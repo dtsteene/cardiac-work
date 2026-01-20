@@ -7,14 +7,19 @@
 #SBATCH --ntasks=8
 #SBATCH --cpus-per-task=1
 #SBATCH --time=12:00:00
-#SBATCH --output=log/simulation_%j.out
-#SBATCH --error=log/simulation_%j.err
 #SBATCH --exclude=n052
 
-# Use: sbatch --export=BPM=60 complete_cycle.sbatch
+# Use: sbatch --export=BPM=75 run_sim_and_post.sbatch
+# For CI testing (short circuit): sbatch --export=BPM=75,CI=1 run_sim_and_post.sbatch
 BPM=${BPM:-75}
+CI=${CI:-0}
 
 echo "--- Job Started: $SLURM_JOB_ID ---"
+if [ "$CI" = "1" ]; then
+    echo "⚠️  CI MODE ENABLED - Short circuit test (2 timesteps only)"
+else
+    echo "Standard mode: Full cardiac cycle simulation"
+fi
 date
 
 # --- Setup Environment ---
@@ -31,24 +36,42 @@ echo "Conda environment: $CONDA_DEFAULT_ENV"
 
 # --- Paths ---
 SUBMIT_DIR=$SLURM_SUBMIT_DIR
-# Define where your python scripts actually live
-SIM_DIR="/home/dtsteene/D1/prelimSim"
+# Define where your python scripts actually live (cardiac-work)
+SIM_DIR="/home/dtsteene/D1/cardiac-work"
+
+# Results and Logs destination
+RESULTS_BASE="${SUBMIT_DIR}/results/sims"
+LOG_DIR="${SUBMIT_DIR}/results/log"
+mkdir -p ${RESULTS_BASE} ${LOG_DIR}
+
+# Specific job results directory
+RESULTS_DIR="${RESULTS_BASE}/run_${SLURM_JOB_ID}"
+mkdir -p ${RESULTS_DIR}
+
+# Log files (now properly configured)
+LOG_FILE="${LOG_DIR}/simulation_${SLURM_JOB_ID}.out"
+ERR_FILE="${LOG_DIR}/simulation_${SLURM_JOB_ID}.err"
+
+# Redirect output/error to the proper log directory
+exec 1>${LOG_FILE}
+exec 2>${ERR_FILE}
 
 # Temporary Work Directory (Fast I/O)
-WORK_DIR="/work/$USER/debug_cycle_${SLURM_JOB_ID}"
+WORK_DIR="/work/$USER/cardiac_cycle_${SLURM_JOB_ID}"
 mkdir -p ${WORK_DIR}
 export XDG_CACHE_HOME="${WORK_DIR}/.cache"
-
-# Final Destination
-RESULTS_DIR="${SUBMIT_DIR}/results/results_debug_${SLURM_JOB_ID}"
-mkdir -p ${RESULTS_DIR}
 
 # --- 1. Main Simulation (MPI) ---
 cd ${WORK_DIR}
 echo "1. Running Simulation (MPI) on ${SLURM_NTASKS} CPUs (BPM=${BPM})..."
+echo "   Working directory: ${WORK_DIR}"
+echo "   Results will be saved to: ${RESULTS_DIR}"
+echo "   Logs: ${LOG_FILE}"
 
-# Note: explicitly pointing to python scripts in SIM_DIR
+# Run complete_cycle.py from cardiac-work directory
 time $CONDA_PREFIX/bin/mpirun -n ${SLURM_NTASKS} -launcher fork $CONDA_PREFIX/bin/python ${SIM_DIR}/complete_cycle.py $BPM
+
+echo "✓ Simulation completed"
 
 # --- 2. Data Transfer (Safety Step) ---
 echo "Simulation complete. Transferring raw data..."
@@ -70,18 +93,39 @@ fi
 # We run this on the RESULTS_DIR (permanent storage)
 # We use standard 'python' (no mpirun) so it runs as a single process (Rank 0)
 
-if [ -f "${SIM_DIR}/postprocess.py" ]; then
-    echo "------------------------------------------------"
-    echo "3. Running Post-Processing (Serial)..."
-    echo "   Target: ${RESULTS_DIR}"
+echo "------------------------------------------------"
+echo "3. Running Post-Processing Analysis..."
+echo "   Target: ${RESULTS_DIR}"
+
+# Change to results directory for analysis
+cd ${RESULTS_DIR}
+
+# Analyze metrics if the metrics calculator ran
+if [ -f "metrics_downsample_1.npy" ]; then
+    echo "   ✓ Found metrics file. Running analysis..."
+    python3 ${SIM_DIR}/analyze_metrics.py . 1
+    echo "   ✓ Metrics analysis complete"
     
-    # Passing RESULTS_DIR as argument ensures it processes the correct folder
-    python ${SIM_DIR}/postprocess.py "${RESULTS_DIR}"
-    
-    echo "✓ Post-processing finished."
+    # List generated plots and statistics
+    ls -lh work_comparison_*.png work_statistics_*.json 2>/dev/null
 else
-    echo "Warning: postprocess.py not found at ${SIM_DIR}/postprocess.py"
+    echo "   Note: No metrics_downsample_1.npy found (metrics calculation may have been skipped)"
 fi
+
+# Hemodynamics and work visualizations
+echo "   ✓ Running postprocess.py for hemodynamics and work plots..."
+python3 ${SIM_DIR}/postprocess.py ${RESULTS_DIR}
+echo "   ✓ Postprocess visuals complete"
+
+# Copy logs to results directory for reference
+cp ${LOG_FILE} ${RESULTS_DIR}/simulation.log 2>/dev/null
+cp ${ERR_FILE} ${RESULTS_DIR}/simulation.err 2>/dev/null
+
+echo "✓ Post-processing finished"
+echo ""
+echo "Results saved to:"
+echo "  Simulation outputs: ${RESULTS_DIR}/"
+echo "  Logs: ${LOG_DIR}/"
 
 # --- Cleanup ---
 echo "Cleanup temporary work dir..."

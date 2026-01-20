@@ -169,13 +169,13 @@ if comm.rank == 0 and not (geodir / "geometry.bp").exists():
         **fiber_angles,
         fiber_space="DG_0",
     )
-    
+
     # --- MPI FIX for V1 ---
     # V1 used comm.allgather here which crashes on clusters with distributed meshes.
-    # Since we are currently in a "Rank 0 generation" block (MPI.COMM_SELF), 
-    # we can just extract the array directly. 
+    # Since we are currently in a "Rank 0 generation" block (MPI.COMM_SELF),
+    # we can just extract the array directly.
     # (Note: If generation were distributed, we would need a purely local extraction).
-    
+
     markers_scalar = system_dg0.markers_scalar
 
     # Get the index map to find total cells (Owned + Ghosts) on this process
@@ -254,24 +254,24 @@ def get_updated_parameters():
     """
     Returns Regazzoni2020 parameters consistent with the configured BPM.
     Reference defaults are for 75 BPM (RR=0.8s).
-    
+
     CRITICAL ALIGNMENT:
     We shift the 0D model phase so that Ventricular Contraction starts at t=0.
     This ensures alignment with the FEM mesh which is at End Diastole.
     """
     params = Regazzoni2020.default_parameters()
-    
+
     # Scale factor relative to reference RR=0.8s (75 BPM)
     factor = RR_INTERVAL / 0.8
-    
+
     # Default Phases (at 75 BPM):
     # LV tC = 0.1s
-    # LA tC = 0.9s (Previous beat relative to 0? No, this is wrapped. 
-    #              In Regazzoni code, tC is just a parameter. 
-    #              Modulo arithmetic places 0.9 near the end of the 0.8s cycle -> 0.1s into next? 
+    # LA tC = 0.9s (Previous beat relative to 0? No, this is wrapped.
+    #              In Regazzoni code, tC is just a parameter.
+    #              Modulo arithmetic places 0.9 near the end of the 0.8s cycle -> 0.1s into next?
     #              Wait. 0.9 mod 0.8 = 0.1. So LA contracts at 0.1?? same as LV?
-    #              Let's check Regazzoni defaults carefully. 
-    #              default_parameters has "tC": 0.9 * s for LA. 
+    #              Let's check Regazzoni defaults carefully.
+    #              default_parameters has "tC": 0.9 * s for LA.
     #              If RR=0.8, then 0.9 is 0.1s into the cycle.
     #              If LV tC=0.1. Then LA and LV contract simultaneously? That's wrong.
     #              Let's assume the Regazzoni defaults imply a specific relative timing.
@@ -279,29 +279,29 @@ def get_updated_parameters():
     #              If LA tC = 0.9 and RR = 1.0 (hypothetically), then it's late diastole.
     #              Let's use the AV delay (time between LA and LV start).
     #              We will simply FORCE LV tC to 0.0, and shift others relative to it.
-    
+
     # Reference timing to shift FROM:
     ref_LV_tC = 0.1 * factor # Scale the reference start time too
-    
+
     # Shift needed to move LV tC to 0.0
     time_shift = -ref_LV_tC
-    
+
     # Apply Scaling and Shifting
     for chamber in ["LA", "RA", "LV", "RV"]:
         # Scale original tC
         original_tC = params["chambers"][chamber]["tC"].magnitude # Removing unit for calc
         scaled_tC = original_tC * factor
-        
+
         # Shift
         new_tC = scaled_tC + time_shift
-        
+
         # Wrap to [0, RR) to be safe (though formula handles negatives usually)
         # Using modulo manually to ensure parametrics are clean
-        # new_tC = new_tC % RR_INTERVAL 
+        # new_tC = new_tC % RR_INTERVAL
         # Actually, let's keep it linear, the model handles modulo.
-        
+
         params["chambers"][chamber]["tC"] = new_tC * circulation.units.ureg("s")
-        
+
         # Scale durations
         params["chambers"][chamber]["TC"] *= factor
         params["chambers"][chamber]["TR"] *= factor
@@ -311,10 +311,10 @@ def get_updated_parameters():
         params["chambers"][chamber]["tC"] = 0.0 * circulation.units.ureg("s")
         params["chambers"][chamber]["TC"] = TC_ACTIVATION * circulation.units.ureg("s")
         params["chambers"][chamber]["TR"] = TR_ACTIVATION * circulation.units.ureg("s")
-    
+
     # Update HR
     params["HR"] = circulation.units.ureg(f"{HR_HZ} Hz")
-    
+
     return params
 
 def run_0D(init_state, nbeats=10):
@@ -322,7 +322,7 @@ def run_0D(init_state, nbeats=10):
     # Use parameters consistent with BPM
     params = get_updated_parameters()
     model = Regazzoni2020(parameters=params)
-    
+
     history = model.solve(num_beats=nbeats, initial_state=init_state)
     state = dict(zip(model.state_names(), model.state))
     return history, state
@@ -374,11 +374,11 @@ def get_activation(t):
     """
     # Use the configured activation parameters based on BPM
     value = circulation.time_varying_elastance.blanco_ventricle(
-        EA=1.0, 
-        EB=0.0, 
+        EA=1.0,
+        EB=0.0,
         tC=tc_shifted,          # 0.0
-        TC=TC_ACTIVATION, 
-        TR=TR_ACTIVATION, 
+        TC=TC_ACTIVATION,
+        TR=TR_ACTIVATION,
         RR=RR_INTERVAL,
     )(t)
     # V1 Logic: Return array for spatially varying tension
@@ -390,22 +390,22 @@ if comm.rank == 0:
     t = np.linspace(0, RR_INTERVAL, 200)
     activation_curve = get_activation(t)
     ax.plot(t, activation_curve.T, label=['LV', 'Septum', 'RV'], linewidth=2)
-    
+
     # Mark cardiac cycle phases
     contraction_end = tc_shifted + TC_ACTIVATION
     relaxation_end = tc_shifted + TC_ACTIVATION + TR_ACTIVATION
-    
+
     ax.axvspan(tc_shifted, contraction_end, alpha=0.1, color='red', label='Contraction')
     ax.axvspan(contraction_end, relaxation_end, alpha=0.1, color='blue', label='Relaxation')
     ax.axvspan(relaxation_end, RR_INTERVAL, alpha=0.1, color='green', label='Rest/Filling')
-    
+
     ax.set_xlabel(f"Time (s) - {BPM} BPM", fontsize=12)
     ax.set_ylabel("Activation (kPa)", fontsize=12)
     ax.set_title(f"Activation Curve ({BPM} BPM) - Aligned to ED at t=0", fontsize=13, weight='bold')
     ax.legend(loc='upper right', fontsize=10)
     ax.grid(True, alpha=0.3)
     ax.set_ylim([0, 110])
-    
+
     fig.savefig(outdir / "activation.png", dpi=150, bbox_inches='tight')
     plt.close(fig)
 
@@ -414,18 +414,18 @@ if comm.rank == 0:
 
 def setup_problem(geometry, f0, s0, material_params):
     material = pulse.HolzapfelOgden(f0=f0, s0=s0, **material_params)
-    
+
     # Use scifem to create simple function space based on markers_mt
     # markers_mt was saved in additional_data in geometry step
     markers_mt = geo.additional_data["markers_mt"]
-    
+
     # Create function space for active tension
     V_Ta = scifem.create_space_of_simple_functions(
-        mesh=geo.mesh, 
-        cell_tag=markers_mt, 
+        mesh=geo.mesh,
+        cell_tag=markers_mt,
         tags=[1, 2, 3] # Tags for LV, RV, Septum (check LDRB output for specific indices)
     )
-    
+
     Ta = pulse.Variable(dolfinx.fem.Function(V_Ta), "kPa")
     active_model = pulse.ActiveStress(f0, activation=Ta)
     comp_model = pulse.compressibility.Compressible2()
@@ -568,7 +568,7 @@ for i in range(ramp_steps):
     lv_volume.value = current_lvv
     rv_volume.value = current_rvv
     problem.solve()
-    
+
     plv = problem.cavity_pressures[0].x.array[0] * 1e-3
     prv = problem.cavity_pressures[1].x.array[0] * 1e-3
     if comm.rank == 0:
@@ -578,7 +578,7 @@ vtx.write(0.0)
 vtx_stress.write(0.0)
 
 # Store old values (handling Array for Ta due to scifem/V1)
-problem.old_Ta = Ta.value.x.array.copy() 
+problem.old_Ta = Ta.value.x.array.copy()
 problem.old_lv_volume = lv_volume.value.copy()
 problem.old_rv_volume = rv_volume.value.copy()
 
@@ -586,7 +586,7 @@ problem.old_rv_volume = rv_volume.value.copy()
 
 def p_BiV_func(V_LV, V_RV, t):
     logger.info(f"Coupling Time {t:.4f}: Target V_LV={V_LV:.2f}, V_RV={V_RV:.2f}")
-    
+
     # Logic from V1: Get array value
     value = get_activation(t)
     old_Ta = problem.old_Ta
@@ -617,10 +617,10 @@ def p_BiV_func(V_LV, V_RV, t):
             for i in range(num_steps):
                 lv_volume.value = old_lv_volume + (i + 1) * (new_value_LV - old_lv_it) / num_steps
                 rv_volume.value = old_rv_volume + (i + 1) * (new_value_RV - old_rv_it) / num_steps
-                
+
                 # V1 Logic: Update the array
                 Ta.assign(old_Ta + (i + 1) * dTa / num_steps)
-                
+
                 try:
                     problem.solve()
                 except RuntimeError as e:
@@ -653,6 +653,9 @@ def p_BiV_func(V_LV, V_RV, t):
 
     return circulation.units.kPa_to_mmHg(lv_p_kPa), circulation.units.kPa_to_mmHg(rv_p_kPa)
 
+# --- Import Metrics Calculator ---
+from metrics_calculator import MetricsCalculator
+
 # --- Checkpointing and Callback ---
 
 filename = outdir / Path("function_checkpoint.bp")
@@ -668,10 +671,94 @@ adios4dolfinx.write_meshtags(filename, mesh=geometry.mesh, meshtags=geo.addition
 output_file = outdir / "output.json"
 Ta_history: list[float] = []
 
+# --- Initialize Metrics Calculator ---
+# Prepare fiber field dictionary in current configuration
+fiber_fields_map = {
+    'f0': f0_quad,
+    's0': s0_quad,
+    'n0': geo.n0,  # Normal (sheet normal)
+    'l0': None,    # Longitudinal (will be computed if needed)
+    'c0': None,    # Circumferential (will be computed if needed)
+}
+
+metrics_calc = MetricsCalculator(
+    geometry=geometry,
+    geo=geo,
+    fiber_field_map=fiber_fields_map,
+    material_dg=material_dg,
+    problem=problem,
+    comm=comm
+)
+
+if comm.rank == 0:
+    logger.info("Metrics calculator initialized for True Work vs Clinical Proxies")
+
 def callback(model, i: int, t: float, save=True):
+    """
+    Callback executed at each timestep.
+
+    Computes and stores:
+    - True work (stress-based) per region
+    - Clinical work proxies (pressure-based) per region
+    - Stress/strain quantities
+
+    Skips plotting (wasteful on compute nodes).
+    Saves everything at every timestep but allows downsampling later.
+    """
+
+    # Interpolate stress/strain fields for checkpointing
     fiber_stress.interpolate(fiber_stress_expr)
     fiber_strain.interpolate(fiber_strain_expr)
     Ta_history.append(get_activation(t))
+
+    # Update state tracking for work calculation
+    if i == 0:
+        # First step: initialize previous state
+        metrics_calc.update_state()
+        metrics_calc_skip_work = True
+    else:
+        metrics_calc_skip_work = False
+
+    # Explicitly get current state (P and V) to ensure metrics calculator has them
+    # irrespective of history update timing
+    lv_p_kPa = problem.cavity_pressures[0].x.array[0] * 1e-3
+    rv_p_kPa = problem.cavity_pressures[1].x.array[0] * 1e-3
+
+    current_state = {
+        "p_LV": circulation.units.kPa_to_mmHg(lv_p_kPa),
+        "p_RV": circulation.units.kPa_to_mmHg(rv_p_kPa),
+    }
+
+    # Prefer directly computed cavity volumes (mechanics side) to avoid empty 0D history timing.
+    # lv_volume/rv_volume are in m^3; convert to mL for consistency with circulation volumes.
+    V_LV_ml = float(lv_volume.value * volume2ml)
+    V_RV_ml = float(rv_volume.value * volume2ml)
+    current_state["V_LV"] = V_LV_ml
+    current_state["V_RV"] = V_RV_ml
+
+    if comm.rank == 0 and i < 5:
+        print(f"DEBUG VOLUMES i={i}: lv_volume.value={float(lv_volume.value):.3e} m^3 → {V_LV_ml:.3f} mL, rv_volume.value={float(rv_volume.value):.3e} m^3 → {V_RV_ml:.3f} mL")
+
+    # If the 0D model exposes volumes, keep them as an alternate sanity check (not primary).
+    if hasattr(model, "V_LV"):
+        current_state.setdefault("V_LV_0D", model.V_LV)
+    if hasattr(model, "V_RV"):
+        current_state.setdefault("V_RV_0D", model.V_RV)
+
+    # Compute all metrics for this timestep
+    region_metrics = metrics_calc.compute_regional_metrics(
+        timestep_idx=i,
+        t=t,
+        model_history=model.history,
+        skip_work_calc=metrics_calc_skip_work,
+        current_state=current_state
+    )
+
+    # Store metrics (all timesteps; downsampling happens at save time)
+    metrics_calc.store_metrics(region_metrics, i, t, downsample_factor=1)
+
+    # Update state for next iteration (after metrics computed)
+    metrics_calc.update_state()
 
     if save:
         vtx.write(t)
@@ -679,46 +766,19 @@ def callback(model, i: int, t: float, save=True):
         adios4dolfinx.write_function(filename, u=problem.u, name="displacement", time=t)
         adios4dolfinx.write_function(filename, u=fiber_stress, name="fiber_stress", time=t)
         adios4dolfinx.write_function(filename, u=fiber_strain, name="fiber_strain", time=t)
-        
+
         out = {k: v[: i + 1] for k, v in model.history.items()}
         out["Ta"] = Ta_history
         V_LV = model.history["V_LV"][: i + 1] - error_LV
         V_RV = model.history["V_RV"][: i + 1] - error_RV
         out["V_LV"] = V_LV
         out["V_RV"] = V_RV
-        
+
         if comm.rank == 0:
             output_file.write_text(json.dumps(out, indent=4, default=custom_json))
 
-            # Incremental Plotting
-            fig = plt.figure(layout="constrained", figsize=(12, 8))
-            gs = GridSpec(3, 4, figure=fig)
-            ax1 = fig.add_subplot(gs[:, 0])
-            ax2 = fig.add_subplot(gs[:, 1])
-            ax3 = fig.add_subplot(gs[0, 2])
-            ax4 = fig.add_subplot(gs[1, 2])
-            ax5 = fig.add_subplot(gs[0, 3])
-            ax6 = fig.add_subplot(gs[1, 3])
-            ax7 = fig.add_subplot(gs[2, 2:])
-
-            p_LV = model.history["p_LV"][: i + 1]
-            p_RV = model.history["p_RV"][: i + 1]
-
-            ax1.plot(V_LV, p_LV); ax1.set_xlabel("LVV [mL]"); ax1.set_ylabel("LVP [mmHg]")
-            ax2.plot(V_RV, p_RV); ax2.set_xlabel("RVV [mL]"); ax2.set_ylabel("RVP [mmHg]")
-            ax3.plot(model.history["time"][: i + 1], p_LV); ax3.set_ylabel("LVP [mmHg]")
-            ax4.plot(model.history["time"][: i + 1], V_LV); ax4.set_ylabel("LVV [mL]")
-            ax5.plot(model.history["time"][: i + 1], p_RV); ax5.set_ylabel("RVP [mmHg]")
-            ax6.plot(model.history["time"][: i + 1], V_RV); ax6.set_ylabel("RVV [mL]")
-            
-            # Note: plotting Ta history might need adjustment if it is an array
-            # Simple plot of first component or mean
-            ta_plot = [x if np.ndim(x)==0 else x[0] for x in Ta_history[: i + 1]]
-            ax7.plot(model.history["time"][: i + 1], ta_plot); ax7.set_ylabel("Ta (LV) [kPa]")
-
-            for axi in [ax3, ax4, ax5, ax6, ax7]: axi.set_xlabel("Time [s]")
-            fig.savefig(outdir / "pv_loop_incremental.png")
-            plt.close(fig)
+            # No incremental plotting (wasteful on compute nodes)
+            # Plots will be generated in post-processing if needed
 
 # --- Run Simulation ---
 
@@ -742,3 +802,10 @@ dt = 0.001
 end_time = 2 * dt if os.getenv("CI") else None
 circulation_model.solve(num_beats=num_beats, initial_state=circ_state, dt=dt, T=end_time)
 logger.info("Simulation complete.")
+
+# --- Save Metrics ---
+if comm.rank == 0:
+    logger.info("Saving mechanics metrics (true work vs clinical proxies)...")
+    # Save with downsampling options: full resolution, every 5th step, every 10th step
+    metrics_calc.save_metrics(outdir, downsample_factors=[1, 5, 10])
+    logger.info("✓ Metrics saved to results directory")
