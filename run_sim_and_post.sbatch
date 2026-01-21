@@ -100,22 +100,14 @@ echo "   Target: ${RESULTS_DIR}"
 # Change to results directory for analysis
 cd ${RESULTS_DIR}
 
-# Analyze metrics if the metrics calculator ran
+# Run unified analysis script (combines all post-processing)
 if [ -f "metrics_downsample_1.npy" ]; then
-    echo "   ✓ Found metrics file. Running analysis..."
+    echo "   Running comprehensive analysis (analyze_metrics.py)..."
     python3 ${SIM_DIR}/analyze_metrics.py . 1
-    echo "   ✓ Metrics analysis complete"
-    
-    # List generated plots and statistics
-    ls -lh work_comparison_*.png work_statistics_*.json 2>/dev/null
+    echo "   ✓ Analysis complete"
 else
     echo "   Note: No metrics_downsample_1.npy found (metrics calculation may have been skipped)"
 fi
-
-# Hemodynamics and work visualizations
-echo "   ✓ Running postprocess.py for hemodynamics and work plots..."
-python3 ${SIM_DIR}/postprocess.py ${RESULTS_DIR}
-echo "   ✓ Postprocess visuals complete"
 
 # Copy logs to results directory for reference
 cp ${LOG_FILE} ${RESULTS_DIR}/simulation.log 2>/dev/null

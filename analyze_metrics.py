@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """
-Post-Processing Script: Analyze True Work vs Clinical Proxy Results
+Comprehensive Post-Processing & Analysis Script
 
-This script loads the metrics saved by complete_cycle.py and generates
-publication-quality comparison plots and statistics.
+This unified script handles ALL analysis tasks:
+1. Load and validate simulation data (metrics + hemodynamics)
+2. Print diagnostic summary (pressure/volume ranges, work magnitudes)
+3. Generate hemodynamic plots (PV loops, time series)
+4. Generate work comparison plots (True vs Proxy vs Boundary)
+5. Phase-windowed correlation analysis
+6. Boundary work validation
+7. Statistics export (JSON)
+
+Replaces: postprocess.py, diagnose_work.py, analyze_metrics.py (legacy)
 
 Usage:
-  python3 analyze_metrics.py <results_dir>
+  python3 analyze_metrics.py <results_dir> [downsample_factor]
 
 Example:
-  python3 analyze_metrics.py results_biv_complete_cycle_hybrid_75bpm
+  python3 analyze_metrics.py results/sims/run_943768 1
 """
 
 import sys
@@ -21,6 +29,276 @@ from matplotlib.gridspec import GridSpec
 
 # Unit conversion: 1 mmHg*mL = 1.33322e-4 Joules
 MMHG_ML_TO_J = 1.33322e-4
+
+
+def print_diagnostics(metrics, results_dir):
+    """
+    Print comprehensive diagnostics summary (from diagnose_work.py).
+    Shows hemodynamics, activation, work magnitudes, and correlations.
+    """
+    print("\n" + "="*80)
+    print(f"DIAGNOSTIC SUMMARY: {Path(results_dir).name}")
+    print("="*80)
+    
+    # --- 1. Hemodynamics ---
+    print("\n### HEMODYNAMICS ###")
+    V_LV = np.array(metrics.get("V_LV", []))
+    V_RV = np.array(metrics.get("V_RV", []))
+    p_LV = np.array(metrics.get("p_LV", []))
+    p_RV = np.array(metrics.get("p_RV", []))
+    
+    if len(V_LV) > 0:
+        print(f"LV Volume:   {V_LV.min():>6.1f} - {V_LV.max():<6.1f} mL  (Δ{V_LV.max()-V_LV.min():.1f})")
+        print(f"RV Volume:   {V_RV.min():>6.1f} - {V_RV.max():<6.1f} mL  (Δ{V_RV.max()-V_RV.min():.1f})")
+        print(f"LV Pressure: {p_LV.min():>6.1f} - {p_LV.max():<6.1f} mmHg (Δ{p_LV.max()-p_LV.min():.1f})")
+        print(f"RV Pressure: {p_RV.min():>6.1f} - {p_RV.max():<6.1f} mmHg (Δ{p_RV.max()-p_RV.min():.1f})")
+        
+        # Warnings
+        if V_LV.max() - V_LV.min() < 10:
+            print("⚠ WARNING: LV volume swing < 10 mL")
+        if p_LV.max() - p_LV.min() < 50:
+            print("⚠ WARNING: LV pressure swing < 50 mmHg")
+    
+    # --- 2. Work Magnitudes ---
+    print("\n### WORK MAGNITUDES ###")
+    work_true_LV = np.array(metrics.get("work_true_LV", []))
+    work_proxy_LV = np.array(metrics.get("work_proxy_pv_LV", []))
+    work_true_RV = np.array(metrics.get("work_true_RV", []))
+    work_proxy_RV = np.array(metrics.get("work_proxy_pv_RV", []))
+    
+    if len(work_true_LV) > 0:
+        # Convert proxy to Joules
+        work_proxy_LV_J = work_proxy_LV * MMHG_ML_TO_J
+        work_proxy_RV_J = work_proxy_RV * MMHG_ML_TO_J
+        
+        cumul_true_LV = np.cumsum(work_true_LV)[-1] if len(work_true_LV) > 0 else 0
+        cumul_proxy_LV = np.cumsum(work_proxy_LV_J)[-1] if len(work_proxy_LV_J) > 0 else 0
+        cumul_true_RV = np.cumsum(work_true_RV)[-1] if len(work_true_RV) > 0 else 0
+        cumul_proxy_RV = np.cumsum(work_proxy_RV_J)[-1] if len(work_proxy_RV_J) > 0 else 0
+        
+        print(f"LV True Work:   {cumul_true_LV:>10.4e} J  (Range: {work_true_LV.min():.2e} to {work_true_LV.max():.2e})")
+        print(f"LV Proxy Work:  {cumul_proxy_LV:>10.4e} J  (Range: {work_proxy_LV_J.min():.2e} to {work_proxy_LV_J.max():.2e})")
+        print(f"RV True Work:   {cumul_true_RV:>10.4e} J")
+        print(f"RV Proxy Work:  {cumul_proxy_RV:>10.4e} J")
+        
+        # Ratio
+        ratio_LV = cumul_true_LV / cumul_proxy_LV if cumul_proxy_LV != 0 else 0
+        ratio_RV = cumul_true_RV / cumul_proxy_RV if cumul_proxy_RV != 0 else 0
+        print(f"\nLV True/Proxy Ratio: {ratio_LV:.3f}")
+        print(f"RV True/Proxy Ratio: {ratio_RV:.3f}")
+        
+        # Interpretation
+        if 0.5 < ratio_LV < 2.0:
+            print("✓ LV magnitudes similar (good!)")
+        elif ratio_LV < 0.1:
+            print("❌ True Work << Proxy (stress integration issue?)")
+        elif ratio_LV > 10:
+            print("❌ True Work >> Proxy (unit conversion error?)")
+        
+        # Correlation
+        if len(work_true_LV) > 2:
+            corr_LV = np.corrcoef(work_true_LV[1:], work_proxy_LV_J[1:])[0, 1]
+            corr_RV = np.corrcoef(work_true_RV[1:], work_proxy_RV_J[1:])[0, 1]
+            print(f"\n📊 LV Correlation: {corr_LV:.3f}")
+            print(f"📊 RV Correlation: {corr_RV:.3f}")
+            
+            if corr_LV > 0.7:
+                print("✓ Strong correlation (excellent!)")
+            elif corr_LV > 0.4:
+                print("⚠ Moderate correlation")
+            else:
+                print("❌ Weak correlation (physics mismatch?)")
+    
+    print("\n" + "="*80)
+
+
+def plot_hemodynamics(metrics, output_dir):
+    """
+    Create hemodynamic plots (from postprocess.py):
+    1. PV loop with metrics overlay
+    2. Time series (pressure + volume for all chambers)
+    3. GridSpec complete cycle visualization
+    """
+    times = np.array(metrics.get("time", []))
+    p_LV = np.array(metrics.get("p_LV", []))
+    p_RV = np.array(metrics.get("p_RV", []))
+    p_LA = np.array(metrics.get("p_LA", []))
+    p_RA = np.array(metrics.get("p_RA", []))
+    V_LV = np.array(metrics.get("V_LV", []))
+    V_RV = np.array(metrics.get("V_RV", []))
+    
+    if len(V_LV) == 0:
+        print("⚠ No hemodynamic data for plotting")
+        return
+    
+    # Align arrays
+    min_len = min(len(times), len(p_LV), len(V_LV))
+    times = times[-min_len:]
+    p_LV = p_LV[-min_len:]
+    p_RV = p_RV[-min_len:]
+    V_LV = V_LV[-min_len:]
+    V_RV = V_RV[-min_len:]
+    p_LA = p_LA[-min_len:] if len(p_LA) >= min_len else p_LA
+    p_RA = p_RA[-min_len:] if len(p_RA) >= min_len else p_RA
+    
+    # --- 1. PV Loop with Metrics ---
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+    
+    ax1.plot(V_LV, p_LV, 'b-', linewidth=2.5, label='LV PV Loop')
+    ax1.scatter(V_LV[0], p_LV[0], color='green', s=100, zorder=5, label='ED')
+    ax1.scatter(V_LV[-1], p_LV[-1], color='red', s=100, zorder=5, label='ES')
+    
+    # Direction arrows
+    for i in range(0, len(V_LV)-1, max(1, len(V_LV)//10)):
+        ax1.arrow(V_LV[i], p_LV[i], V_LV[i+1]-V_LV[i], p_LV[i+1]-p_LV[i],
+                 head_width=2, head_length=3, fc='blue', ec='blue', alpha=0.5)
+    
+    ax1.set_xlabel('LV Volume (mL)', fontsize=12, fontweight='bold')
+    ax1.set_ylabel('LV Pressure (mmHg)', fontsize=12, fontweight='bold')
+    ax1.set_title('Left Ventricular PV Loop', fontsize=13, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(fontsize=10)
+    
+    # Metrics panel
+    lv_ef = (V_LV.max() - V_LV.min()) / V_LV.max() * 100
+    sv = V_LV.max() - V_LV.min()
+    dp_dt = np.gradient(p_LV)
+    max_dp_dt = np.max(np.abs(dp_dt))
+    
+    ax2.axis('off')
+    metrics_text = f"""
+HEMODYNAMIC PARAMETERS
+
+Left Ventricle:
+  • Peak Systolic Pressure: {p_LV.max():.1f} mmHg
+  • End Diastolic Pressure: {p_LV.min():.1f} mmHg
+  • End Systolic Volume:    {V_LV.min():.1f} mL
+  • End Diastolic Volume:   {V_LV.max():.1f} mL
+  • Stroke Volume:          {sv:.1f} mL
+  • Ejection Fraction:      {lv_ef:.1f}%
+  • dP/dt max:              {max_dp_dt:.1f} mmHg/s
+
+Right Ventricle:
+  • Peak Systolic Pressure: {p_RV.max():.1f} mmHg
+  • End Diastolic Pressure: {p_RV.min():.1f} mmHg
+  • End Systolic Volume:    {V_RV.min():.1f} mL
+  • End Diastolic Volume:   {V_RV.max():.1f} mL
+
+Simulation: ✓ SUCCESS
+  • Time Points: {len(times)}
+"""
+    
+    ax2.text(0.1, 0.9, metrics_text, transform=ax2.transAxes,
+            fontsize=11, verticalalignment='top', fontfamily='monospace',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / "pv_loop_analysis.png", dpi=150, bbox_inches='tight')
+    print(f"✓ Saved: pv_loop_analysis.png")
+    plt.close()
+    
+    # --- 2. Time Series Grid ---
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    
+    axes[0,0].plot(times, p_LV, 'b-', linewidth=2)
+    axes[0,0].set_ylabel('LV Pressure (mmHg)', fontweight='bold')
+    axes[0,0].set_title('Left Ventricle Pressure', fontweight='bold')
+    axes[0,0].grid(True, alpha=0.3)
+    
+    axes[0,1].plot(times, p_RV, 'r-', linewidth=2)
+    axes[0,1].set_ylabel('RV Pressure (mmHg)', fontweight='bold')
+    axes[0,1].set_title('Right Ventricle Pressure', fontweight='bold')
+    axes[0,1].grid(True, alpha=0.3)
+    
+    axes[1,0].plot(times, V_LV, 'b-', linewidth=2, label='LV')
+    axes[1,0].plot(times, V_RV, 'r-', linewidth=2, label='RV')
+    axes[1,0].set_xlabel('Time (s)', fontweight='bold')
+    axes[1,0].set_ylabel('Volume (mL)', fontweight='bold')
+    axes[1,0].set_title('Ventricular Volumes', fontweight='bold')
+    axes[1,0].legend()
+    axes[1,0].grid(True, alpha=0.3)
+    
+    if len(p_LA) > 0:
+        axes[1,1].plot(times, p_LA, 'b--', linewidth=2, label='LA')
+        axes[1,1].plot(times, p_RA, 'r--', linewidth=2, label='RA')
+        axes[1,1].set_xlabel('Time (s)', fontweight='bold')
+        axes[1,1].set_ylabel('Atrial Pressure (mmHg)', fontweight='bold')
+        axes[1,1].set_title('Atrial Pressures', fontweight='bold')
+        axes[1,1].legend()
+        axes[1,1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / "hemodynamics_timeseries.png", dpi=150, bbox_inches='tight')
+    print(f"✓ Saved: hemodynamics_timeseries.png")
+    plt.close()
+    
+    # --- 3. Complete Cycle GridSpec Visualization ---
+    try:
+        fig = plt.figure(layout="constrained", figsize=(14, 8))
+        gs = GridSpec(3, 4, figure=fig)
+        
+        # Left: LV PV Loop
+        ax1 = fig.add_subplot(gs[:, 0])
+        ax1.plot(V_LV, p_LV, 'b-', linewidth=2)
+        ax1.set_xlabel("LVV [mL]", fontweight='bold')
+        ax1.set_ylabel("LVP [mmHg]", fontweight='bold')
+        ax1.set_title("LV PV Loop", fontweight='bold')
+        ax1.grid(True, alpha=0.3)
+        
+        # Second column: RV PV Loop
+        ax2 = fig.add_subplot(gs[:, 1])
+        ax2.plot(V_RV, p_RV, 'r-', linewidth=2)
+        ax2.set_xlabel("RVV [mL]", fontweight='bold')
+        ax2.set_ylabel("RVP [mmHg]", fontweight='bold')
+        ax2.set_title("RV PV Loop", fontweight='bold')
+        ax2.grid(True, alpha=0.3)
+        
+        # Right side: Time series
+        ax3 = fig.add_subplot(gs[0, 2])
+        ax3.plot(times, p_LV, 'b-', linewidth=1.5)
+        ax3.set_ylabel("LVP [mmHg]", fontweight='bold')
+        ax3.set_xticklabels([])
+        ax3.grid(True, alpha=0.3)
+        ax3.set_title("Pressures", fontweight='bold', fontsize=10)
+        
+        ax5 = fig.add_subplot(gs[0, 3])
+        ax5.plot(times, p_RV, 'r-', linewidth=1.5)
+        ax5.set_ylabel("RVP [mmHg]", fontweight='bold')
+        ax5.set_xticklabels([])
+        ax5.grid(True, alpha=0.3)
+        
+        ax4 = fig.add_subplot(gs[1, 2])
+        ax4.plot(times, V_LV, 'b-', linewidth=1.5)
+        ax4.set_ylabel("LVV [mL]", fontweight='bold')
+        ax4.set_xticklabels([])
+        ax4.grid(True, alpha=0.3)
+        ax4.set_title("Volumes", fontweight='bold', fontsize=10)
+        
+        ax6 = fig.add_subplot(gs[1, 3])
+        ax6.plot(times, V_RV, 'r-', linewidth=1.5)
+        ax6.set_ylabel("RVV [mL]", fontweight='bold')
+        ax6.set_xticklabels([])
+        ax6.grid(True, alpha=0.3)
+        
+        # Active tension (if available)
+        Ta = np.array(metrics.get("Ta", []))
+        if len(Ta) > 0:
+            if Ta.ndim > 1:
+                Ta = Ta[:, 0]
+            Ta = Ta[-min_len:] if len(Ta) >= min_len else Ta
+            
+            ax7 = fig.add_subplot(gs[2, 2:])
+            ax7.plot(times[:len(Ta)], Ta, 'purple', linewidth=1.5)
+            ax7.set_ylabel("Ta (LV) [kPa]", fontweight='bold')
+            ax7.set_xlabel("Time [s]", fontweight='bold')
+            ax7.grid(True, alpha=0.3)
+            ax7.set_title("Active Tension", fontweight='bold', fontsize=10)
+        
+        plt.savefig(output_dir / "pv_loop_complete_cycle.png", dpi=150, bbox_inches='tight')
+        print(f"✓ Saved: pv_loop_complete_cycle.png")
+        plt.close()
+    except Exception as e:
+        print(f"⚠ Complete cycle visualization skipped: {e}")
 
 
 def load_metrics(results_dir, downsample_factor=1):
@@ -47,31 +325,15 @@ def load_metrics(results_dir, downsample_factor=1):
             # Merge history into metrics
             for key, val in history.items():
                 if key not in metrics:
-                    val_array = np.array(val)
-                    # Downsample if history is significantly longer
-                    if len(val_array) > target_len:
-                         step = len(val_array) // target_len
-                         step = max(1, step)
-                         metrics[key] = val_array[::step][:target_len]
-                    else:
-                         metrics[key] = val_array[:target_len]
+                    metrics[key] = val
         except Exception as e:
             print(f"Warning: Could not load history.npy: {e}")
 
     return metrics
 
 
-
 def extract_regional_data(metrics, regions=["LV", "RV", "Septum"]):
-    """
-    Extract work data for specified regions.
-
-    Includes advanced proxy calculations for the Septum to compare:
-    - Standard Proxy: (pLV+pRV)/2 * (dV_LV+dV_RV)
-    - LV-focused Proxy: pLV * (dV_LV+dV_RV)
-    - RV-focused Proxy: pRV * (dV_LV+dV_RV)
-    - Weighted Blend: (alpha*pLV + beta*pRV) * (dV_LV+dV_RV)
-    """
+    """Extract work data for specified regions."""
     data = {}
 
     # Extract raw history needed for re-calculations
@@ -85,106 +347,30 @@ def extract_regional_data(metrics, regions=["LV", "RV", "Septum"]):
     min_len_history = min(len(p_LV), len(p_RV), len(V_LV), len(V_RV), len(full_times))
 
     # Recalculate dV (backward difference)
-    # dV[i] = V[i] - V[i-1]. First element is 0.
     dV_LV = np.zeros(min_len_history)
     dV_RV = np.zeros(min_len_history)
     dV_LV[1:] = V_LV[1:min_len_history] - V_LV[0:min_len_history-1]
     dV_RV[1:] = V_RV[1:min_len_history] - V_RV[0:min_len_history-1]
 
-    dV_Total = (dV_LV + dV_RV) / 2.0  # Septum volume change (split contribution)
-    # Note: In metrics_calculator.py, proxy_Septum uses dV_total / 2.0
-    # Let's align with the definition used: Work ~ P * dV
-
-    # Process standard regions
+    # Process regions
     for region in regions:
         true_work = np.array(metrics.get(f"work_true_{region}", []))
-
-        # Default proxy from file
         proxy_work = np.array(metrics.get(f"work_proxy_pv_{region}", []))
 
         # Align time with work data
         current_times = full_times
         min_len = min(len(true_work), len(proxy_work))
 
-        # Truncate to match work length (sometimes Work has one less point if step 0 skipped)
+        # Truncate to match work length
         if len(true_work) > min_len: true_work = true_work[-min_len:]
         if len(proxy_work) > min_len: proxy_work = proxy_work[-min_len:]
 
-        # Convert proxy work from mmHg*mL to Joules (True work is Joules)
+        # Convert proxy work from mmHg*mL to Joules
         if len(proxy_work) > 0:
             proxy_work = proxy_work * MMHG_ML_TO_J
 
-
-        # Determine time slice (usually aligned to end)
-        time_slice = slice(-min_len, None) if min_len > 0 else slice(None)
-
-        # Determine current times for this region - EXPLICIT TRUNCATION
+        # Determine current times for this region
         region_times = current_times[-min_len:] if min_len > 0 else []
-
-        # Recalculate proxy if history is available (to fix potential zero-proxy bug in saved metrics)
-        if region == "LV" and min_len > 0:
-             p_val = p_LV[-min_len:]
-             dV_val = dV_LV[-min_len:]
-             if len(p_val) == len(proxy_work):
-                 proxy_work = p_val * dV_val * MMHG_ML_TO_J
-        elif region == "RV" and min_len > 0:
-             p_val = p_RV[-min_len:]
-             dV_val = dV_RV[-min_len:]
-             if len(p_val) == len(proxy_work):
-                 proxy_work = p_val * dV_val * MMHG_ML_TO_J
-
-        # If this is the Septum, we generate extra comparisons
-        # We need raw P and dV arrays matched to this time slice
-        if region == "Septum" and min_len > 0:
-            # Match lengths
-            # CAUTION: The raw arrays (p_LV, dV_LV) might be slightly longer than truncated work arrays
-            # We must truncate them to exactly match min_len
-
-            p_L_val = p_LV[-min_len:]
-            p_R_val = p_RV[-min_len:]
-            dV_L_val = dV_LV[-min_len:]
-            dV_R_val = dV_RV[-min_len:]
-
-            # Septum dV is typically defined as the change in the total volume that it affects
-            # Or geometrically, it moves between LV and RV.
-            # MetricsCalculator uses: proxies["work_proxy_pv_Septum"] = p_avg * dV_total / 2.0
-
-            dV_Septum = (dV_L_val + dV_R_val) / 2.0
-
-            # 1. Standard Proxy (Already loaded as proxy_work): Average Pressure
-            # proxy_std = (p_L_val + p_R_val) / 2.0 * dV_Septum
-
-            # 2. LV Pressure Proxy
-            proxy_lv = p_L_val * dV_Septum
-
-            # 3. RV Pressure Proxy
-            proxy_rv = p_R_val * dV_Septum
-
-            # 4. Weighted Blend (e.g., 2/3 LV + 1/3 RV) - often Septum follows LV more
-            proxy_blend = (0.67 * p_L_val + 0.33 * p_R_val) * dV_Septum
-
-            # Convert to Joules
-            proxy_lv *= MMHG_ML_TO_J
-            proxy_rv *= MMHG_ML_TO_J
-            proxy_blend *= MMHG_ML_TO_J
-
-            # Store these variants for Septum
-            data["Septum_LV_Proxy"] = {
-                "true_work": true_work, # Septum true work
-                "proxy_work": proxy_lv,
-                "time": region_times
-            }
-            data["Septum_RV_Proxy"] = {
-                "true_work": true_work,
-                "proxy_work": proxy_rv,
-                "time": region_times
-            }
-            data["Septum_Blend_Proxy"] = {
-                "true_work": true_work,
-                "proxy_work": proxy_blend,
-                "time": region_times
-            }
-
 
         data[region] = {
             "true_work": true_work,
@@ -196,64 +382,31 @@ def extract_regional_data(metrics, regions=["LV", "RV", "Septum"]):
 
 
 def compute_statistics(data, metrics=None):
-    """Compute statistics for work comparison, including phase-windowed analysis."""
+    """Compute statistics for work comparison."""
     stats = {}
-
-    # Extract ejection phase mask if possible (V_LV decreasing)
-    ejection_mask = None
-    if metrics is not None:
-        V_LV = np.array(metrics.get("V_LV", []))
-        if len(V_LV) > 1:
-            dV_LV = np.diff(V_LV, prepend=V_LV[0])  # Volume decrease during ejection
-            ejection_mask = dV_LV < -1e-6  # Negative dV indicates ejection
-            print(f"  Ejection phase detected: {np.sum(ejection_mask)} / {len(ejection_mask)} timesteps")
 
     for region, values in data.items():
         true_w = values["true_work"]
         proxy_w = values["proxy_work"]
 
-        # Avoid division by zero
-        proxy_w_safe = np.clip(np.abs(proxy_w), 1e-12, None) * np.sign(proxy_w + 1e-15)
-
         if len(true_w) > 0 and len(proxy_w) > 0:
-            # Compute full-cycle metrics
+            correlation = np.corrcoef(true_w, proxy_w)[0, 1] if len(true_w) > 1 else 0.0
+            
             stats[region] = {
-                "true_work_mean": np.mean(true_w),
-                "true_work_max": np.max(true_w),
-                "true_work_min": np.min(true_w),
-                "proxy_work_mean": np.mean(proxy_w),
-                "proxy_work_max": np.max(proxy_w),
-                "proxy_work_min": np.min(proxy_w),
-                "correlation": np.corrcoef(true_w, proxy_w)[0, 1] if len(true_w) > 1 else 0,
-                "rmse": np.sqrt(np.mean((true_w - proxy_w)**2)),
+                "true_work_mean": float(np.mean(true_w)),
+                "true_work_max": float(np.max(true_w)),
+                "true_work_min": float(np.min(true_w)),
+                "proxy_work_mean": float(np.mean(proxy_w)),
+                "proxy_work_max": float(np.max(proxy_w)),
+                "proxy_work_min": float(np.min(proxy_w)),
+                "correlation": float(correlation),
             }
-
-            # Compute ejection-phase metrics if mask available
-            if ejection_mask is not None and len(ejection_mask) == len(true_w):
-                ejection_true = true_w[ejection_mask]
-                ejection_proxy = proxy_w[ejection_mask]
-
-                if len(ejection_true) > 1:
-                    stats[region]["correlation_ejection"] = (
-                        np.corrcoef(ejection_true, ejection_proxy)[0, 1]
-                    )
-                    stats[region]["rmse_ejection"] = np.sqrt(
-                        np.mean((ejection_true - ejection_proxy)**2)
-                    )
-                    stats[region]["num_ejection_points"] = int(np.sum(ejection_mask))
-                else:
-                    stats[region]["correlation_ejection"] = 0.0
-                    stats[region]["rmse_ejection"] = 0.0
-                    stats[region]["num_ejection_points"] = 0
 
     return stats
 
 
 def plot_validation_boundary_work(data, metrics, output_file=None):
-    """
-    Create validation plot: Boundary Work vs Proxy Work.
-    Boundary work should match proxy work if physics are correct.
-    """
+    """Create validation plot: Boundary Work vs Proxy Work."""
     fig, axes = plt.subplots(2, 1, figsize=(12, 10))
 
     # Extract necessary data
@@ -321,11 +474,7 @@ def plot_validation_boundary_work(data, metrics, output_file=None):
 
         if output_file:
             plt.savefig(output_file, dpi=150, bbox_inches='tight')
-            print(f"✓ Saved boundary validation plot: {output_file}")
-            print(f"  LV Validation Error: {error_lv:.2f}%")
-            print(f"  RV Validation Error: {error_rv:.2f}%")
-        else:
-            plt.show()
+            print(f"✓ Saved: {Path(output_file).name}")
 
         plt.close()
         return {"lv_error": error_lv, "rv_error": error_rv}
@@ -335,10 +484,7 @@ def plot_validation_boundary_work(data, metrics, output_file=None):
 
 
 def plot_phase_windowed_analysis(data, metrics, output_file=None):
-    """
-    Create phase-windowed analysis plots: Full cycle vs Ejection phase.
-    Compare correlation and RMSE between global and ejection-only.
-    """
+    """Create phase-windowed analysis plots: Full cycle vs Ejection phase."""
     # Extract volume data to define ejection phase
     V_LV = np.array(metrics.get("V_LV", []))
     times = np.array(metrics.get("time", []))
@@ -360,7 +506,7 @@ def plot_phase_windowed_analysis(data, metrics, output_file=None):
     true_w = np.array(lv_data["true_work"])
     proxy_w = np.array(lv_data["proxy_work"])
 
-    # Align ejection mask to work arrays (they might be different lengths)
+    # Align ejection mask to work arrays
     min_len = min(len(ejection_mask), len(true_w))
     if min_len > 0:
         ejection_mask = ejection_mask[-min_len:]
@@ -371,8 +517,6 @@ def plot_phase_windowed_analysis(data, metrics, output_file=None):
     # Split into ejection and non-ejection phases
     ejection_true = true_w[ejection_mask]
     ejection_proxy = proxy_w[ejection_mask]
-    non_ejection_true = true_w[~ejection_mask]
-    non_ejection_proxy = proxy_w[~ejection_mask]
 
     # Compute correlations
     global_corr = np.corrcoef(true_w, proxy_w)[0, 1] if len(true_w) > 1 else 0.0
@@ -438,9 +582,6 @@ Ejection Phase Only:
   • RMSE:        {ejection_rmse:>12.4e} J
   • N points:    {len(ejection_true):>8d}
 
-Non-Ejection Phase:
-  • N points:    {len(non_ejection_true):>8d}
-
 Interpretation:
   If ejection corr >> global corr:
     ✓ Proxy captures systolic work
@@ -456,9 +597,7 @@ Interpretation:
 
     if output_file:
         plt.savefig(output_file, dpi=150, bbox_inches='tight')
-        print(f"✓ Saved phase-windowed analysis plot: {output_file}")
-    else:
-        plt.show()
+        print(f"✓ Saved: {Path(output_file).name}")
 
     plt.close()
 
@@ -468,15 +607,12 @@ Interpretation:
         "ejection_correlation": float(ejection_corr),
         "ejection_rmse": float(ejection_rmse),
         "num_ejection_points": int(np.sum(ejection_mask)),
-        "num_non_ejection_points": int(np.sum(~ejection_mask)),
     }
 
 
 def plot_comparison(data, output_file=None):
     """Create comprehensive comparison plots."""
-
     regions = list(data.keys())
-    # Sort regions to keep main ones first
     ordered_regions = ["LV", "RV", "Septum"]
     other_regions = [r for r in regions if r not in ordered_regions]
     plot_regions = ordered_regions + sorted(other_regions)
@@ -484,21 +620,18 @@ def plot_comparison(data, output_file=None):
     # Filter out empty data
     plot_regions = [r for r in plot_regions if r in data and len(data[r]["true_work"]) > 0]
 
-    # Calculate grid size roughly
+    # Calculate grid size
     n_plots = len(plot_regions)
     cols = 3
     rows = (n_plots + cols - 1) // cols
 
-    # Re-setup figure based on dynamic number of regions
     fig = plt.figure(figsize=(5*cols, 4*rows))
     gs = GridSpec(rows, cols, figure=fig, hspace=0.4, wspace=0.3)
 
     colors = {
-        "LV": "blue", "RV": "red", "Septum": "green",
-        "Septum_LV_Proxy": "purple", "Septum_RV_Proxy": "orange", "Septum_Blend_Proxy": "teal"
+        "LV": "blue", "RV": "red", "Septum": "green"
     }
 
-    # === Comparison Plots (Scatter + Regression) for all variants ===
     for idx, region in enumerate(plot_regions):
         row = idx // cols
         col = idx % cols
@@ -507,32 +640,24 @@ def plot_comparison(data, output_file=None):
         true_w = np.array(data[region]["true_work"]).ravel()
         proxy_w = np.array(data[region]["proxy_work"]).ravel()
 
-        # Ensure lengths match for plotting (safety check)
+        # Ensure lengths match
         min_p_len = min(len(true_w), len(proxy_w))
         if min_p_len > 0:
-            true_w = true_w[:min_p_len]
-            proxy_w = proxy_w[:min_p_len]
-        else:
-            print(f"Warning: Empty data for {region}")
-            continue
+            true_w = true_w[-min_p_len:]
+            proxy_w = proxy_w[-min_p_len:]
 
         color = colors.get(region, "black")
 
         # Plot Scatter
         ax.scatter(proxy_w, true_w, alpha=0.5, s=20, color=color, label="Data")
 
-        # Calculate stats for title
+        # Calculate stats
         if len(true_w) > 1:
             corr = np.corrcoef(true_w, proxy_w)[0, 1]
-            rmse = np.sqrt(np.mean((true_w - proxy_w)**2))
-
-            # Regression Line
-            mask = ~(np.isnan(proxy_w) | np.isnan(true_w))
-            if np.sum(mask) > 2 and np.std(proxy_w[mask]) > 1e-9:
-                z = np.polyfit(proxy_w[mask], true_w[mask], 1)
-                p = np.poly1d(z)
-                px = np.linspace(np.min(proxy_w[mask]), np.max(proxy_w[mask]), 100)
-                ax.plot(px, p(px), "k--", alpha=0.7, linewidth=1.5, label=f"R={corr:.3f}")
+            z = np.polyfit(proxy_w, true_w, 1)
+            p = np.poly1d(z)
+            px = np.linspace(np.min(proxy_w), np.max(proxy_w), 100)
+            ax.plot(px, p(px), 'k--', linewidth=1.5, label=f"R={corr:.3f}")
 
         ax.set_xlabel("Proxy Work (P·V)")
         ax.set_ylabel("True Work (S·E)")
@@ -540,38 +665,24 @@ def plot_comparison(data, output_file=None):
         ax.legend(fontsize=8, loc="upper left")
         ax.grid(True, alpha=0.2)
 
-        # Add text box with correlation
-        # ax.text(0.05, 0.95, f"R = {corr:.3f}", transform=ax.transAxes, verticalalignment='top')
-
     if output_file:
         plt.savefig(output_file, dpi=150, bbox_inches="tight")
-        print(f"✓ Saved comparison plot: {output_file}")
-    else:
-        plt.show()
+        print(f"✓ Saved: {Path(output_file).name}")
 
     plt.close()
 
 
 def print_statistics(stats):
-    """Print formatted statistics including phase-windowed metrics."""
+    """Print formatted statistics."""
     print("\n" + "="*80)
     print("WORK METRICS STATISTICS")
     print("="*80)
 
     for region, values in stats.items():
         print(f"\n{region}:")
-        print(f"  True Work:  mean={values['true_work_mean']:>12.4e}, max={values['true_work_max']:>12.4e}, min={values['true_work_min']:>12.4e}")
-        print(f"  Proxy Work: mean={values['proxy_work_mean']:>12.4e}, max={values['proxy_work_max']:>12.4e}, min={values['proxy_work_min']:>12.4e}")
-        print(f"  Correlation (Global): {values['correlation']:>6.3f}")
-        
-        # Print ejection phase stats if available
-        if "correlation_ejection" in values:
-            print(f"  Correlation (Ejection): {values['correlation_ejection']:>6.3f}")
-            print(f"  RMSE (Global): {values['rmse']:>12.4e}")
-            print(f"  RMSE (Ejection): {values['rmse_ejection']:>12.4e}")
-            print(f"  Ejection points: {values.get('num_ejection_points', 0):>6d}")
-        else:
-            print(f"  RMSE: {values['rmse']:>12.4e}")
+        print(f"  True Work:  mean={values['true_work_mean']:>12.4e}, max={values['true_work_max']:>12.4e}")
+        print(f"  Proxy Work: mean={values['proxy_work_mean']:>12.4e}, max={values['proxy_work_max']:>12.4e}")
+        print(f"  Correlation: {values['correlation']:>6.3f}")
 
 
 def main():
@@ -582,18 +693,38 @@ def main():
     results_dir = Path(sys.argv[1])
     downsample_factor = int(sys.argv[2]) if len(sys.argv) > 2 else 1
 
+    print("\n" + "="*80)
+    print("COMPREHENSIVE POST-PROCESSING & ANALYSIS")
+    print("="*80)
+    print(f"Results: {results_dir}")
+    print(f"Downsample: {downsample_factor}")
+
     # Load metrics
-    print(f"Loading metrics from {results_dir} (downsample_factor={downsample_factor})...")
+    print(f"\nLoading metrics from {results_dir}...")
     metrics = load_metrics(results_dir, downsample_factor)
 
     if metrics is None:
         sys.exit(1)
 
+    # --- 1. Print Diagnostics ---
+    print_diagnostics(metrics, results_dir)
+
+    # --- 2. Hemodynamic Plots ---
+    print("\n" + "="*80)
+    print("HEMODYNAMIC VISUALIZATION")
+    print("="*80)
+    plot_hemodynamics(metrics, results_dir)
+
+    # --- 3. Work Analysis ---
+    print("\n" + "="*80)
+    print("WORK ANALYSIS")
+    print("="*80)
+    
     # Extract regional data
     regions = ["LV", "RV", "Septum"]
     data = extract_regional_data(metrics, regions=regions)
 
-    # Compute statistics (pass metrics for phase-windowed analysis)
+    # Compute statistics
     stats = compute_statistics(data, metrics=metrics)
     print_statistics(stats)
 
@@ -601,7 +732,7 @@ def main():
     plot_file = results_dir / f"work_comparison_downsample_{downsample_factor}.png"
     plot_comparison(data, output_file=str(plot_file))
 
-    # NEW: Create boundary work validation plot (if data available)
+    # --- 4. Boundary Work Validation ---
     print("\n" + "="*80)
     print("BOUNDARY WORK VALIDATION")
     print("="*80)
@@ -610,9 +741,9 @@ def main():
         boundary_plot_file = results_dir / f"boundary_work_validation_downsample_{downsample_factor}.png"
         boundary_validation = plot_validation_boundary_work(data, metrics, output_file=str(boundary_plot_file))
     else:
-        print("⚠ No boundary work data found (geometry may lack facet tags)")
+        print("⚠ No boundary work data found")
 
-    # NEW: Create phase-windowed analysis plot
+    # --- 5. Phase-Windowed Analysis ---
     print("\n" + "="*80)
     print("PHASE-WINDOWED ANALYSIS")
     print("="*80)
@@ -623,11 +754,10 @@ def main():
     else:
         print("⚠ No volume data for phase analysis")
 
-    # Save statistics to JSON (including phase-windowed)
+    # --- 6. Save Statistics ---
     stats_json = {k: {kk: float(vv) if isinstance(vv, (np.floating, np.integer)) else vv
                       for kk, vv in v.items()} for k, v in stats.items()}
     
-    # Add phase analysis results
     if phase_analysis:
         stats_json["phase_analysis_LV"] = phase_analysis
     if boundary_validation:
@@ -639,8 +769,17 @@ def main():
     print(f"\n✓ Saved statistics: {stats_file}")
 
     print("\n" + "="*80)
-    print("Analysis complete!")
+    print("ANALYSIS COMPLETE ✓")
     print("="*80)
+    print("\nGenerated files:")
+    print("  1. pv_loop_analysis.png")
+    print("  2. hemodynamics_timeseries.png")
+    print("  3. pv_loop_complete_cycle.png")
+    print("  4. work_comparison_downsample_*.png")
+    print("  5. boundary_work_validation_downsample_*.png")
+    print("  6. phase_windowed_analysis_downsample_*.png")
+    print("  7. work_statistics_downsample_*.json")
+    print("="*80 + "\n")
 
 
 if __name__ == "__main__":

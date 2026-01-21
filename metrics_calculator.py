@@ -22,21 +22,22 @@ import ufl
 class MetricsCalculator:
     """Calculate cardiac mechanics metrics per region at each timestep."""
 
-    def __init__(self, geometry, geo, fiber_field_map, material_dg, problem, comm):
+    def __init__(self, geometry, geo, fiber_field_map, problem, comm, cardiac_model):
         """
         Args:
             geometry: pulse.HeartGeometry object
             geo: cardiac_geometries.Geometry object (for access to mesh tags)
             fiber_field_map: dict with fiber vectors in current configuration
                 {'f0': f0_mapped, 's0': s0_mapped, 'l0': long, 'c0': circ, 'n0': norm}
-            material_dg: pulse material model for stress calculation
             problem: pulse.problem.StaticProblem with problem.u, cavities, etc.
             comm: MPI communicator
+            cardiac_model: pulse.CardiacModel - THE single source of truth for all stress
+                Contains material, active, and compressibility components
         """
         self.geometry = geometry
         self.geo = geo
         self.fiber_fields = fiber_field_map
-        self.material_dg = material_dg
+        self.cardiac_model = cardiac_model  # GRAND UNIFICATION: Single model
         self.problem = problem
         self.comm = comm
         self.rank = comm.rank
@@ -77,21 +78,25 @@ class MetricsCalculator:
         C = F.T * F
         E = 0.5 * (C - I)
 
-        # Second Piola-Kirchhoff stress
-        S = self.material_dg.S(ufl.variable(C))
+        # NOTE: We do NOT precompute full S here because it depends on Ta which varies.
+        # We compute S fresh in _calculate_true_work() during each timestep.
+        # For visualization, use passive material component only.
+        
+        S_passive = self.cardiac_model.material.S(ufl.variable(C))
+        sigma_passive = self.cardiac_model.material.sigma(F)
 
         # Mapped fiber direction in current config
         f_current = (F * f0) / ufl.sqrt(ufl.inner(F * f0, F * f0))
 
-        # Scalar projections
-        fiber_stress = ufl.inner(self.material_dg.sigma(F) * f_current, f_current)
+        # Scalar projections (using passive for visualization)
+        fiber_stress = ufl.inner(sigma_passive * f_current, f_current)
         fiber_strain = ufl.inner(E * f0, f0)
 
-        # Store for later interpolation
+        # Store for later use
         self.u = u
         self.F = F
+        self.C = C  # Store C for computing S later
         self.E = E
-        self.S = S
         self.fiber_stress_expr = fiber_stress
         self.fiber_strain_expr = fiber_strain
 
@@ -117,8 +122,11 @@ class MetricsCalculator:
             self.E_prev = dolfinx.fem.Function(W_tensor)
             self.u_prev = dolfinx.fem.Function(self.problem.u.function_space)
 
+        # Compute current FULL stress (must be fresh each time due to Ta)
+        S_full = self.cardiac_model.S(ufl.variable(self.C))
+        
         # Interpolate current S and E
-        S_expr = dolfinx.fem.Expression(self.S, W_tensor.element.interpolation_points)
+        S_expr = dolfinx.fem.Expression(S_full, W_tensor.element.interpolation_points)
         E_expr = dolfinx.fem.Expression(self.E, W_tensor.element.interpolation_points)
 
         S_cur = dolfinx.fem.Function(W_tensor)
@@ -194,8 +202,12 @@ class MetricsCalculator:
         """Calculate true work using proper UFL integration."""
         W_tensor = dolfinx.fem.functionspace(self.mesh, ("DG", 1, (3, 3)))
 
+        # Compute FULL stress (Passive + Active + Pressure) at current timestep
+        # This must be done fresh each time because Ta changes
+        S_full = self.cardiac_model.S(ufl.variable(self.C))
+        
         # Current S and E
-        S_expr = dolfinx.fem.Expression(self.S, W_tensor.element.interpolation_points)
+        S_expr = dolfinx.fem.Expression(S_full, W_tensor.element.interpolation_points)
         E_expr = dolfinx.fem.Expression(self.E, W_tensor.element.interpolation_points)
 
         S_cur = dolfinx.fem.Function(W_tensor)
@@ -207,6 +219,21 @@ class MetricsCalculator:
         dS_avg = 0.5 * (self.S_prev + S_cur)
         dE = E_cur - self.E_prev
         W_density = ufl.inner(dS_avg, dE)
+
+        # === DEBUG: Calculate Passive-Only Work for comparison ===
+        # Get passive stress from material component only (strips out active + pressure)
+        S_passive_only = self.cardiac_model.material.S(ufl.variable(self.C))
+        S_passive_only_expr = dolfinx.fem.Expression(S_passive_only, W_tensor.element.interpolation_points)
+        S_passive_only_cur = dolfinx.fem.Function(W_tensor)
+        S_passive_only_cur.interpolate(S_passive_only_expr)
+        
+        # Store previous passive stress for incremental calculation
+        if not hasattr(self, 'S_passive_prev'):
+            self.S_passive_prev = dolfinx.fem.Function(W_tensor)
+            self.S_passive_prev.x.array[:] = S_passive_only_cur.x.array
+        
+        dS_passive_avg = 0.5 * (self.S_passive_prev + S_passive_only_cur)
+        W_passive_density = ufl.inner(dS_passive_avg, dE)
 
         work_data = {}
         regions_to_integrate = self._get_regions_to_integrate()
@@ -221,23 +248,45 @@ class MetricsCalculator:
             dx_sub = ufl.Measure("dx", domain=self.mesh, subdomain_data=cell_tags, metadata=metadata)
 
             total_work_local = 0.0
+            passive_work_local = 0.0
 
             for marker_val in region_markers:
                 try:
-                    # Integrate W_density over the subdomain
-                    # Using dolfinx.fem.form requires integers for subdomain ids
+                    # Integrate TOTAL work (Full stress: Passive + Active + Pressure)
                     form_work = dolfinx.fem.form(W_density * dx_sub(int(marker_val)))
-                    val = dolfinx.fem.assemble_scalar(form_work)
-                    total_work_local += val
+                    val_total = dolfinx.fem.assemble_scalar(form_work)
+                    total_work_local += val_total
+                    
+                    # Integrate PASSIVE-ONLY work (Material only)
+                    form_passive = dolfinx.fem.form(W_passive_density * dx_sub(int(marker_val)))
+                    val_passive = dolfinx.fem.assemble_scalar(form_passive)
+                    passive_work_local += val_passive
+                    
                 except Exception as e:
                     if self.rank == 0:
                         print(f"Error integrating work for {region_name}, marker {marker_val}: {e}")
 
             # Global Sum
             total_work_global = self.comm.allreduce(total_work_local, op=MPI.SUM)
+            passive_work_global = self.comm.allreduce(passive_work_local, op=MPI.SUM)
+            
+            # === DEBUG LOGGING: Show Active Contribution ===
+            if self.rank == 0 and region_name in ["LV", "RV"]:
+                diff = total_work_global - passive_work_global
+                ratio = abs(diff/passive_work_global) if abs(passive_work_global) > 1e-12 else 0.0
+                print(
+                    f"DEBUG WORK SPLIT ({region_name}) | "
+                    f"Total={total_work_global:.3e} J, "
+                    f"PassiveOnly={passive_work_global:.3e} J, "
+                    f"Diff(Active+Pressure)={diff:.3e} J, "
+                    f"Ratio={ratio:.2f}x"
+                )
 
             # Store TOTAL ENERGY (Joules), do not divide by volume
             work_data[f"work_true_{region_name}"] = total_work_global
+
+        # Update passive stress for next timestep
+        self.S_passive_prev.x.array[:] = S_passive_only_cur.x.array
 
         return work_data
 

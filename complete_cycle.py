@@ -33,15 +33,27 @@ import pulse
 # ============================================================================
 # BPM (Beats Per Minute) Configuration - Can be set via command line or environment
 import sys
-try:
-    # Try command line argument first
-    if len(sys.argv) > 1:
-        BPM = int(sys.argv[1])
-    else:
-        # Try environment variable
-        BPM = int(os.getenv("BPM", 75))
-except (ValueError, IndexError):
-    BPM = 75  # Default: 60 or 75
+import argparse
+
+# Parse command line arguments
+parser = argparse.ArgumentParser(description='Complete cardiac cycle simulation')
+parser.add_argument('bpm', type=int, nargs='?', default=None, help='Heart rate in BPM (default: 75)')
+parser.add_argument('--ci', action='store_true', help='Enable CI mode (2 timesteps only for quick testing)')
+args = parser.parse_args()
+
+# Determine BPM
+if args.bpm is not None:
+    BPM = args.bpm
+else:
+    BPM = int(os.getenv("BPM", 75))
+
+# CI Mode flag (OFF by default, must be explicitly enabled)
+CI_MODE = args.ci or bool(os.getenv("CI"))
+
+if CI_MODE:
+    print("⚠️  CI MODE ENABLED - Short circuit test (2 timesteps only)")
+else:
+    print("✓ PRODUCTION MODE - Full simulation")
 
 # Heart rate in Hz (BPM / 60)
 HR_HZ = BPM / 60.0
@@ -159,7 +171,7 @@ if comm.rank == 0 and not (geodir / "geometry.bp").exists():
         **fiber_angles,
         fiber_space="Quadrature_6",
     )
-
+    #could change fiber_space to DG_1 or CG_1?
     # Generate DG0 system for Active Tension Markers (From V1)
     # This creates markers scalar which helps define LV/RV/Septum regions
     system_dg0 = ldrb.dolfinx_ldrb(
@@ -539,17 +551,23 @@ problem = pulse.problem.StaticProblem(
 )
 
 # Setup Stress/Strain Post-processing
+# FIXED: Use full CardiacModel (material + compressibility) instead of material only
+# This ensures stresses include pressure contribution for proper boundary work calculation
+
 W = dolfinx.fem.functionspace(geometry.mesh, ("DG", 1))
 I = ufl.Identity(3)
 F = ufl.variable(ufl.grad(problem.u) + I)
 C = F.T * F
 E = 0.5 * (C - I)
 f_map = (F * f0_map) / ufl.sqrt(ufl.inner(F * f0_map, F * f0_map))
-material_dg = pulse.HolzapfelOgden(f0=f0_map, s0=f0_map, **material_params)
-T_mat = material_dg.sigma(F)
+
+# For fiber stress visualization only: Create a simple standalone material
+# (We use problem.model in MetricsCalculator for actual work calculations)
+material_viz = pulse.HolzapfelOgden(f0=f0_map, s0=f0_map, **material_params)
+T_viz = material_viz.sigma(F)  # Simple passive stress for visualization only
 
 fiber_stress = dolfinx.fem.Function(W, name="fiber_stress")
-fiber_stress_expr = dolfinx.fem.Expression(ufl.inner(T_mat * f_map, f_map), W.element.interpolation_points)
+fiber_stress_expr = dolfinx.fem.Expression(ufl.inner(T_viz * f_map, f_map), W.element.interpolation_points)
 fiber_strain = dolfinx.fem.Function(W, name="fiber_strain")
 fiber_strain_expr = dolfinx.fem.Expression(ufl.inner(E * f0_map, f0_map), W.element.interpolation_points)
 
@@ -685,9 +703,9 @@ metrics_calc = MetricsCalculator(
     geometry=geometry,
     geo=geo,
     fiber_field_map=fiber_fields_map,
-    material_dg=material_dg,
     problem=problem,
-    comm=comm
+    comm=comm,
+    cardiac_model=problem.model  # GRAND UNIFICATION: Single source of truth
 )
 
 if comm.rank == 0:
@@ -797,15 +815,27 @@ circulation_model = circulation.regazzoni2020.Regazzoni2020(
 )
 
 logger.info(f"Starting coupled simulation at {BPM} BPM (HR={HR_HZ} Hz, RR={RR_INTERVAL:.3f}s)...")
-num_beats = 1  # DEBUG: Single beat only
+num_beats = 1  # Single beat simulation
 dt = 0.001
-end_time = 2 * dt if os.getenv("CI") else None
-circulation_model.solve(num_beats=num_beats, initial_state=circ_state, dt=dt, T=end_time)
-logger.info("Simulation complete.")
 
-# --- Save Metrics ---
-if comm.rank == 0:
-    logger.info("Saving mechanics metrics (true work vs clinical proxies)...")
-    # Save with downsampling options: full resolution, every 5th step, every 10th step
-    metrics_calc.save_metrics(outdir, downsample_factors=[1, 5, 10])
-    logger.info("✓ Metrics saved to results directory")
+# CI Mode: Only 2 timesteps for quick testing; Production: Full beat
+if CI_MODE:
+    end_time = 2 * dt  # ~0.002s for quick validation
+    logger.info(f"⚠️  CI MODE: Running only {end_time}s ({int(end_time/dt)} timesteps)")
+else:
+    end_time = None  # Full beat
+    logger.info(f"✓ PRODUCTION MODE: Running full beat ({RR_INTERVAL:.3f}s)")
+
+try:
+    circulation_model.solve(num_beats=num_beats, initial_state=circ_state, dt=dt, T=end_time)
+    logger.info("Simulation complete.")
+finally:
+    # --- Save Metrics (ALWAYS, even if simulation crashes) ---
+    if comm.rank == 0:
+        logger.info("Saving mechanics metrics (true work vs clinical proxies)...")
+        try:
+            # Save with downsampling options: full resolution, every 5th step, every 10th step
+            metrics_calc.save_metrics(outdir, downsample_factors=[1, 5, 10])
+            logger.info("✓ Metrics saved to results directory")
+        except Exception as e:
+            logger.error(f"Failed to save metrics: {e}")
