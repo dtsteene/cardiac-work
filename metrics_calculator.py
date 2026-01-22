@@ -87,12 +87,6 @@ class MetricsCalculator:
         self.aha_tags = None
 
     def _flatten_tensor(self, T):
-        """Flatten a 3x3 tensor into a 9-component vector UFL expression.
-        
-        Args:
-            T: 3x3 UFL tensor
-            
-    def _flatten_tensor(self, T):
         """Return tensor as-is for direct tensor space (no flattening needed).
         
         Args:
