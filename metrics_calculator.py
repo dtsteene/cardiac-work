@@ -57,12 +57,10 @@ class MetricsCalculator:
         self.mesh = geometry.mesh
         self.volume2ml = 1e6
 
-        # --- EXPLICIT VECTOR ELEMENT DEFINITION ---
-        # Use basix.ufl to strictly define a DG-0 vector of size 9
-        # This avoids implicit tensor layout that causes JIT tabulation mismatches
-        cell_name = self.mesh.topology.cell_name()
-        vector_elem = basix.ufl.element("DG", cell_name, 0, shape=(9,))
-        self.W_flat = dolfinx.fem.functionspace(self.mesh, vector_elem)
+        # --- SUPERVISOR SUGGESTION (Jan 22, 2026) ---
+        # Try DG-0 tensor space (3,3) directly instead of flattened vectors
+        # This may avoid quadrature/tabulation mismatches
+        self.W_flat = dolfinx.fem.functionspace(self.mesh, ("DG", 0, (3, 3)))
         
         # Scalar space for scalar quantities
         self.W_scalar = dolfinx.fem.functionspace(self.mesh, ("DG", 0))
@@ -94,45 +92,45 @@ class MetricsCalculator:
         Args:
             T: 3x3 UFL tensor
             
+    def _flatten_tensor(self, T):
+        """Return tensor as-is for direct tensor space (no flattening needed).
+        
+        Args:
+            T: 3x3 UFL tensor
+            
         Returns:
-            UFL vector of length 9 (row-major order)
+            Same tensor (W_flat is now (3,3) tensor space)
         """
-        return ufl.as_vector([T[i, j] for i in range(3) for j in range(3)])
+        return T
 
     def _interpolate_tensor_to_flat(self, tensor_ufl, target_function):
-        """Robustly interpolate a 3x3 tensor into a flattened vector function (size 9).
+        """Interpolate a 3x3 tensor directly into DG-0 tensor function space.
         
-        Uses local (cell-wise) projection for DG-0 spaces. This avoids MPI communicator
-        leaks from creating solvers in loops.
+        Uses local (cell-wise) projection for DG-0 spaces.
         
         Args:
             tensor_ufl: 3x3 UFL tensor expression to interpolate
-            target_function: dolfinx.fem.Function(W_flat) to store result
+            target_function: dolfinx.fem.Function(W_flat) with (3,3) tensor space
         """
         from dolfinx import fem
         
-        # Flatten the tensor into a vector using as_vector
-        tensor_flat_ufl = self._flatten_tensor(tensor_ufl)
-        
-        # For DG-0, use local projection (cell-wise average)
-        # RHS: ∫ tensor_flat · test dx
+        # Direct tensor projection (no flattening)
         test = ufl.TestFunction(self.W_flat)
-        L = fem.form(ufl.inner(tensor_flat_ufl, test) * self.dx)
+        L = fem.form(ufl.inner(tensor_ufl, test) * self.dx)
         
         # Assemble RHS
         b = fem.petsc.assemble_vector(L)
         b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
         
-        # For DG-0, mass matrix is diagonal (cell volumes)
-        # So we can just divide by cell volumes instead of solving
+        # Mass matrix (diagonal for DG-0)
         a = fem.form(ufl.inner(ufl.TrialFunction(self.W_flat), test) * self.dx)
         A = fem.petsc.assemble_matrix(a)
         A.assemble()
         
-        # Get diagonal (cell volumes * 9 for vector components)
+        # Get diagonal
         diag = A.getDiagonal()
         
-        # Solve by dividing: x = b / diag
+        # Solve: x = b / diag
         target_function.x.petsc_vec.array[:] = b.array / diag.array
         
         # Cleanup
@@ -210,13 +208,13 @@ class MetricsCalculator:
         E_cur_flat = dolfinx.fem.Function(self.W_flat)
         self._interpolate_tensor_to_flat(self.E, E_cur_flat)
 
-        # 2. Work Calculation: Dot product of vectors == Double contraction of tensors
-        # 0.5 * (S_prev + S_cur) · (E_cur - E_prev)
+        # 2. Work Calculation: Tensor double contraction S:E
+        # 0.5 * (S_prev + S_cur) : (E_cur - E_prev)
         dS_avg = 0.5 * (self.S_prev_flat + S_cur_flat)
         dE = E_cur_flat - self.E_prev_flat
         
-        # KEY: ufl.dot on vectors is numerically stable and JIT-compilable
-        W_density = ufl.dot(dS_avg, dE)
+        # KEY: Use ufl.inner() for proper tensor contraction (not dot product)
+        W_density = ufl.inner(dS_avg, dE)
 
         # --- Passive Only Work (Debug Comparison) ---
         S_passive = self.cardiac_model.material.S(ufl.variable(self.C))
@@ -224,7 +222,7 @@ class MetricsCalculator:
         self._interpolate_tensor_to_flat(S_passive, S_pass_cur)
         
         dS_pass_avg = 0.5 * (self.S_passive_prev_flat + S_pass_cur)
-        W_passive_density = ufl.dot(dS_pass_avg, dE)
+        W_passive_density = ufl.inner(dS_pass_avg, dE)
 
         # Integrate over regions
         work_data = {}
@@ -283,16 +281,16 @@ class MetricsCalculator:
         
         dE = E_cur_flat - self.E_prev_flat
 
-        # Calculate Magnitude from flattened vector (dot product with self)
-        S_mag = ufl.sqrt(ufl.dot(self.S_prev_flat, self.S_prev_flat) + 1e-10)
+        # Calculate Magnitude from tensor (Frobenius norm)
+        S_mag = ufl.sqrt(ufl.inner(self.S_prev_flat, self.S_prev_flat) + 1e-10)
         
         # Active fraction (0-1): sigmoid approximation
         S_ref = 10.0e3  # Reference stress in Pa
         active_frac = ufl.tanh(S_mag / S_ref)
 
-        # Work density re-calculation
+        # Work density re-calculation with tensor contraction
         W_avg = 0.5 * (self.S_prev_flat + S_cur_flat)
-        W_total = ufl.dot(W_avg, dE)
+        W_total = ufl.inner(W_avg, dE)
         
         W_active_density = active_frac * W_total
         W_passive_density = (1.0 - active_frac) * W_total
