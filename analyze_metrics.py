@@ -622,6 +622,10 @@ def plot_comparison(data, output_file=None):
 
     # Calculate grid size
     n_plots = len(plot_regions)
+    if n_plots == 0:
+        print("⚠ No valid data to plot. Skipping plot_comparison.")
+        return None
+    
     cols = 3
     rows = (n_plots + cols - 1) // cols
 
