@@ -524,6 +524,9 @@ s0_quad = pulse.utils.map_vector_field(f=geo.s0, u=u_pre, normalize=True, name="
 f0_map = pulse.utils.map_vector_field(
     geo.additional_data["f0_DG_1"], u=u_pre, normalize=True, name="f0",
 )
+s0_map = pulse.utils.map_vector_field(
+    geo.additional_data.get("s0_DG_1", geo.s0), u=u_pre, normalize=True, name="s0",
+)
 
 lvv_unloaded = comm.allreduce(geometry.volume("LV"), op=MPI.SUM)
 rvv_unloaded = comm.allreduce(geometry.volume("RV"), op=MPI.SUM)
@@ -699,13 +702,23 @@ fiber_fields_map = {
     'c0': None,    # Circumferential (will be computed if needed)
 }
 
+# Supervisor suggestion: build a metrics-only CardiacModel with DG-space fibers
+material_metrics = pulse.HolzapfelOgden(f0=f0_map, s0=s0_map, **material_params)
+active_metrics = pulse.ActiveStress(f0_map, activation=Ta)
+comp_metrics = pulse.compressibility.Compressible2()
+metrics_model = pulse.CardiacModel(
+    material=material_metrics,
+    active=active_metrics,
+    compressibility=comp_metrics,
+)
+
 metrics_calc = MetricsCalculator(
     geometry=geometry,
     geo=geo,
     fiber_field_map=fiber_fields_map,
     problem=problem,
     comm=comm,
-    cardiac_model=problem.model  # GRAND UNIFICATION: Single source of truth
+    cardiac_model=metrics_model  # Use DG fiber model for metrics stress
 )
 
 if comm.rank == 0:

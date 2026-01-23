@@ -650,6 +650,9 @@ conda activate RV
 - [ ] **Next developer: Choose Option A, B, or C**
 - [ ] Ready for phase-windowed analysis and publication
 
+### Recent Attempt (Jan 23, 2026)
+- DG tensor space test (job 944645, CI mode): [results/sims/run_944645](results/sims/run_944645) produced no metrics/plots (empty folder). Log stayed in initial coupling (t=0.001 s) with repeated circulation tables; no explicit error, but run exited without outputs. Boundary-work validation remains unsolved.
+
 ---
 
 **Status**: ✅ Production Ready (January 20, 2026)  
