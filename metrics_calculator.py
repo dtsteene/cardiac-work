@@ -39,13 +39,9 @@ class MetricsCalculator:
 
         # --- Nuclear Option v4 Setup (Exact Quadrature) ---
         # W_scalar: Scalar space used for component storage.
-        # UPGRADE to ("Quadrature", 4) to match the integration rule exactly.
-        # This captures the non-linear stress (Exponential) at the exact points where
-        # it will be integrated, avoiding ANY projection loss (DG1/DG2).
-        # UPDATE: Trying Degree 8 to capture magnitude (exponential peak) better
-        self.quad_degree = 8
-        qe = basix.ufl.quadrature_element(self.mesh.ufl_cell().cellname(), degree=self.quad_degree, scheme="default")
-        self.W_scalar = dolfinx.fem.functionspace(self.mesh, qe)
+        # REVERT to ("DG", 1) (Linear) to capture Magnitude correctly.
+        # We rely on finer mesh (char_length=5.0) to fix the correlation/continuity artifacts.
+        self.W_scalar = dolfinx.fem.functionspace(self.mesh, ("DG", 1))
 
         # Storage for Previous State (Lists of 9 DG1 Scalars)
         # We store components individually to avoid ANY tensor space JIT/layout issues.
@@ -174,8 +170,7 @@ class MetricsCalculator:
         work_data = {}
         regions_to_integrate = self._get_regions_to_integrate()
         # DG1 requires quadrature degree >= 2*1 = 2. Safe to use 4.
-        # For High-Order Quadrature element (Deg 8), we must match the integration rule!
-        metadata = {"quadrature_degree": self.quad_degree}
+        metadata = {"quadrature_degree": 4}
 
         for region_name, cell_tags, region_markers in regions_to_integrate:
             if cell_tags is None: continue
@@ -227,7 +222,7 @@ class MetricsCalculator:
 
         work_split = {}
         regions_to_integrate = self._get_regions_to_integrate()
-        metadata = {"quadrature_degree": self.quad_degree}
+        metadata = {"quadrature_degree": 4}
         for region_name, cell_tags, region_markers in regions_to_integrate:
             if cell_tags is None: continue
             dx_sub = ufl.Measure("dx", domain=self.mesh, subdomain_data=cell_tags, metadata=metadata)
@@ -312,8 +307,12 @@ class MetricsCalculator:
             
             for region, p_val, marker in [("LV", p_LV, lv_marker), ("RV", p_RV, rv_marker)]:
                 try:
-                    val = dolfinx.fem.assemble_scalar(dolfinx.fem.form(p_val * ufl.dot(n_vec, Du) * ds_cav(marker)))
-                    boundary_work[f"work_boundary_{region}"] = self.comm.allreduce(val, op=MPI.SUM)
+                    # Result is in mmHg * mm^3 (if p in mmHg, mesh in mm)
+                    # 1 mmHg * mm^3 = 133.322 Pa * 1e-9 m^3 = 1.33322e-7 Joules
+                    MMHG_MM3_TO_J = 1.33322e-7
+                    val_raw = dolfinx.fem.assemble_scalar(dolfinx.fem.form(p_val * ufl.dot(n_vec, Du) * ds_cav(marker)))
+                    val_joules = self.comm.allreduce(val_raw, op=MPI.SUM) * MMHG_MM3_TO_J
+                    boundary_work[f"work_boundary_{region}"] = val_joules
                 except:
                     boundary_work[f"work_boundary_{region}"] = 0.0
         except:

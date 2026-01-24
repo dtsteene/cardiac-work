@@ -417,8 +417,10 @@ def plot_validation_boundary_work(data, metrics, output_file=None):
     proxy_rv = np.array(metrics.get("work_proxy_pv_RV", []))
 
     # Convert proxy to Joules
-    proxy_lv = proxy_lv * MMHG_ML_TO_J
-    proxy_rv = proxy_rv * MMHG_ML_TO_J
+    # NOTE: metrics_calculator.py ALREADY converts proxy to Joules.
+    # We should NOT convert again.
+    # proxy_lv = proxy_lv * MMHG_ML_TO_J
+    # proxy_rv = proxy_rv * MMHG_ML_TO_J
 
     # Ensure all arrays are aligned
     min_len = min(len(times), len(boundary_lv), len(proxy_lv))

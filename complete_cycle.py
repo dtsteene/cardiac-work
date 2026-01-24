@@ -135,7 +135,8 @@ if comm.rank == 0 and not (geodir / "geometry.bp").exists():
     logger.info("Generating and processing geometry (Rank 0)...")
     mode = -1
     std = 0
-    char_length = 10.0
+    # Higher fidelity mesh (char_length 10 -> 5.0) for better septum accuracy
+    char_length = 5.0
 
     # Generate base mesh
     geo = cardiac_geometries.mesh.ukb(

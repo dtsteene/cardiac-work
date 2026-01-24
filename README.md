@@ -13,11 +13,52 @@ We have identified a fundamental trade-off between **Work Magnitude** (Total Ene
 | **DG0** | Discontinuous Galerkin (Constant per cell) | ❌ **Low** (~50% Loss) | ✅ **High** (>0.90) | Averaging over the cell smooths out the exponential peak of stress, losing significant energy. However, the constant value preserves element-wise independence, maintaining good correlation shape. |
 | **DG1** | Discontinuous Galerkin (Linear per cell) | ✅ **Correct** (Matches Ref) | ⚠️ **Degraded** (~0.79) | Linear gradients capture the "area under the curve" correctly, restoring the magnitude. However, the projection to a linear field across the cell introduces continuity artifacts that hurt the thin Septum's specific correlation. |
 | **Quadrature (Deg 4)** | Values stored at Integration Points | ❌ **Low** (~50% Loss) | ✅ **High** (~0.91) | Evaluating exactly at integration points eliminates projection errors (restoring Septum correlation), but Degree 4 seems to undersample the exponential peak, resulting in energy loss similar to DG0. |
+| **Quadrature (Deg 8)** | Increased density of points | ❌ **Low** (~50% Loss) | ✅ **High** (~0.90) | **CRITICAL FINDING**: Increasing degree didn't restore magnitude. This proves the loss isn't due to undersampling, but likely a mismatch between the *storage* points and the *integration* points. If they don't align perfectly, UFL sees "zeros" between points. |
 
 **Conclusion:**
 - To get **Shape** (Correlation), we need element-wise independence (DG0 or Quadrature).
 - To get **Magnitude** (Energy), we need to capture the high gradients of the exponential stress law (DG1 or Higher Degree Quadrature).
-- **Next Step**: Testing Higher Degree Quadrature (Deg 6/8) to see if we can capture the peak energy while maintaining the perfect correlation.
+- **CRITICAL FINDING (Degree 8)**: Increasing degree didn't restore magnitude. This proves the loss isn't due to undersampling, but likely a mismatch between the *storage* points and the *integration* points. If they don't align perfectly, UFL sees "zeros" between points.
+
+## 🧵 Trace of Function Spaces (Resolution Chain)
+
+Understanding the "loss of accuracy" requires tracing the resolution of the data at each step. Here is the pipeline that touches the Septum:
+
+1.  **Geometry / Mesh**:
+    *   Mixed element mesh (Tetrahedra + Hexahedra?).
+    *   Septum is thin: Likely only 1-2 elements thick.
+    *   *Limit*: Any spatial variation smaller than element size is lost immediately.
+
+2.  **Displacement (`u`)**:
+    *   Space: `("Lagrange", 2)` (P2, Quadratic).
+    *   Definition: Continuous.
+    *   *Implication*: This is the "Ground Truth" of movement. It can curve (quadratic).
+
+3.  **Deformation Gradient (`F`) & Strain (`E`)**:
+    *   Math: $F = I + \nabla u$, $E = 0.5(F^T F - I)$.
+    *   Space: Derivatives of P2 are P1 (Linear).
+    *   *Implication*: Strain is effectively **Linear** (DG1) inside each element.
+
+4.  **Stress (`S`)**:
+    *   Math: $S = \partial \Psi / \partial E$.
+    *   Constitutive Law: Exponential ($\Psi \sim e^{E}$).
+    *   *Implication*: Even if Strain is Linear, Stress is **Exponential**.
+    *   *Challenge*: An exponential function $e^{kx}$ cannot be perfectly represented by Linear (P1) or Constant (P0) bases.
+
+5.  **Metrics Calculation (The "Lossy" Step)**:
+    *   We project/interpolate $S$ into a specific space for storage (`W_scalar`):
+        *   **DG0 (Constant)**: Averages the exponential curve. PEAK LOSS = HIGH. MAGNITUDE = WRONG. CORRELATION = GOOD (Local).
+        *   **DG1 (Linear)**: Fits a line to the exponential curve. PEAK CAPTURE = GOOD (Area match). MAGNITUDE = RIGHT. CORRELATION = BAD (Continuity/Overshoot).
+        *   **Quadrature**: Samples exactly at points. EVALUATION = EXACT. INTEGRATION = SENSITIVE. If integration points $\neq$ storage points, result is garbage.
+
+**Conclusion for Accuracy**:
+The "Golden accuracy" (DG1) came from the fact that a **Linear** approximation (DG1) of an Exponential function preserves the **Area** (Energy) much better than a **Constant** approximation (DG0), while still allowing jumps between elements (Discontinuous). The degradation in Septum correlation in DG1 likely comes from "slope artifacts" where the linear gradient overshoots in the very thin septum elements.
+
+**Precision Strategy (Jan 24, 2026)**:
+To resolve this, we have accepted the higher cost of a finer mesh:
+-   **Space**: Reverted to `("DG", 1)` for correct Energy Magnitude.
+-   **Mesh**: Increased resolution (`char_length = 5.0mm`) to allow the linear basis to capture septum curvature without overshoot.
+-   **Validation**: Fixed unit conversion bug in Boundary Work Analysis (Proxy vs Boundary now matches ~12% error).
 
 ---
 
