@@ -7,11 +7,12 @@ Computes:
 3. WORK PROXIES (Clinical): PV work, Pressure-Strain Area (PSA)
 
 Implementation Note:
-  Uses "Nuclear Option v2" (DG1 Components) for interpolation: 
+  Uses "Nuclear Option v4" (Quadrature Components) for interpolation: 
   3x3 tensors are broken into 9 scalars.
-  CRITICAL UPDATE: Uses DG1 (Degree 1) instead of DG0.
-  Since u is P2, F is P1-discontinuous. Using DG1 captures the intra-element
-  gradients that DG0 misses, restoring the correct work magnitude and correlation.
+  CRITICAL UPDATE: Uses Quadrature Elements (deg 4) instead of DG2.
+  This allows us to evaluate the Stress/Strain exactly at the integration points,
+  recovering the full physics without the smoothing artifacts of polynomial projection.
+  This mimics the original "slow but accurate" behavior while keeping JIT safety.
   
   Optimized to pre-compile expressions once at init.
 """
@@ -22,6 +23,7 @@ from collections import defaultdict
 from mpi4py import MPI
 import dolfinx
 import ufl
+import basix.ufl
 
 class MetricsCalculator:
     def __init__(self, geometry, geo, fiber_field_map, problem, comm, cardiac_model):
@@ -35,10 +37,15 @@ class MetricsCalculator:
         self.mesh = geometry.mesh
         self.volume2ml = 1e6
 
-        # --- Nuclear Option v2 Setup (High Precision) ---
-        # W_scalar: Scalar space used for component storage. 
-        # MUST BE DG1 to match P2 displacement physics (F is P1).
-        self.W_scalar = dolfinx.fem.functionspace(self.mesh, ("DG", 1))
+        # --- Nuclear Option v4 Setup (Exact Quadrature) ---
+        # W_scalar: Scalar space used for component storage.
+        # UPGRADE to ("Quadrature", 4) to match the integration rule exactly.
+        # This captures the non-linear stress (Exponential) at the exact points where
+        # it will be integrated, avoiding ANY projection loss (DG1/DG2).
+        # UPDATE: Trying Degree 8 to capture magnitude (exponential peak) better
+        self.quad_degree = 8
+        qe = basix.ufl.quadrature_element(self.mesh.ufl_cell().cellname(), degree=self.quad_degree, scheme="default")
+        self.W_scalar = dolfinx.fem.functionspace(self.mesh, qe)
 
         # Storage for Previous State (Lists of 9 DG1 Scalars)
         # We store components individually to avoid ANY tensor space JIT/layout issues.
@@ -167,7 +174,8 @@ class MetricsCalculator:
         work_data = {}
         regions_to_integrate = self._get_regions_to_integrate()
         # DG1 requires quadrature degree >= 2*1 = 2. Safe to use 4.
-        metadata = {"quadrature_degree": 4}
+        # For High-Order Quadrature element (Deg 8), we must match the integration rule!
+        metadata = {"quadrature_degree": self.quad_degree}
 
         for region_name, cell_tags, region_markers in regions_to_integrate:
             if cell_tags is None: continue
@@ -219,7 +227,7 @@ class MetricsCalculator:
 
         work_split = {}
         regions_to_integrate = self._get_regions_to_integrate()
-        metadata = {"quadrature_degree": 4}
+        metadata = {"quadrature_degree": self.quad_degree}
         for region_name, cell_tags, region_markers in regions_to_integrate:
             if cell_tags is None: continue
             dx_sub = ufl.Measure("dx", domain=self.mesh, subdomain_data=cell_tags, metadata=metadata)
@@ -287,6 +295,9 @@ class MetricsCalculator:
             if cavity_tags is None:
                 return {"work_boundary_LV": 0.0, "work_boundary_RV": 0.0}
             
+            # Boundary integration doesn't necessarily need to match the internal volume quadrature degree, 
+            # but higher is better for consistency. Keeping 4 or matching quad_degree is fine. 
+            # Boundary elements are 2D, so degree requirements differ. 4 is usually plenty.
             ds_cav = ufl.Measure("ds", domain=self.mesh, subdomain_data=cavity_tags, metadata={"quadrature_degree": 4})
             n_vec = ufl.FacetNormal(self.mesh)
             

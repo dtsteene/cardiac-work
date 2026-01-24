@@ -11,10 +11,14 @@
 
 # Use: sbatch --export=BPM=75 run_sim_and_post.sbatch
 # For CI testing (short circuit): sbatch --export=BPM=75,CI=1 run_sim_and_post.sbatch
+# Add a robust comment: sbatch --export=BPM=75,COMMENT="Testing Quadrature" run_sim_and_post.sbatch
+
 BPM=${BPM:-75}
 CI=${CI:-0}
+COMMENT=${COMMENT:-"No description provided"}
 
 echo "--- Job Started: $SLURM_JOB_ID ---"
+echo "Job Description: $COMMENT"
 if [ "$CI" = "1" ]; then
     echo "⚠️  CI MODE ENABLED - Short circuit test (2 timesteps only)"
 else
@@ -47,6 +51,9 @@ mkdir -p ${RESULTS_BASE} ${LOG_DIR}
 # Specific job results directory
 RESULTS_DIR="${RESULTS_BASE}/run_${SLURM_JOB_ID}"
 mkdir -p ${RESULTS_DIR}
+
+# Save the description immediately
+echo "$COMMENT" > "${RESULTS_DIR}/run_description.txt"
 
 # Log files (now properly configured)
 LOG_FILE="${LOG_DIR}/simulation_${SLURM_JOB_ID}.out"

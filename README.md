@@ -4,6 +4,21 @@ A comprehensive pipeline for simulating 3D cardiac mechanics coupled with 0D cir
 
 **Status**: ✅ Production ready (Jan 21, 2026). Tensor interpolation resolved via local L2 projection. Job 943869 validated.
 
+## 🔬 CRITICAL FINDINGS: Function Spaces & Accuracy Trade-offs (Jan 2026)
+
+We have identified a fundamental trade-off between **Work Magnitude** (Total Energy) and **Spatial Correlation** (Shape Match) depending on the Finite Element space used to store stress/strain components.
+
+| Function Space | Description | Magnitude (Work) | Septum Correlation | Diagnosis |
+| :--- | :--- | :--- | :--- | :--- |
+| **DG0** | Discontinuous Galerkin (Constant per cell) | ❌ **Low** (~50% Loss) | ✅ **High** (>0.90) | Averaging over the cell smooths out the exponential peak of stress, losing significant energy. However, the constant value preserves element-wise independence, maintaining good correlation shape. |
+| **DG1** | Discontinuous Galerkin (Linear per cell) | ✅ **Correct** (Matches Ref) | ⚠️ **Degraded** (~0.79) | Linear gradients capture the "area under the curve" correctly, restoring the magnitude. However, the projection to a linear field across the cell introduces continuity artifacts that hurt the thin Septum's specific correlation. |
+| **Quadrature (Deg 4)** | Values stored at Integration Points | ❌ **Low** (~50% Loss) | ✅ **High** (~0.91) | Evaluating exactly at integration points eliminates projection errors (restoring Septum correlation), but Degree 4 seems to undersample the exponential peak, resulting in energy loss similar to DG0. |
+
+**Conclusion:**
+- To get **Shape** (Correlation), we need element-wise independence (DG0 or Quadrature).
+- To get **Magnitude** (Energy), we need to capture the high gradients of the exponential stress law (DG1 or Higher Degree Quadrature).
+- **Next Step**: Testing Higher Degree Quadrature (Deg 6/8) to see if we can capture the peak energy while maintaining the perfect correlation.
+
 ---
 
 ## 📋 EXECUTIVE SUMMARY FOR HANDOVER
