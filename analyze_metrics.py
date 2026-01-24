@@ -542,10 +542,24 @@ def plot_phase_windowed_analysis(data, metrics, output_file=None):
     ax = axes[0, 1]
     ax.scatter(proxy_w, true_w, alpha=0.6, s=30, c='gray', label='All points')
     ax.scatter(ejection_proxy, ejection_true, alpha=0.8, s=50, c='green', label='Ejection', marker='o')
-    z = np.polyfit(proxy_w, true_w, 1)
-    p = np.poly1d(z)
-    px = np.linspace(np.min(proxy_w), np.max(proxy_w), 100)
-    ax.plot(px, p(px), 'b--', linewidth=2, label=f'Global R={global_corr:.3f}')
+    
+    # Guard against degenerate data (all zeros, NaNs, etc.)
+    if len(proxy_w) > 1 and np.isfinite(proxy_w).any() and np.isfinite(true_w).any():
+        try:
+            # Filter out NaN/inf and check for valid range
+            valid_idx = np.isfinite(proxy_w) & np.isfinite(true_w)
+            if np.sum(valid_idx) > 1 and np.std(proxy_w[valid_idx]) > 1e-12:
+                z = np.polyfit(proxy_w[valid_idx], true_w[valid_idx], 1)
+                p = np.poly1d(z)
+                px = np.linspace(np.min(proxy_w[valid_idx]), np.max(proxy_w[valid_idx]), 100)
+                ax.plot(px, p(px), 'b--', linewidth=2, label=f'Global R={global_corr:.3f}')
+            else:
+                ax.text(0.5, 0.5, 'Insufficient data for fit', ha='center', va='center', transform=ax.transAxes)
+        except np.linalg.LinAlgError:
+            ax.text(0.5, 0.5, 'SVD convergence failed', ha='center', va='center', transform=ax.transAxes)
+    else:
+        ax.text(0.5, 0.5, 'No valid data', ha='center', va='center', transform=ax.transAxes)
+    
     ax.set_xlabel('Proxy Work', fontweight='bold')
     ax.set_ylabel('True Work', fontweight='bold')
     ax.set_title('Global Correlation (All Phases)', fontweight='bold')
