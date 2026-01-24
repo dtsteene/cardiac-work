@@ -1,5 +1,0 @@
---- Job Started: 944643 ---
-⚠️  CI MODE ENABLED - Short circuit test (2 timesteps only)
-Thu Jan 22 07:23:46 PM CET 2026
-Conda environment: RV
-slurmstepd: error: *** JOB 944643 ON n015 CANCELLED AT 2026-01-22T19:26:02 ***
