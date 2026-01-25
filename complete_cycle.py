@@ -39,6 +39,10 @@ import argparse
 parser = argparse.ArgumentParser(description='Complete cardiac cycle simulation')
 parser.add_argument('bpm', type=int, nargs='?', default=None, help='Heart rate in BPM (default: 75)')
 parser.add_argument('--ci', action='store_true', help='Enable CI mode (2 timesteps only for quick testing)')
+parser.add_argument('--mesh', type=str, default=None, help='Path to custom XDMF mesh (optional)')
+parser.add_argument('--char_length', type=float, default=5.0, help='Mesh characteristic length (default: 5.0)')
+parser.add_argument('--metrics_space', type=str, default="DG0", choices=["DG0", "DG1"], help='Function space for metrics (DG0 or DG1)')
+parser.add_argument('--circulation_params', type=str, default=None, help='Path to JSON file with circulation parameters')
 args = parser.parse_args()
 
 # Determine BPM
@@ -105,7 +109,15 @@ class MPIFilter(logging.Filter):
     def filter(self, record):
         return 1 if self.comm.rank == 0 else 0
 
-outdir = Path(f"results_biv_complete_cycle_hybrid_{BPM}bpm")
+if args.mesh:
+    mesh_name = Path(args.mesh).stem
+    outdir = Path(f"results_{mesh_name}_hybrid_{BPM}bpm")
+else:
+    # Include knob settings in output directory name for sweeps
+    metrics_str = args.metrics_space.lower()
+    mesh_res_str = f"L{int(args.char_length)}" # L5 or L10
+    outdir = Path(f"results_biv_{metrics_str}_{mesh_res_str}_{BPM}bpm")
+
 comm = MPI.COMM_WORLD
 
 # Rank 0 handles directory creation
@@ -135,23 +147,68 @@ if comm.rank == 0 and not (geodir / "geometry.bp").exists():
     logger.info("Generating and processing geometry (Rank 0)...")
     mode = -1
     std = 0
-    # Higher fidelity mesh (char_length 10 -> 5.0) for better septum accuracy
-    char_length = 5.0
+    # Configurable fidelity mesh (default 5.0)
+    char_length = args.char_length
 
-    # Generate base mesh
-    geo = cardiac_geometries.mesh.ukb(
-        outdir=geodir,
-        comm=MPI.COMM_SELF, # Generation happens on rank 0 only initially
-        mode=mode,
-        std=std,
-        case="ED",
-        char_length_max=char_length,
-        char_length_min=char_length,
-        clipped=True,
-    )
+    if args.mesh:
+        # --- CUSTOM MESH PATH ---
+        logger.info(f"Loading CUSTOM MESH from: {args.mesh}")
+        
+        # 1. Read Mesh
+        with dolfinx.io.XDMFFile(MPI.COMM_SELF, args.mesh, "r") as xdmf:
+             mesh_in = xdmf.read_mesh(name="mesh")
+             
+             # Create connectivity to read facet tags (Requires IndexMap for facets)
+             mesh_in.topology.create_connectivity(mesh_in.topology.dim - 1, mesh_in.topology.dim)
 
-    # Rotate Mesh (Base Normal -> X-axis)
-    geo = geo.rotate(target_normal=[1.0, 0.0, 0.0], base_marker="BASE")
+             # Custom meshes typically have facet_tags
+             try:
+                 ft_in = xdmf.read_meshtags(mesh_in, name="facet_tags")
+             except:
+                 logger.warning("Could not read 'facet_tags', trying 'mesh_tags'...")
+                 ft_in = xdmf.read_meshtags(mesh_in, name="mesh_tags")
+        
+        # 2. Define Markers (Based on Paraview Inspection)
+        # 40: Epicardium, 30: LV Endo, 20: RV Endo, 10: Base
+        markers = {
+            "BASE": (10, 2),
+            "ENDO_LV": (30, 2),
+            "ENDO_RV": (20, 2),
+            "EPI": (40, 2)
+        }
+        
+        # 3. Create Geometry Object
+        # Note: We must create the object structure expected by the rest of the code
+        # We assume standard LDRB fiber creation is needed since XDMF lacked fibers.
+        
+        # Create minimal Geometry object wrapper or use cardiac_geometries class
+        # Ideally we use cardiac_geometries if possible to get helper methods
+        geo = cardiac_geometries.geometry.Geometry(
+            mesh=mesh_in,
+            markers=markers,
+            ffun=ft_in,
+            f0=None, s0=None, n0=None # Fibers generated below
+        )
+        
+        # NOTE: Custom meshes might NOT require rotation if they are already aligned.
+        # Assuming NO ROTATION for now unless proven otherwise.
+        
+    else:
+        # --- DEFAULT UKB GENERATION ---
+        # Generate base mesh
+        geo = cardiac_geometries.mesh.ukb(
+            outdir=geodir,
+            comm=MPI.COMM_SELF, # Generation happens on rank 0 only initially
+            mode=mode,
+            std=std,
+            case="ED",
+            char_length_max=char_length,
+            char_length_min=char_length,
+            clipped=True,
+        )
+
+        # Rotate Mesh (Base Normal -> X-axis)
+        geo = geo.rotate(target_normal=[1.0, 0.0, 0.0], base_marker="BASE")
 
     fiber_angles = dict(
         alpha_endo_lv=60,
@@ -165,10 +222,16 @@ if comm.rank == 0 and not (geodir / "geometry.bp").exists():
     )
 
     # Generate Fibers (LDRB)
+    # Note: LDRB needs transforming markers to its expected keys
+    ldrb_markers = cardiac_geometries.mesh.transform_markers(geo.markers, clipped=True)
+    
+    # If using custom mesh, clipped=True might not be relevant but transform_markers filters by standard keys which is good.
+    # However, for our custom map, we constructed it with standard keys "ENDO_LV" etc, so it should pass.
+    
     system = ldrb.dolfinx_ldrb(
         mesh=geo.mesh,
         ffun=geo.ffun,
-        markers=cardiac_geometries.mesh.transform_markers(geo.markers, clipped=True),
+        markers=ldrb_markers,
         **fiber_angles,
         fiber_space="Quadrature_6",
     )
@@ -178,7 +241,7 @@ if comm.rank == 0 and not (geodir / "geometry.bp").exists():
     system_dg0 = ldrb.dolfinx_ldrb(
         mesh=geo.mesh,
         ffun=geo.ffun,
-        markers=cardiac_geometries.mesh.transform_markers(geo.markers, clipped=True),
+        markers=ldrb_markers,
         **fiber_angles,
         fiber_space="DG_0",
     )
@@ -245,8 +308,13 @@ comm.barrier()
 logger.info("Loading geometry...")
 geo = cardiac_geometries.geometry.Geometry.from_folder(comm=comm, folder=geodir)
 
-# Scale to meters
-scale = 1e-3
+if args.mesh:
+    # Custom mesh assumption: Units in cm (typical for clinical scans)
+    scale = 1e-2
+else:
+    # UKB mesh assumption: Units in mm
+    scale = 1e-3
+
 geo.mesh.geometry.x[:] *= scale
 
 geometry = pulse.HeartGeometry.from_cardiac_geometries(geo, metadata={"quadrature_degree": 6})
@@ -255,13 +323,77 @@ geometry = pulse.HeartGeometry.from_cardiac_geometries(geo, metadata={"quadratur
 volume2ml = 1e6
 mesh_unit = "m"
 
-lvv_target = comm.allreduce(geometry.volume("LV"), op=MPI.SUM)
-rvv_target = comm.allreduce(geometry.volume("RV"), op=MPI.SUM)
+# Helper to assist with parser_ds above which isn't defined
+def parser_ds(ds_measure, marker_id):
+    return ds_measure(marker_id)
+
+lvv_target = 0.0
+rvv_target = 0.0
+
+try:
+    lvv_target = comm.allreduce(geometry.volume("LV"), op=MPI.SUM)
+except Exception:
+    # Fallback for meshes without volume tags (Surface Integral)
+    # V = 1/3 * int(x . n) ds
+    logger.info("Volume tag 'LV' not found. Calculating cavity volume from surface 'ENDO_LV'...")
+    x = ufl.SpatialCoordinate(geometry.mesh)
+    n = ufl.FacetNormal(geometry.mesh)
+    # Note: Normal points OUT of the domain (into the cavity).
+    # So V_cavity = -1/3 * int(x.n) ds(endo)? 
+    # Or is it positive? Divergence theorem on the HOLE?
+    # Usually V = -1/3 int(x.n) ds_endo if n points OUT of wall (INTO cavity).
+    # Let's verify sign convention.
+    try:
+        ds_lv = parser_ds(geometry.ds, geometry.markers["ENDO_LV"][0])
+        val = dolfinx.fem.assemble_scalar(dolfinx.fem.form(-1.0/3.0 * ufl.dot(x, n) * ds_lv))
+        lvv_target = comm.allreduce(val, op=MPI.SUM)
+    except Exception as e:
+        logger.warning(f"Failed to calc LV volume from surface: {e}")
+
+try:
+    rvv_target = comm.allreduce(geometry.volume("RV"), op=MPI.SUM)
+except Exception:
+    logger.info("Volume tag 'RV' not found. Calculating cavity volume from surface 'ENDO_RV'...")
+    x = ufl.SpatialCoordinate(geometry.mesh)
+    n = ufl.FacetNormal(geometry.mesh)
+    try:
+        ds_rv = parser_ds(geometry.ds, geometry.markers["ENDO_RV"][0])
+        val = dolfinx.fem.assemble_scalar(dolfinx.fem.form(-1.0/3.0 * ufl.dot(x, n) * ds_rv))
+        rvv_target = comm.allreduce(val, op=MPI.SUM)
+    except Exception as e:
+        logger.warning(f"Failed to calc RV volume from surface: {e}")
+
+# Helper to assist with parser_ds above which isn't defined
+def parser_ds(ds_measure, marker_id):
+    return ds_measure(marker_id)
 logger.info(
     f"ED Volumes: LV={lvv_target * volume2ml:.2f} mL, RV={rvv_target * volume2ml:.2f} mL",
 )
 
 # --- 0D Circulation Model (From V2) ---
+
+# Helper to update parameters containing units
+def update_parameters_from_json(params, json_params):
+    """
+    Recursively update parameters from JSON dict, preserving units if they exist in params.
+    """
+    ureg = circulation.units.ureg
+    
+    for key, value in json_params.items():
+        if key in params:
+            if isinstance(value, dict) and isinstance(params[key], dict):
+                update_parameters_from_json(params[key], value)
+            else:
+                # Update value, preserving unit if target has one
+                if hasattr(params[key], "units"):
+                    original_unit = params[key].units
+                    # JSON value is number, attach original unit
+                    params[key] = value * original_unit
+                else:
+                    params[key] = value
+        else:
+             # Key in JSON but not in defaults. Add it.
+             params[key] = value
 
 def get_updated_parameters():
     """
@@ -273,6 +405,22 @@ def get_updated_parameters():
     This ensures alignment with the FEM mesh which is at End Diastole.
     """
     params = Regazzoni2020.default_parameters()
+
+    # Load from JSON if provided
+    if args.circulation_params:
+        p_path = Path(args.circulation_params)
+        if p_path.exists():
+            if comm.rank == 0:
+                logger.info(f"Loading circulation parameters from {p_path}")
+            
+            with open(p_path) as f:
+                data = json.load(f)
+            
+            # JSON file structure is {"parameters": {...}} or just {...}
+            # We look for "parameters" key first
+            json_params = data.get("parameters", data)
+            
+            update_parameters_from_json(params, json_params)
 
     # Scale factor relative to reference RR=0.8s (75 BPM)
     factor = RR_INTERVAL / 0.8
@@ -482,8 +630,13 @@ logger.info(f"Target ED Pressures: p_LV={p_LV_ED:.2f} kPa, p_RV={p_RV_ED:.2f} kP
 
 pressure_lv = pulse.Variable(dolfinx.fem.Constant(geometry.mesh, 0.0), "kPa")
 pressure_rv = pulse.Variable(dolfinx.fem.Constant(geometry.mesh, 0.0), "kPa")
-neumann_lv = pulse.NeumannBC(traction=pressure_lv, marker=geometry.markers["LV"][0])
-neumann_rv = pulse.NeumannBC(traction=pressure_rv, marker=geometry.markers["RV"][0])
+
+# FIX: Use ENDO_LV/RV markers directly for surface traction if "LV"/"RV" missing
+lv_marker_id = geometry.markers["LV"][0] if "LV" in geometry.markers else geometry.markers["ENDO_LV"][0]
+rv_marker_id = geometry.markers["RV"][0] if "RV" in geometry.markers else geometry.markers["ENDO_RV"][0]
+
+neumann_lv = pulse.NeumannBC(traction=pressure_lv, marker=lv_marker_id)
+neumann_rv = pulse.NeumannBC(traction=pressure_rv, marker=rv_marker_id)
 
 bcs_prestress = pulse.BoundaryConditions(
     robin=robin, dirichlet=(dirichlet_bc,), neumann=(neumann_lv, neumann_rv),
@@ -529,8 +682,24 @@ s0_map = pulse.utils.map_vector_field(
     geo.additional_data.get("s0_DG_1", geo.s0), u=u_pre, normalize=True, name="s0",
 )
 
-lvv_unloaded = comm.allreduce(geometry.volume("LV"), op=MPI.SUM)
-rvv_unloaded = comm.allreduce(geometry.volume("RV"), op=MPI.SUM)
+# Robust Volume Calculation (Handle missing 'LV' tags)
+x = ufl.SpatialCoordinate(geometry.mesh)
+n = ufl.FacetNormal(geometry.mesh)
+
+try:
+    lvv_unloaded = comm.allreduce(geometry.volume("LV"), op=MPI.SUM)
+except:
+    ds_lv = parser_ds(geometry.ds, geometry.markers["ENDO_LV"][0])
+    val = dolfinx.fem.assemble_scalar(dolfinx.fem.form(-1.0/3.0 * ufl.dot(x, n) * ds_lv))
+    lvv_unloaded = comm.allreduce(val, op=MPI.SUM)
+
+try:
+    rvv_unloaded = comm.allreduce(geometry.volume("RV"), op=MPI.SUM)
+except:
+    ds_rv = parser_ds(geometry.ds, geometry.markers["ENDO_RV"][0])
+    val = dolfinx.fem.assemble_scalar(dolfinx.fem.form(-1.0/3.0 * ufl.dot(x, n) * ds_rv))
+    rvv_unloaded = comm.allreduce(val, op=MPI.SUM)
+
 logger.info(f"Unloaded volumes: LV={lvv_unloaded * volume2ml:.2f} mL, RV={rvv_unloaded * volume2ml:.2f} mL")
 
 model, robin, dirichlet_bc, Ta = setup_problem(
@@ -539,9 +708,14 @@ model, robin, dirichlet_bc, Ta = setup_problem(
 
 lv_volume = dolfinx.fem.Constant(geometry.mesh, dolfinx.default_scalar_type(lvv_unloaded))
 rv_volume = dolfinx.fem.Constant(geometry.mesh, dolfinx.default_scalar_type(rvv_unloaded))
+
+# Use correct markers for Cavity definitions
+lv_marker = "LV" if "LV" in geometry.markers else "ENDO_LV"
+rv_marker = "RV" if "RV" in geometry.markers else "ENDO_RV"
+
 cavities = [
-    pulse.problem.Cavity(marker="LV", volume=lv_volume),
-    pulse.problem.Cavity(marker="RV", volume=rv_volume),
+    pulse.problem.Cavity(marker=lv_marker, volume=lv_volume),
+    pulse.problem.Cavity(marker=rv_marker, volume=rv_volume),
 ]
 
 bcs_forward = pulse.BoundaryConditions(robin=robin, dirichlet=(dirichlet_bc,))
@@ -713,13 +887,16 @@ metrics_model = pulse.CardiacModel(
     compressibility=comp_metrics,
 )
 
+metrics_type_arg = ("DG", 0) if args.metrics_space == "DG0" else ("DG", 1)
+
 metrics_calc = MetricsCalculator(
     geometry=geometry,
     geo=geo,
     fiber_field_map=fiber_fields_map,
     problem=problem,
     comm=comm,
-    cardiac_model=metrics_model  # Use DG fiber model for metrics stress
+    cardiac_model=metrics_model,  # Use DG fiber model for metrics stress
+    metrics_space_type=metrics_type_arg
 )
 
 if comm.rank == 0:

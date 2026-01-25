@@ -26,7 +26,7 @@ import ufl
 import basix.ufl
 
 class MetricsCalculator:
-    def __init__(self, geometry, geo, fiber_field_map, problem, comm, cardiac_model):
+    def __init__(self, geometry, geo, fiber_field_map, problem, comm, cardiac_model, metrics_space_type=("DG", 0)):
         self.geometry = geometry
         self.geo = geo
         self.fiber_fields = fiber_field_map
@@ -36,14 +36,16 @@ class MetricsCalculator:
         self.rank = comm.rank
         self.mesh = geometry.mesh
         self.volume2ml = 1e6
+        self.metrics_space_type = metrics_space_type
 
         # --- Nuclear Option v4 Setup (Exact Quadrature) ---
         # W_scalar: Scalar space used for component storage.
-        # REVERT to ("DG", 1) (Linear) to capture Magnitude correctly.
-        # We rely on finer mesh (char_length=5.0) to fix the correlation/continuity artifacts.
-        self.W_scalar = dolfinx.fem.functionspace(self.mesh, ("DG", 1))
+        # Configurable via metrics_space_type ("DG", 0) or ("DG", 1) etc.
+        # DG0: High Spatial Correlation (No overshoot artifacts)
+        # DG1: High Magnitude Accuracy (Better integration of exponential stress)
+        self.W_scalar = dolfinx.fem.functionspace(self.mesh, self.metrics_space_type)
 
-        # Storage for Previous State (Lists of 9 DG1 Scalars)
+        # Storage for Previous State (Lists of 9 Scalars)
         # We store components individually to avoid ANY tensor space JIT/layout issues.
         # Layout: 0: (0,0), 1: (0,1), 2: (0,2), 3: (1,0)...
         self.S_prev_comps = [dolfinx.fem.Function(self.W_scalar) for _ in range(9)]
