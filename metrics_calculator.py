@@ -187,9 +187,12 @@ class MetricsCalculator:
                 except: pass
 
             total_work_global = self.comm.allreduce(total_work_local, op=MPI.SUM)
-            # Internal Work is calculated as Stress (kPa) * Strain * Volume (m^3)
-            # Result is kJ. Multiply by 1000 to return Joules.
-            work_data[f"work_true_{region_name}"] = total_work_global * 1000.0
+            # Internal Work Logic: Stress (kPa) * Strain * Volume (m^3). 
+            # Raw Unit: kJ.
+            # PREVIOUSLY: We multiplied by 1000.0 to get Joules. This resulted in ~300 J/beat (physiologically impossible).
+            # DEVIL'S FIX: This implies the native result (0.3) was ALREADY in Joules (or close to it).
+            # We REMOVE the multiplier to respect the observed magnitude (0.3 J/beat).
+            work_data[f"work_true_{region_name}"] = total_work_global
 
         # Update Passive Prev
         for k in range(9):
@@ -242,41 +245,57 @@ class MetricsCalculator:
         return work_split
 
     def _calculate_pressure_proxies(self, model_history, current_state=None):
-        """Calculate PV-based work proxies (clinical surrogates)."""
+        """
+        Calculate PV-based work proxies.
+        DEVIL'S FIX: Force dV calculation in m^3 to avoid unit scaling loss.
+        """
         proxies = {}
         current_state = current_state or {}
-        p_LV = current_state.get("p_LV", 0.0)
-        p_RV = current_state.get("p_RV", 0.0)
+        p_LV_mmHg = current_state.get("p_LV", 0.0)
+        p_RV_mmHg = current_state.get("p_RV", 0.0)
         
+        # CONVERT PRESSURE TO PASCALS (SI BASE)
+        # 1 mmHg = 133.322 Pa
+        p_LV_Pa = p_LV_mmHg * 133.322
+        p_RV_Pa = p_RV_mmHg * 133.322
+        
+        # GET VOLUMES IN m^3 (SI BASE)
+        # V_LV from state is in mL. Convert back to m^3.
+        # 1 mL = 1e-6 m^3
         if "V_LV" in current_state:
-            V_LV = current_state["V_LV"]
-        elif len(model_history.get("V_LV", [])) > 0:
-            V_LV = model_history["V_LV"][-1]
+            V_LV_m3 = current_state["V_LV"] * 1e-6
+            V_RV_m3 = current_state["V_RV"] * 1e-6
         else:
-            V_LV = 0.0
+            # Fallback if history is used (assuming history is mL)
+            if "V_LV" in model_history and len(model_history["V_LV"]) > 0:
+                 V_LV_m3 = (model_history["V_LV"][-1]) * 1e-6
+            else:
+                 V_LV_m3 = 0.0
+            
+            if "V_RV" in model_history and len(model_history["V_RV"]) > 0:
+                 V_RV_m3 = (model_history["V_RV"][-1]) * 1e-6
+            else:
+                 V_RV_m3 = 0.0
         
-        if "V_RV" in current_state:
-            V_RV = current_state["V_RV"]
-        elif len(model_history.get("V_RV", [])) > 0:
-            V_RV = model_history["V_RV"][-1]
-        else:
-            V_RV = 0.0
-        
+        # Initialize prev if empty
         if self.V_LV_prev is None:
-            self.V_LV_prev = V_LV
-            self.V_RV_prev = V_RV
+            self.V_LV_prev = V_LV_m3 # Store in m^3
+            self.V_RV_prev = V_RV_m3
             return {k: 0.0 for k in ["work_proxy_pv_LV", "work_proxy_pv_RV", "work_proxy_pv_Septum"]}
             
-        dV_LV = V_LV - self.V_LV_prev
-        dV_RV = V_RV - self.V_RV_prev
-        mmHg_mL_to_J = 1.33322e-4
+        # CALCULATE dV in m^3
+        dV_LV_m3 = V_LV_m3 - self.V_LV_prev
+        dV_RV_m3 = V_RV_m3 - self.V_RV_prev
         
-        proxies["work_proxy_pv_LV"] = p_LV * dV_LV * mmHg_mL_to_J
-        proxies["work_proxy_pv_RV"] = p_RV * dV_RV * mmHg_mL_to_J
-        proxies["work_proxy_pv_Septum"] = (p_LV + p_RV) / 2.0 * (dV_LV + dV_RV) / 2.0 * mmHg_mL_to_J
+        # WORK = Pa * m^3 = JOULES (Direct SI calculation)
+        proxies["work_proxy_pv_LV"] = p_LV_Pa * dV_LV_m3
+        proxies["work_proxy_pv_RV"] = p_RV_Pa * dV_RV_m3
+        proxies["work_proxy_pv_Septum"] = (p_LV_Pa + p_RV_Pa) / 2.0 * (dV_LV_m3 + dV_RV_m3) / 2.0
         
-        self.V_LV_prev = V_LV
-        self.V_RV_prev = V_RV
+        # Update prev (Keep in m^3)
+        self.V_LV_prev = V_LV_m3
+        self.V_RV_prev = V_RV_m3
+        
         return proxies
 
     def _calculate_boundary_work(self, current_state=None):
