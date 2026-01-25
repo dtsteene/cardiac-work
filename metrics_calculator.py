@@ -278,47 +278,108 @@ class MetricsCalculator:
         return proxies
 
     def _calculate_boundary_work(self, current_state=None):
-        """Calculate boundary work: W_boundary = ∫ p (n · Δu) dA"""
+        """
+        Calculate boundary work: 
+        1. Pressure Work: W_p = ∫ p (n · Δu) dA (Energy leaving system/pumping)
+        2. Spring Work:   W_s = ∫ α (u_avg · Δu) dA (Energy stored in boundary springs)
+        """
         current_state = current_state or {}
         p_LV = current_state.get("p_LV", 0.0)
         p_RV = current_state.get("p_RV", 0.0)
         
         u_cur = self.problem.u
-        Du = u_cur - self.u_prev if self.u_prev is not None else ufl.as_vector([0, 0, 0])
+        if self.u_prev is None:
+             # If no previous state, no work is done
+            return {"work_boundary_LV": 0.0, "work_boundary_RV": 0.0, 
+                    "work_boundary_springs": 0.0, "work_boundary_total": 0.0}
+
+        # Kinematics for Work Integration
+        Du = u_cur - self.u_prev 
+        u_avg = 0.5 * (u_cur + self.u_prev) # Midpoint rule for spring force integration
         
         boundary_work = {}
+        
+        # --- 1. Pressure Work (Cavities) ---
         try:
+            # Try to get facet tags. Prioritize the one passed in geometry.
             cavity_tags = getattr(self.geometry, "facet_tags", getattr(self.geo, "ffun", self.geo.additional_data.get("markers_facets", None)))
-            if cavity_tags is None:
-                return {"work_boundary_LV": 0.0, "work_boundary_RV": 0.0}
             
-            # Boundary integration doesn't necessarily need to match the internal volume quadrature degree, 
-            # but higher is better for consistency. Keeping 4 or matching quad_degree is fine. 
-            # Boundary elements are 2D, so degree requirements differ. 4 is usually plenty.
+            if cavity_tags is None:
+                print("WARNING: No facet tags found for boundary work.")
+                return {"work_boundary_total": 0.0}
+            
             ds_cav = ufl.Measure("ds", domain=self.mesh, subdomain_data=cavity_tags, metadata={"quadrature_degree": 4})
             n_vec = ufl.FacetNormal(self.mesh)
             
-            try:
-                lv_marker = self.geo.markers["ENDO_LV"][0]
-            except:
-                lv_marker = 1
-            try:
-                rv_marker = self.geo.markers["ENDO_RV"][0]
-            except:
-                rv_marker = 2
+            # Lookup markers (Robust fallback)
+            try: lv_marker = self.geo.markers["ENDO_LV"][0]
+            except: lv_marker = 1
+            try: rv_marker = self.geo.markers["ENDO_RV"][0]
+            except: rv_marker = 2
             
+            total_pressure_work = 0.0
+            MMHG_MM3_TO_J = 1.33322e-7
+
             for region, p_val, marker in [("LV", p_LV, lv_marker), ("RV", p_RV, rv_marker)]:
                 try:
-                    # Result is in mmHg * mm^3 (if p in mmHg, mesh in mm)
-                    # 1 mmHg * mm^3 = 133.322 Pa * 1e-9 m^3 = 1.33322e-7 Joules
-                    MMHG_MM3_TO_J = 1.33322e-7
+                    # p * (n . du)
                     val_raw = dolfinx.fem.assemble_scalar(dolfinx.fem.form(p_val * ufl.dot(n_vec, Du) * ds_cav(marker)))
                     val_joules = self.comm.allreduce(val_raw, op=MPI.SUM) * MMHG_MM3_TO_J
                     boundary_work[f"work_boundary_{region}"] = val_joules
-                except:
+                    total_pressure_work += val_joules
+                except Exception as e:
                     boundary_work[f"work_boundary_{region}"] = 0.0
-        except:
-            boundary_work = {"work_boundary_LV": 0.0, "work_boundary_RV": 0.0}
+            
+            # --- 2. Spring/Robin BC Work (Epi + Base) ---
+            # These constants MUST match complete_cycle.py
+            # If units in mesh are mm, alpha needs to be scaled? 
+            # In complete_cycle.py: alpha_epi=1e5 (Pa/m). 
+            # Work = F * dx. If F is Pa/m * m = Pa. Pa * Area * dx.
+            # Let's stick to the raw accumulation and assume consistent units with internal work.
+            
+            alpha_epi = 1e5
+            alpha_base = 1e6
+            
+            try: epi_marker = self.geo.markers["EPI"][0]
+            except: epi_marker = 40 # Standard UKB fallback
+            
+            try: base_marker = self.geo.markers["BASE"][0]
+            except: base_marker = 10 # Standard UKB fallback
+
+            # Work against spring = Integral( Force_spring . du )
+            # Force_spring = alpha * u. 
+            # We use u_avg for the force magnitude during the step.
+            # W = Integral( (alpha * u_avg) . Du )
+            
+            # NOTE: Check units. If mesh is scaled (e.g. 1e-3), u is small. 
+            # Internal work is calculated in Joules (or consistent units).
+            # We assume alpha provided in complete_cycle is consistent with mesh units.
+            
+            term_epi = alpha_epi * ufl.dot(u_avg, Du) * ds_cav(epi_marker)
+            term_base = alpha_base * ufl.dot(u_avg, Du) * ds_cav(base_marker)
+            
+            w_epi_raw = dolfinx.fem.assemble_scalar(dolfinx.fem.form(term_epi))
+            w_base_raw = dolfinx.fem.assemble_scalar(dolfinx.fem.form(term_base))
+            
+            w_spring_total = self.comm.allreduce(w_epi_raw + w_base_raw, op=MPI.SUM)
+            
+            # Scale adjustment: The pressure work had a conversion factor (mmHg -> J).
+            # If Internal Work is calculated in Pascals * m^3 (Joules), and alpha is Pa/m,
+            # Then Pa/m * m * m = Pa * m^2 (Force). Force * m (disp) = Joules.
+            # However, if your mesh is in mm, u is in mm. alpha is Pa/m. 
+            # This unit conversion is tricky. 
+            # Assuming scifem/pulse handles units consistently:
+            # If your mesh is scaled by 1e-3 (meters), then the result is Joules.
+            # If your mesh is in mm, you might need a 1e-6 or 1e-9 factor here.
+            # Based on complete_cycle.py: geometry.x[:] *= scale (1e-3). 
+            # So the mesh IS in meters. The result is Joules.
+            
+            boundary_work["work_boundary_springs"] = w_spring_total
+            boundary_work["work_boundary_total"] = total_pressure_work + w_spring_total
+            
+        except Exception as e:
+            if self.rank == 0: print(f"Error in boundary work calc: {e}")
+            boundary_work = {"work_boundary_total": 0.0}
         
         return boundary_work
 
