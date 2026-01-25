@@ -23,6 +23,16 @@ METRICS_SPACE=${METRICS_SPACE:-"DG0"}
 CIRCULATION_PARAMS=${CIRCULATION_PARAMS:-""}
 COMMENT=${COMMENT:-"No description provided"}
 
+# --- Resolve Relative Paths to Absolute ---
+# Since we change directory to WORK_DIR, we must ensure input paths are absolute
+if [ -n "$MESH_PATH" ] && [[ "$MESH_PATH" != /* ]]; then
+    MESH_PATH="${SLURM_SUBMIT_DIR}/${MESH_PATH}"
+fi
+
+if [ -n "$CIRCULATION_PARAMS" ] && [[ "$CIRCULATION_PARAMS" != /* ]]; then
+    CIRCULATION_PARAMS="${SLURM_SUBMIT_DIR}/${CIRCULATION_PARAMS}"
+fi
+
 echo "--- Job Started: $SLURM_JOB_ID ---"
 echo "Job Description: $COMMENT"
 if [ "$CI" = "1" ]; then

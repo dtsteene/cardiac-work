@@ -67,9 +67,9 @@ def print_diagnostics(metrics, results_dir):
     work_proxy_RV = np.array(metrics.get("work_proxy_pv_RV", []))
     
     if len(work_true_LV) > 0:
-        # Convert proxy to Joules
-        work_proxy_LV_J = work_proxy_LV * MMHG_ML_TO_J
-        work_proxy_RV_J = work_proxy_RV * MMHG_ML_TO_J
+        # Metrics are already in SI (Joules) from metrics_calculator.py (Devils Fix)
+        work_proxy_LV_J = work_proxy_LV 
+        work_proxy_RV_J = work_proxy_RV
         
         cumul_true_LV = np.cumsum(work_true_LV)[-1] if len(work_true_LV) > 0 else 0
         cumul_proxy_LV = np.cumsum(work_proxy_LV_J)[-1] if len(work_proxy_LV_J) > 0 else 0
