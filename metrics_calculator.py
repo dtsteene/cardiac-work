@@ -187,7 +187,9 @@ class MetricsCalculator:
                 except: pass
 
             total_work_global = self.comm.allreduce(total_work_local, op=MPI.SUM)
-            work_data[f"work_true_{region_name}"] = total_work_global
+            # Internal Work is calculated as Stress (kPa) * Strain * Volume (m^3)
+            # Result is kJ. Multiply by 1000 to return Joules.
+            work_data[f"work_true_{region_name}"] = total_work_global * 1000.0
 
         # Update Passive Prev
         for k in range(9):
@@ -323,8 +325,13 @@ class MetricsCalculator:
             for region, p_val, marker in [("LV", p_LV, lv_marker), ("RV", p_RV, rv_marker)]:
                 try:
                     # p * (n . du)
+                    # p_val is in mmHg. Mesh is in METERS (standard pulse/scifem).
+                    # 1 mmHg = 133.322 Pa.
+                    # Result Integral = mmHg * m^2 * m = mmHg * m^3.
+                    # Convert to J (Pa*m^3): Multiply only by 133.322.
+                    MMHG_TO_PA = 133.322
                     val_raw = dolfinx.fem.assemble_scalar(dolfinx.fem.form(p_val * ufl.dot(n_vec, Du) * ds_cav(marker)))
-                    val_joules = self.comm.allreduce(val_raw, op=MPI.SUM) * MMHG_MM3_TO_J
+                    val_joules = self.comm.allreduce(val_raw, op=MPI.SUM) * MMHG_TO_PA
                     boundary_work[f"work_boundary_{region}"] = val_joules
                     total_pressure_work += val_joules
                 except Exception as e:
