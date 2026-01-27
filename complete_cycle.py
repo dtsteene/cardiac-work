@@ -5,6 +5,8 @@
 
 import json
 import os
+import csv
+import time as time_module
 import logging
 import shutil
 from pathlib import Path
@@ -43,6 +45,8 @@ parser.add_argument('--mesh', type=str, default=None, help='Path to custom XDMF 
 parser.add_argument('--char_length', type=float, default=5.0, help='Mesh characteristic length (default: 5.0)')
 parser.add_argument('--metrics_space', type=str, default="DG0", choices=["DG0", "DG1"], help='Function space for metrics (DG0 or DG1)')
 parser.add_argument('--circulation_params', type=str, default=None, help='Path to JSON file with circulation parameters')
+parser.add_argument('--alpha_epi', type=float, default=1e5, help='Epicardial spring stiffness (Pa/m) (default: 1e5)')
+parser.add_argument('--alpha_base', type=float, default=1e6, help='Basal spring stiffness (Pa/m) (default: 1e6)')
 args = parser.parse_args()
 
 # Determine BPM
@@ -347,8 +351,11 @@ except Exception:
         ds_lv = parser_ds(geometry.ds, geometry.markers["ENDO_LV"][0])
         val = dolfinx.fem.assemble_scalar(dolfinx.fem.form(-1.0/3.0 * ufl.dot(x, n) * ds_lv))
         lvv_target = comm.allreduce(val, op=MPI.SUM)
+    # RECOMMENDED FIX
     except Exception as e:
-        logger.warning(f"Failed to calc LV volume from surface: {e}")
+        logger.error(f"CRITICAL: Could not calculate LV Volume via tag OR surface integral: {e}")
+        # Stop the script immediately
+        raise RuntimeError("Cannot determine LV target volume. Check mesh markers.")
 
 try:
     rvv_target = comm.allreduce(geometry.volume("RV"), op=MPI.SUM)
@@ -573,7 +580,7 @@ if comm.rank == 0:
 
 # --- Setup Problem (From V1: Uses Scifem and markers_mt) ---
 
-def setup_problem(geometry, f0, s0, material_params):
+def setup_problem(geometry, f0, s0, material_params, alpha_epi_val=1e5, alpha_base_val=1e6):
     material = pulse.HolzapfelOgden(f0=f0, s0=s0, **material_params)
 
     # Use scifem to create simple function space based on markers_mt
@@ -598,12 +605,12 @@ def setup_problem(geometry, f0, s0, material_params):
     )
 
     alpha_epi = pulse.Variable(
-        dolfinx.fem.Constant(geometry.mesh, dolfinx.default_scalar_type(1e5)), "Pa / m",
+        dolfinx.fem.Constant(geometry.mesh, dolfinx.default_scalar_type(alpha_epi_val)), "Pa / m",
     )
     robin_epi = pulse.RobinBC(value=alpha_epi, marker=geometry.markers["EPI"][0])
 
     alpha_base = pulse.Variable(
-        dolfinx.fem.Constant(geometry.mesh, dolfinx.default_scalar_type(1e6)), "Pa / m",
+        dolfinx.fem.Constant(geometry.mesh, dolfinx.default_scalar_type(alpha_base_val)), "Pa / m",
     )
     robin_base = pulse.RobinBC(value=alpha_base, marker=geometry.markers["BASE"][0])
     robin = [robin_epi, robin_base]
@@ -619,6 +626,7 @@ def setup_problem(geometry, f0, s0, material_params):
 material_params = pulse.HolzapfelOgden.transversely_isotropic_parameters()
 model, robin, dirichlet_bc, Ta = setup_problem(
     geometry=geometry, f0=geo.f0, s0=geo.s0, material_params=material_params,
+    alpha_epi_val=args.alpha_epi, alpha_base_val=args.alpha_base
 )
 
 # --- Prestressing (Inverse Elasticity) ---
@@ -751,7 +759,8 @@ fiber_strain_expr = dolfinx.fem.Expression(ufl.inner(E * f0_map, f0_map), W.elem
 
 # Writers
 vtx = dolfinx.io.VTXWriter(geometry.mesh.comm, outdir / "displacement.bp", [problem.u], engine="BP4")
-vtx_stress = dolfinx.io.VTXWriter(geometry.mesh.comm, outdir / "stress_strain.bp", [fiber_stress, fiber_strain], engine="BP4")
+# Edited to include Ta
+vtx_stress = dolfinx.io.VTXWriter(geometry.mesh.comm, outdir / "stress_strain.bp", [fiber_stress, fiber_strain, Ta.value], engine="BP4")
 
 # --- Inflation (Reference -> End-Diastole) ---
 
@@ -864,6 +873,24 @@ adios4dolfinx.write_meshtags(filename, mesh=geometry.mesh, meshtags=geometry.fac
 # Write the markers_mt from V1 logic as well
 adios4dolfinx.write_meshtags(filename, mesh=geometry.mesh, meshtags=geo.additional_data["markers_mt"], meshtag_name="cfun")
 
+# --- Setup "Sublime" Logging ---
+# This file records the heartbeat of the simulation step-by-step
+trace_log_path = outdir / "active_mechanics_trace.csv"
+
+if comm.rank == 0:
+    with open(trace_log_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "Step", "Time", 
+            "Ta_Input_Func",    # The theoretical value from get_activation(t)
+            "Ta_Solver_Max",    # What the solver actually used
+            "Ta_Metrics_Max",   # What the calculator saw (Must match Solver!)
+            "S_Active_Max",     # The resulting physical stress (kPa)
+            "Work_Active_Inc",  # Incremental work done this step
+            "Sync_Error"        # Check if Solver and Metrics are out of sync
+        ])
+    logger.info(f"Trace log initialized: {trace_log_path}")
+
 output_file = outdir / "output.json"
 Ta_history: list[float] = []
 
@@ -903,79 +930,108 @@ if comm.rank == 0:
     logger.info("Metrics calculator initialized for True Work vs Clinical Proxies")
 
 def callback(model, i: int, t: float, save=True):
-    """
-    Callback executed at each timestep.
-
-    Computes and stores:
-    - True work (stress-based) per region
-    - Clinical work proxies (pressure-based) per region
-    - Stress/strain quantities
-
-    Skips plotting (wasteful on compute nodes).
-    Saves everything at every timestep but allows downsampling later.
-    """
-
-    # Interpolate stress/strain fields for checkpointing
+    # 1. Update Inputs
+    raw_activation_vec = get_activation(t)
+    Ta_history.append(raw_activation_vec)
     fiber_stress.interpolate(fiber_stress_expr)
     fiber_strain.interpolate(fiber_strain_expr)
-    Ta_history.append(get_activation(t))
+    
+    # 2. FORCE SYNC
+    solver_ta_array = Ta.value.x.array[:]
+    metrics_calc.cardiac_model.active.activation.value.x.array[:] = solver_ta_array  
+    max_ta_solver = np.max(solver_ta_array)
 
-    # Update state tracking for work calculation
+    # 3. METRICS CALCULATION
     if i == 0:
-        # First step: initialize previous state
         metrics_calc.update_state()
         metrics_calc_skip_work = True
     else:
         metrics_calc_skip_work = False
 
-    # Explicitly get current state (P and V) to ensure metrics calculator has them
-    # irrespective of history update timing
+    # Get current state
     lv_p_kPa = problem.cavity_pressures[0].x.array[0] * 1e-3
     rv_p_kPa = problem.cavity_pressures[1].x.array[0] * 1e-3
-
     current_state = {
         "p_LV": circulation.units.kPa_to_mmHg(lv_p_kPa),
         "p_RV": circulation.units.kPa_to_mmHg(rv_p_kPa),
+        "V_LV": float(lv_volume.value * volume2ml),
+        "V_RV": float(rv_volume.value * volume2ml)
     }
-
-    # Prefer directly computed cavity volumes (mechanics side) to avoid empty 0D history timing.
-    # lv_volume/rv_volume are in m^3; convert to mL for consistency with circulation volumes.
-    V_LV_ml = float(lv_volume.value * volume2ml)
-    V_RV_ml = float(rv_volume.value * volume2ml)
-    current_state["V_LV"] = V_LV_ml
-    current_state["V_RV"] = V_RV_ml
-
-    if comm.rank == 0 and i < 5:
-        print(f"DEBUG VOLUMES i={i}: lv_volume.value={float(lv_volume.value):.3e} m^3 → {V_LV_ml:.3f} mL, rv_volume.value={float(rv_volume.value):.3e} m^3 → {V_RV_ml:.3f} mL")
-
-    # If the 0D model exposes volumes, keep them as an alternate sanity check (not primary).
+    
     if hasattr(model, "V_LV"):
         current_state.setdefault("V_LV_0D", model.V_LV)
     if hasattr(model, "V_RV"):
         current_state.setdefault("V_RV_0D", model.V_RV)
 
-    # Compute all metrics for this timestep
     region_metrics = metrics_calc.compute_regional_metrics(
-        timestep_idx=i,
-        t=t,
+        timestep_idx=i, t=t,
         model_history=model.history,
         skip_work_calc=metrics_calc_skip_work,
         current_state=current_state
     )
 
-    # Store metrics (all timesteps; downsampling happens at save time)
-    metrics_calc.store_metrics(region_metrics, i, t, downsample_factor=1)
+    # 4. SUBLIME LOGGING (Expanded)
+    if comm.rank == 0:
+        s_act_max = region_metrics.get("debug_S_active_max", 0.0)
+        
+        # Energy Breakdown
+        w_total = region_metrics.get("work_true_LV", 0.0)
+        w_fiber = region_metrics.get("work_fiber_LV", 0.0)
+        w_sheet = region_metrics.get("work_sheet_LV", 0.0)
+        w_normal = region_metrics.get("work_normal_LV", 0.0)
+        w_shear = region_metrics.get("work_shear_LV", 0.0)
+        w_passive = region_metrics.get("work_passive_LV", 0.0)
+        w_robin = region_metrics.get("work_robin_epi", 0.0)
+        
+        # NEW: Pressure-Strain Index
+        w_ps_idx = region_metrics.get("work_ps_index_LV", 0.0)
 
-    # Update state for next iteration (after metrics computed)
+        ta_internal = region_metrics.get("debug_Ta_internal_max", 0.0)
+        sync_error = abs(max_ta_solver - ta_internal)
+
+        if i == 0 or not trace_log_path.exists():
+            with open(trace_log_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "Step", "Time", "Ta_Solver", "S_Act_Max",
+                    "W_Total", "W_Fiber", "W_Sheet", "W_Normal", "W_Shear",
+                    "W_Passive", "W_Robin_Epi", "W_PS_Index", # <--- Added
+                    "Sync_Error"
+                ])
+
+        with open(trace_log_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                i, f"{t:.5f}", 
+                f"{max_ta_solver:.5f}", 
+                f"{s_act_max:.5f}",         
+                f"{w_total:.6e}",
+                f"{w_fiber:.6e}",
+                f"{w_sheet:.6e}",
+                f"{w_normal:.6e}",
+                f"{w_shear:.6e}",
+                f"{w_passive:.6e}",
+                f"{w_robin:.6e}",
+                f"{w_ps_idx:.6e}", # <--- Added
+                f"{sync_error:.1e}"
+            ])
+            
+        if i % 10 == 0:
+            print(f"STEP {i:04d} | t={t:.3f} | W_Tot={w_total:.1e} | W_Fib={w_fiber:.1e} | W_PS_Idx={w_ps_idx:.1e}")
+
+    region_metrics["Ta"] = max_ta_solver
+    # Store metrics
+    metrics_calc.store_metrics(region_metrics, i, t, downsample_factor=1)
     metrics_calc.update_state()
 
+    # 5. Save Files
     if save:
         vtx.write(t)
         vtx_stress.write(t)
         adios4dolfinx.write_function(filename, u=problem.u, name="displacement", time=t)
         adios4dolfinx.write_function(filename, u=fiber_stress, name="fiber_stress", time=t)
         adios4dolfinx.write_function(filename, u=fiber_strain, name="fiber_strain", time=t)
-
+        
         out = {k: v[: i + 1] for k, v in model.history.items()}
         out["Ta"] = Ta_history
         V_LV = model.history["V_LV"][: i + 1] - error_LV
@@ -985,9 +1041,6 @@ def callback(model, i: int, t: float, save=True):
 
         if comm.rank == 0:
             output_file.write_text(json.dumps(out, indent=4, default=custom_json))
-
-            # No incremental plotting (wasteful on compute nodes)
-            # Plots will be generated in post-processing if needed
 
 # --- Run Simulation ---
 

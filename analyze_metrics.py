@@ -665,6 +665,9 @@ def plot_comparison(data, output_file=None):
         if min_p_len > 0:
             true_w = true_w[-min_p_len:]
             proxy_w = proxy_w[-min_p_len:]
+        else:
+             print(f"Warning: No data to plot for {region}")
+             continue
 
         color = colors.get(region, "black")
 
@@ -690,6 +693,130 @@ def plot_comparison(data, output_file=None):
         print(f"✓ Saved: {Path(output_file).name}")
 
     plt.close()
+
+
+def _maybe_get_metric(metrics, keys):
+    """Return the first available metric in keys, else None."""
+    for key in keys:
+        if key in metrics and len(metrics.get(key, [])) > 0:
+            return np.array(metrics[key])
+    return None
+
+
+def plot_stress_strain_loops(metrics, output_dir):
+    """Plot regional fiber stress-strain loops if data is available.
+
+    Expected keys (first available is used):
+      - Septum: fiber_stress_Septum, S_ff_Septum
+                fiber_strain_Septum, E_ff_Septum
+      - Lateral/LV free wall: fiber_stress_Lateral, fiber_stress_LV
+                               fiber_strain_Lateral, fiber_strain_LV
+    """
+    septum_stress = _maybe_get_metric(metrics, ["mean_S_ff_Septum", "fiber_stress_Septum", "S_ff_Septum"])
+    septum_strain = _maybe_get_metric(metrics, ["mean_E_ff_Septum", "fiber_strain_Septum", "E_ff_Septum"])
+    lateral_stress = _maybe_get_metric(metrics, ["mean_S_ff_LV", "fiber_stress_Lateral", "fiber_stress_LV"])
+    lateral_strain = _maybe_get_metric(metrics, ["mean_E_ff_LV", "fiber_strain_Lateral", "fiber_strain_LV"])
+
+    if any(v is None for v in [septum_stress, septum_strain, lateral_stress, lateral_strain]):
+        print("⚠ Stress-strain loop data not found (fiber stress/strain arrays missing). Skipping plot.")
+        return None
+
+    # Ensure equal lengths
+    min_len_septum = min(len(septum_stress), len(septum_strain))
+    min_len_lat = min(len(lateral_stress), len(lateral_strain))
+    if min_len_septum < 3 or min_len_lat < 3:
+        print("⚠ Stress-strain data too short to plot. Skipping.")
+        return None
+
+    septum_stress = septum_stress[:min_len_septum]
+    septum_strain = septum_strain[:min_len_septum]
+    lateral_stress = lateral_stress[:min_len_lat]
+    lateral_strain = lateral_strain[:min_len_lat]
+
+    fig, ax = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
+
+    # Septum loop
+    ax[0].plot(septum_strain, septum_stress, "r-", linewidth=2, label="Septum")
+    ax[0].set_title("Septum: Fiber Stress-Strain")
+    ax[0].set_xlabel(r"Fiber Strain ($E_{ff}$)")
+    ax[0].set_ylabel(r"Fiber Stress ($S_{ff}$) [Pa]")
+    ax[0].grid(True, alpha=0.3)
+    if len(septum_strain) > 2:
+        mid = len(septum_strain) // 2
+        dx = septum_strain[min(mid+1, len(septum_strain)-1)] - septum_strain[mid]
+        dy = septum_stress[min(mid+1, len(septum_stress)-1)] - septum_stress[mid]
+        ax[0].arrow(septum_strain[mid], septum_stress[mid], dx, dy, head_width=0.005, color="black")
+
+    # Lateral loop
+    ax[1].plot(lateral_strain, lateral_stress, "b-", linewidth=2, label="Lateral")
+    ax[1].set_title("Lateral: Fiber Stress-Strain")
+    ax[1].set_xlabel(r"Fiber Strain ($E_{ff}$)")
+    ax[1].grid(True, alpha=0.3)
+
+    plt.suptitle("Regional Myocardial Work Assessment (Fiber Loops)")
+    plt.tight_layout()
+    outfile = Path(output_dir) / "fiber_stress_strain_loops.png"
+    plt.savefig(outfile, dpi=150, bbox_inches="tight")
+    print(f"✓ Saved: {outfile.name}")
+    plt.close()
+    return outfile
+
+
+def plot_energy_balance(metrics, region, output_dir):
+    """Plot bar chart comparing external PV work vs internal tensor vs fiber work."""
+    region_key = region
+    proxy = np.array(metrics.get(f"work_proxy_pv_{region_key}", []))
+    tensor = np.array(metrics.get(f"work_true_{region_key}", []))
+    fiber = np.array(metrics.get(f"work_fiber_{region_key}", []))
+
+    if len(proxy) == 0 or len(tensor) == 0:
+        print(f"⚠ Energy balance: missing proxy or tensor work for {region}. Skipping.")
+        return None
+
+    W_ext = float(np.cumsum(proxy)[-1])
+    W_int = float(np.cumsum(tensor)[-1])
+    W_fiber = float(np.cumsum(fiber)[-1]) if len(fiber) > 0 else None
+
+    labels = ["External Work\n(PV Area)", "Internal Work\n(Full Tensor)"]
+    values = [W_ext, W_int]
+    colors = ["gray", "green"]
+
+    if W_fiber is not None:
+        labels.append("Internal Work\n(Fiber Only)")
+        values.append(W_fiber)
+        colors.append("blue")
+
+    plt.figure(figsize=(8, 6))
+    bars = plt.bar(labels, values, color=colors, alpha=0.8)
+    plt.axhline(y=W_ext, color="gray", linestyle="--", linewidth=1, label="PV Area Baseline")
+
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height, f"{height:.3e}", ha="center", va="bottom")
+
+    plt.ylabel("Work (J)")
+    plt.title(f"{region} Energy Balance: Model vs Clinical Proxy")
+    plt.legend()
+
+    fiber_pct = (W_fiber / W_int * 100) if (W_fiber is not None and abs(W_int) > 1e-12) else None
+    footer = f"Full Tensor Work should be ≥ PV area."
+    if fiber_pct is not None:
+        footer += f" Fiber share = {fiber_pct:.1f}% of tensor work."
+    plt.figtext(0.5, -0.08, footer, ha="center", fontsize=10, bbox={"facecolor":"orange", "alpha":0.2, "pad":5})
+
+    plt.tight_layout()
+    outfile = Path(output_dir) / f"energy_balance_{region}.png"
+    plt.savefig(outfile, dpi=150, bbox_inches="tight")
+    print(f"✓ Saved: {outfile.name}")
+    plt.close()
+    return {
+        "region": region,
+        "external_work": W_ext,
+        "internal_work_tensor": W_int,
+        "internal_work_fiber": W_fiber,
+        "fiber_fraction": fiber_pct,
+        "outfile": str(outfile),
+    }
 
 
 def print_statistics(stats):
@@ -774,7 +901,23 @@ def main():
     else:
         print("⚠ No volume data for phase analysis")
 
-    # --- 6. Save Statistics ---
+    # --- 6. Fiber Stress-Strain Loops (optional) ---
+    print("\n" + "="*80)
+    print("FIBER STRESS-STRAIN LOOPS")
+    print("="*80)
+    loops_file = plot_stress_strain_loops(metrics, results_dir)
+
+    # --- 7. Energy Balance Bar Charts ---
+    print("\n" + "="*80)
+    print("ENERGY BALANCE (PV vs Tensor vs Fiber)")
+    print("="*80)
+    energy_stats = {}
+    for region in ["LV", "RV", "Septum"]:
+        res = plot_energy_balance(metrics, region, results_dir)
+        if res:
+            energy_stats[region] = res
+
+    # --- 8. Save Statistics ---
     stats_json = {k: {kk: float(vv) if isinstance(vv, (np.floating, np.integer)) else vv
                       for kk, vv in v.items()} for k, v in stats.items()}
     
@@ -782,6 +925,10 @@ def main():
         stats_json["phase_analysis_LV"] = phase_analysis
     if boundary_validation:
         stats_json["boundary_validation"] = boundary_validation
+    if energy_stats:
+        stats_json["energy_balance"] = energy_stats
+    if loops_file:
+        stats_json["fiber_stress_strain_loops"] = {"file": str(loops_file)}
 
     stats_file = results_dir / f"work_statistics_downsample_{downsample_factor}.json"
     with open(stats_file, "w") as f:

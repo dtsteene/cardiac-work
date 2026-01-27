@@ -1,22 +1,3 @@
-"""
-Cardiac Mechanics Metrics Calculator (Component-wise Scalar Interpolation Version)
-
-Computes:
-1. TRUE WORK (Internal): ∫ 0.5*(S_prev + S_curr) : (E_curr - E_prev) dV
-2. BOUNDARY WORK (External): ∫ (p n · Δu) dA
-3. WORK PROXIES (Clinical): PV work, Pressure-Strain Area (PSA)
-
-Implementation Note:
-  Uses "Nuclear Option v4" (Quadrature Components) for interpolation: 
-  3x3 tensors are broken into 9 scalars.
-  CRITICAL UPDATE: Uses Quadrature Elements (deg 4) instead of DG2.
-  This allows us to evaluate the Stress/Strain exactly at the integration points,
-  recovering the full physics without the smoothing artifacts of polynomial projection.
-  This mimics the original "slow but accurate" behavior while keeping JIT safety.
-  
-  Optimized to pre-compile expressions once at init.
-"""
-
 import numpy as np
 from pathlib import Path
 from collections import defaultdict
@@ -35,446 +16,311 @@ class MetricsCalculator:
         self.comm = comm
         self.rank = comm.rank
         self.mesh = geometry.mesh
-        self.volume2ml = 1e6
-        self.metrics_space_type = metrics_space_type
-
-        # --- Nuclear Option v4 Setup (Exact Quadrature) ---
-        # W_scalar: Scalar space used for component storage.
-        # Configurable via metrics_space_type ("DG", 0) or ("DG", 1) etc.
-        # DG0: High Spatial Correlation (No overshoot artifacts)
-        # DG1: High Magnitude Accuracy (Better integration of exponential stress)
-        self.W_scalar = dolfinx.fem.functionspace(self.mesh, self.metrics_space_type)
-
-        # Storage for Previous State (Lists of 9 Scalars)
-        # We store components individually to avoid ANY tensor space JIT/layout issues.
-        # Layout: 0: (0,0), 1: (0,1), 2: (0,2), 3: (1,0)...
-        self.S_prev_comps = [dolfinx.fem.Function(self.W_scalar) for _ in range(9)]
-        self.E_prev_comps = [dolfinx.fem.Function(self.W_scalar) for _ in range(9)]
-        self.S_passive_prev_comps = [dolfinx.fem.Function(self.W_scalar) for _ in range(9)]
         
-        self.u_prev = dolfinx.fem.Function(self.problem.u.function_space)
+        # --- 1. Define Function Spaces ---
+        element_type = metrics_space_type[0]
+        degree = metrics_space_type[1]
+        
+        # Scalar Space (for Work Density, Strain Energy)
+        self.W_scalar = dolfinx.fem.functionspace(self.mesh, (element_type, degree))
+        
+        # Tensor Space (for Stress S and Strain E)
+        self.W_tensor = dolfinx.fem.functionspace(self.mesh, (element_type, degree, (3, 3)))
 
-        # Persistent temp scalar for interpolation
-        self.temp_scalar = dolfinx.fem.Function(self.W_scalar)
+        # --- 2. Define Functions for State Tracking ---
+        self.S_total = dolfinx.fem.Function(self.W_tensor, name="S_total")
+        self.S_active = dolfinx.fem.Function(self.W_tensor, name="S_active")
+        self.S_passive = dolfinx.fem.Function(self.W_tensor, name="S_passive")
+        self.S_comp = dolfinx.fem.Function(self.W_tensor, name="S_compressible")
+        
+        self.E_cur = dolfinx.fem.Function(self.W_tensor, name="E_cur")
+        self.E_prev = dolfinx.fem.Function(self.W_tensor, name="E_prev")
+        
+        # Initialize Previous State to Zero
+        self.E_prev.x.array[:] = 0.0
 
-        # Pre-compile basic UFL expressions and Component Expressions
+        # --- 3. Setup UFL Expressions ---
         self._setup_expressions()
 
-        # Storage & State tracking
+        # History and State flags
         self.metrics_history = defaultdict(list)
         self.has_previous_state = False
         self.V_LV_prev = None
         self.V_RV_prev = None
-        self.septum_tags = geo.additional_data.get("markers_mt", None)
-        self.aha_tags = None
+        
+        # Strain History for PS Loops
+        self.eps_LV_prev = 0.0
+        self.eps_RV_prev = 0.0
+        
+        # Region Tags
+        self.region_tags = geo.additional_data.get("markers_mt", None)
 
     def _setup_expressions(self):
-        """Pre-compile core UFL expressions and their component-wise JIT kernels."""
-        f0 = self.fiber_fields['f0']
         u = self.problem.u
         I = ufl.Identity(3)
         F = ufl.variable(ufl.grad(u) + I)
-        C = F.T * F
+        C = ufl.variable(F.T * F) 
         E = 0.5 * (C - I)
+        
+        S_tot_ufl = self.cardiac_model.S(C)
+        S_act_ufl = self.cardiac_model.active.S(C)
+        S_pas_ufl = self.cardiac_model.material.S(C)
+        S_cmp_ufl = self.cardiac_model.compressibility.S(C)
 
-        # Save UFL objects
-        self.C = C
-        self.E = E
-        
-        # 1. Define UFL Tensors to Track
-        S_total = self.cardiac_model.S(ufl.variable(C))
-        S_passive = self.cardiac_model.material.S(ufl.variable(C))
-        
-        # 2. Get Points for Interpolation (DG1 points)
-        points = self.W_scalar.element.interpolation_points
-        
-        # 3. Pre-compile Expressions for each component (3x3=9 each)
-        self.expr_S_total = self._compile_component_expressions(S_total, points)
-        self.expr_S_passive = self._compile_component_expressions(S_passive, points)
-        self.expr_E = self._compile_component_expressions(E, points)
-        
-    def _compile_component_expressions(self, tensor_ufl, points):
-        """Helper: Create a 3x3 grid of scalar dolfinx.Expressions for a tensor."""
-        exprs = []
-        for i in range(3):
-            row_exprs = []
-            for j in range(3):
-                try:
-                    expr = dolfinx.fem.Expression(tensor_ufl[i, j], points)
-                    row_exprs.append(expr)
-                except Exception as e:
-                    print(f"Error compiling component ({i},{j}): {e}")
-                    raise e
-            exprs.append(row_exprs)
-        return exprs
-
-    def _update_components(self, compiled_exprs, target_funcs_list):
-        """
-        Interpolate expression components into a list of scalar functions.
-        """
-        # Loop through all 9 components
-        for i in range(3):
-            for j in range(3):
-                expr = compiled_exprs[i][j]
-                flat_idx = i * 3 + j
-                # Direct interpolation into the specific scalar function component
-                target_funcs_list[flat_idx].interpolate(expr)
+        points = self.W_tensor.element.interpolation_points
+        self.expr_E = dolfinx.fem.Expression(E, points)
+        self.expr_S_total = dolfinx.fem.Expression(S_tot_ufl, points)
+        self.expr_S_active = dolfinx.fem.Expression(S_act_ufl, points)
+        self.expr_S_passive = dolfinx.fem.Expression(S_pas_ufl, points)
+        self.expr_S_comp = dolfinx.fem.Expression(S_cmp_ufl, points)
 
     def update_state(self):
-        """Update previous state components."""
-        # 1. Update S (Total) Prev
-        self._update_components(self.expr_S_total, self.S_prev_comps)
+        """Called at the END of a timestep to shift Current -> Prev."""
+        self.E_prev.x.array[:] = self.E_cur.x.array[:]
         
-        # 2. Update E Prev
-        self._update_components(self.expr_E, self.E_prev_comps)
-
-        # 3. Update u Prev
-        if self.u_prev is not None and self.problem.u is not None:
-             self.u_prev.x.array[:] = self.problem.u.x.array
-
+        # Track displacement for boundary work
+        if not hasattr(self, '_u_prev'):
+            self._u_prev = dolfinx.fem.Function(self.problem.u.function_space)
+        self._u_prev.x.array[:] = self.problem.u.x.array[:]
+        
         self.has_previous_state = True
-
-    def _calculate_true_work(self):
-        """Calculate true work summing component-wise products."""
-        # Note: We need Current S and E, but we can't overwrite Prev yet because 
-        # we need S_prev and E_prev for the calculation.
-        # We use temp lists for Current.
         
-        S_cur_comps = [dolfinx.fem.Function(self.W_scalar) for _ in range(9)]
-        E_cur_comps = [dolfinx.fem.Function(self.W_scalar) for _ in range(9)]
-        
-        # 1. Get Current State
-        self._update_components(self.expr_S_total, S_cur_comps)
-        self._update_components(self.expr_E, E_cur_comps)
+    def _calculate_state_variables(self):
+        """
+        Calculates absolute state variables (Stress, Strain) at the current time.
+        Run this EVERY step (including t=0).
+        """
+        # --- A. Interpolate Physics ---
+        self.E_cur.interpolate(self.expr_E)
+        self.S_total.interpolate(self.expr_S_total)
+        self.S_active.interpolate(self.expr_S_active)
 
-        # 2. Construct Work Density Expression (Sum of 9 component products)
-        # W = sum( 0.5 * (S_prev_i + S_cur_i) * (E_cur_i - E_prev_i) )
-        W_density = 0.0
-        for k in range(9):
-            dS_avg = 0.5 * (self.S_prev_comps[k] + S_cur_comps[k])
-            dE = E_cur_comps[k] - self.E_prev_comps[k]
-            W_density += dS_avg * dE
+        # --- B. Integration ---
+        data = {}
+
+        # Probe internal active tension
+        try:
+            data["debug_Ta_internal_max"] = np.max(self.cardiac_model.active.activation.value.x.array)
+        except Exception:
+            data["debug_Ta_internal_max"] = 0.0
             
-        # --- Passive Only Work (Debug) ---
-        S_pass_cur_comps = [dolfinx.fem.Function(self.W_scalar) for _ in range(9)]
-        self._update_components(self.expr_S_passive, S_pass_cur_comps)
-        
-        W_passive_density = 0.0
-        for k in range(9):
-            # For passive, we should update S_passive_prev.
-            # But wait, did we initialize S_passive_prev? 
-            # In first step it's 0. Good.
-            dS_pass_avg = 0.5 * (self.S_passive_prev_comps[k] + S_pass_cur_comps[k])
-            dE = E_cur_comps[k] - self.E_prev_comps[k]
-            W_passive_density += dS_pass_avg * dE
+        data["debug_S_active_max"] = np.max(self.S_active.x.array)
 
-        # Integrate
-        work_data = {}
-        regions_to_integrate = self._get_regions_to_integrate()
-        # DG1 requires quadrature degree >= 2*1 = 2. Safe to use 4.
-        metadata = {"quadrature_degree": 4}
+        regions = self._get_regions_to_integrate()
+        f0 = self.fiber_fields['f0']
 
-        for region_name, cell_tags, region_markers in regions_to_integrate:
-            if cell_tags is None: continue
-            dx_sub = ufl.Measure("dx", domain=self.mesh, subdomain_data=cell_tags, metadata=metadata)
-            total_work_local = 0.0
-            passive_work_local = 0.0
+        # Helper: Project Tensor T onto direction v
+        def proj(T, v): return ufl.inner(ufl.dot(T, v), v)
+
+        for region_name, cell_tags, region_markers in regions:
+            # Setup Measure
+            dx_sub = ufl.Measure("dx", domain=self.mesh, subdomain_data=cell_tags, metadata={"quadrature_degree": 4})
             
-            for marker_val in region_markers:
-                try:
-                    total_work_local += dolfinx.fem.assemble_scalar(dolfinx.fem.form(W_density * dx_sub(int(marker_val))))
-                    passive_work_local += dolfinx.fem.assemble_scalar(dolfinx.fem.form(W_passive_density * dx_sub(int(marker_val))))
-                except: pass
+            def assemble_region(expr):
+                val = 0.0
+                for m in region_markers:
+                    form = dolfinx.fem.form(expr * dx_sub(int(m)))
+                    val += dolfinx.fem.assemble_scalar(form)
+                return self.comm.allreduce(val, op=MPI.SUM)
 
-            total_work_global = self.comm.allreduce(total_work_local, op=MPI.SUM)
-            # Internal Work Logic: Stress (kPa) * Strain * Volume (m^3). 
-            # Raw Unit: kJ.
-            # PREVIOUSLY: We multiplied by 1000.0 to get Joules. This resulted in ~300 J/beat (physiologically impossible).
-            # DEVIL'S FIX: This implies the native result (0.3) was ALREADY in Joules (or close to it).
-            # We REMOVE the multiplier to respect the observed magnitude (0.3 J/beat).
-            work_data[f"work_true_{region_name}"] = total_work_global
-
-        # Update Passive Prev
-        for k in range(9):
-            self.S_passive_prev_comps[k].x.array[:] = S_pass_cur_comps[k].x.array[:]
+            # Volume and Averages
+            vol = assemble_region(dolfinx.fem.Constant(self.mesh, 1.0))
             
-        return work_data
+            if vol > 1e-12:
+                S_active_mag = ufl.sqrt(ufl.inner(self.S_active, self.S_active))
+                data[f"mean_S_ff_{region_name}"] = assemble_region(proj(self.S_total, f0)) / vol
+                data[f"mean_E_ff_{region_name}"] = assemble_region(proj(self.E_cur, f0)) / vol
+                data[f"mean_S_active_{region_name}"] = assemble_region(S_active_mag) / vol
+            else:
+                data[f"mean_S_ff_{region_name}"] = 0.0
+                data[f"mean_E_ff_{region_name}"] = 0.0
+                data[f"mean_S_active_{region_name}"] = 0.0
+                
+        return data
 
-    def _calculate_active_passive_work(self):
-        """Calculate active vs passive work split using magnitude-based fraction."""
-        # Re-fetch current state (overhead is small compared to correctness)
-        # Ideally we could pass these from _calculate_true_work but the API is split.
-        S_cur_comps = [dolfinx.fem.Function(self.W_scalar) for _ in range(9)]
-        E_cur_comps = [dolfinx.fem.Function(self.W_scalar) for _ in range(9)]
-        self._update_components(self.expr_S_total, S_cur_comps)
-        self._update_components(self.expr_E, E_cur_comps)
+    def _calculate_incremental_work(self):
+        """
+        Calculates Work Densities (S : dE).
+        Run this only when previous state exists.
+        """
+        # 1. Update interpolations needed for work (Passive/Comp)
+        self.S_passive.interpolate(self.expr_S_passive)
+        self.S_comp.interpolate(self.expr_S_comp)
         
-        # Calculate Magnitude of S_prev
-        S_double_dot = 0.0
-        for k in range(9):
-            S_double_dot += self.S_prev_comps[k] * self.S_prev_comps[k]
+        dE = self.E_cur - self.E_prev
         
-        S_mag = ufl.sqrt(S_double_dot + 1e-10)
-        S_ref = 10.0e3
-        active_frac = ufl.tanh(S_mag / S_ref)
+        # 2. Define Work Densities (UFL)
+        wd_total = ufl.inner(self.S_total, dE)
+        wd_active = ufl.inner(self.S_active, dE)
+        wd_passive = ufl.inner(self.S_passive, dE)
+        wd_comp = ufl.inner(self.S_comp, dE)
+        
+        f0 = self.fiber_fields['f0']
+        s0 = self.fiber_fields['s0'] 
+        n0 = self.fiber_fields['n0'] 
+        
+        def proj(T, v): return ufl.inner(ufl.dot(T, v), v)
+        
+        wd_fiber = proj(self.S_total, f0) * proj(dE, f0)
+        wd_sheet = proj(self.S_total, s0) * proj(dE, s0)
+        wd_normal = proj(self.S_total, n0) * proj(dE, n0)
+        wd_shear = wd_total - (wd_fiber + wd_sheet + wd_normal)
+        wd_passive_fiber = proj(self.S_passive, f0) * proj(dE, f0)
 
-        W_total = 0.0
-        for k in range(9):
-             W_avg = 0.5 * (self.S_prev_comps[k] + S_cur_comps[k])
-             dE = E_cur_comps[k] - self.E_prev_comps[k]
-             W_total += W_avg * dE
-             
-        W_active_density = active_frac * W_total
-        W_passive_density = (1.0 - active_frac) * W_total
+        # 3. Integration
+        data = {}
+        regions = self._get_regions_to_integrate()
+        
+        for region_name, cell_tags, region_markers in regions:
+            dx_sub = ufl.Measure("dx", domain=self.mesh, subdomain_data=cell_tags, metadata={"quadrature_degree": 4})
+            
+            def assemble_region(expr):
+                val = 0.0
+                for m in region_markers:
+                    form = dolfinx.fem.form(expr * dx_sub(int(m)))
+                    val += dolfinx.fem.assemble_scalar(form)
+                return self.comm.allreduce(val, op=MPI.SUM)
 
-        work_split = {}
-        regions_to_integrate = self._get_regions_to_integrate()
-        metadata = {"quadrature_degree": 4}
-        for region_name, cell_tags, region_markers in regions_to_integrate:
-            if cell_tags is None: continue
-            dx_sub = ufl.Measure("dx", domain=self.mesh, subdomain_data=cell_tags, metadata=metadata)
-            w_active = 0.0
-            w_passive = 0.0
-            for val in region_markers:
-                try:
-                    w_active += dolfinx.fem.assemble_scalar(dolfinx.fem.form(W_active_density * dx_sub(int(val))))
-                    w_passive += dolfinx.fem.assemble_scalar(dolfinx.fem.form(W_passive_density * dx_sub(int(val))))
-                except: pass
-            work_split[f"work_active_{region_name}"] = self.comm.allreduce(w_active, op=MPI.SUM)
-            work_split[f"work_passive_{region_name}"] = self.comm.allreduce(w_passive, op=MPI.SUM)
-        return work_split
-
+            data[f"work_true_{region_name}"] = assemble_region(wd_total)
+            data[f"work_active_{region_name}"] = assemble_region(wd_active)
+            data[f"work_passive_{region_name}"] = assemble_region(wd_passive)
+            data[f"work_comp_{region_name}"] = assemble_region(wd_comp)
+            
+            data[f"work_fiber_{region_name}"] = assemble_region(wd_fiber)
+            data[f"work_sheet_{region_name}"] = assemble_region(wd_sheet)   
+            data[f"work_normal_{region_name}"] = assemble_region(wd_normal) 
+            data[f"work_shear_{region_name}"] = assemble_region(wd_shear)   
+            data[f"work_passive_fiber_{region_name}"] = assemble_region(wd_passive_fiber)
+            
+        return data
+    
     def _calculate_pressure_proxies(self, model_history, current_state=None):
-        """
-        Calculate PV-based work proxies.
-        DEVIL'S FIX: Force dV calculation in m^3 to avoid unit scaling loss.
-        """
+        """Calculate PV-based proxies."""
         proxies = {}
         current_state = current_state or {}
+        
         p_LV_mmHg = current_state.get("p_LV", 0.0)
         p_RV_mmHg = current_state.get("p_RV", 0.0)
         
-        # CONVERT PRESSURE TO PASCALS (SI BASE)
-        # 1 mmHg = 133.322 Pa
         p_LV_Pa = p_LV_mmHg * 133.322
         p_RV_Pa = p_RV_mmHg * 133.322
         
-        # GET VOLUMES IN m^3 (SI BASE)
-        # V_LV from state is in mL. Convert back to m^3.
-        # 1 mL = 1e-6 m^3
-        if "V_LV" in current_state:
-            V_LV_m3 = current_state["V_LV"] * 1e-6
-            V_RV_m3 = current_state["V_RV"] * 1e-6
-        else:
-            # Fallback if history is used (assuming history is mL)
-            if "V_LV" in model_history and len(model_history["V_LV"]) > 0:
-                 V_LV_m3 = (model_history["V_LV"][-1]) * 1e-6
-            else:
-                 V_LV_m3 = 0.0
-            
-            if "V_RV" in model_history and len(model_history["V_RV"]) > 0:
-                 V_RV_m3 = (model_history["V_RV"][-1]) * 1e-6
-            else:
-                 V_RV_m3 = 0.0
+        V_LV_m3 = current_state.get("V_LV", 0.0) * 1e-6
+        V_RV_m3 = current_state.get("V_RV", 0.0) * 1e-6
         
-        # Initialize prev if empty
         if self.V_LV_prev is None:
-            self.V_LV_prev = V_LV_m3 # Store in m^3
+            self.V_LV_prev = V_LV_m3
             self.V_RV_prev = V_RV_m3
-            return {k: 0.0 for k in ["work_proxy_pv_LV", "work_proxy_pv_RV", "work_proxy_pv_Septum"]}
+            return {k: 0.0 for k in ["work_proxy_pv_LV", "work_proxy_pv_RV"]}
             
-        # CALCULATE dV in m^3
-        dV_LV_m3 = V_LV_m3 - self.V_LV_prev
-        dV_RV_m3 = V_RV_m3 - self.V_RV_prev
+        dV_LV = V_LV_m3 - self.V_LV_prev
+        dV_RV = V_RV_m3 - self.V_RV_prev
         
-        # WORK = Pa * m^3 = JOULES (Direct SI calculation)
-        proxies["work_proxy_pv_LV"] = p_LV_Pa * dV_LV_m3
-        proxies["work_proxy_pv_RV"] = p_RV_Pa * dV_RV_m3
-        proxies["work_proxy_pv_Septum"] = (p_LV_Pa + p_RV_Pa) / 2.0 * (dV_LV_m3 + dV_RV_m3) / 2.0
+        proxies["work_proxy_pv_LV"] = p_LV_Pa * dV_LV
+        proxies["work_proxy_pv_RV"] = p_RV_Pa * dV_RV
         
-        # Update prev (Keep in m^3)
         self.V_LV_prev = V_LV_m3
         self.V_RV_prev = V_RV_m3
-        
         return proxies
 
-    def _calculate_boundary_work(self, current_state=None):
-        """
-        Calculate boundary work: 
-        1. Pressure Work: W_p = ∫ p (n · Δu) dA (Energy leaving system/pumping)
-        2. Spring Work:   W_s = ∫ α (u_avg · Δu) dA (Energy stored in boundary springs)
-        """
-        current_state = current_state or {}
-        p_LV = current_state.get("p_LV", 0.0)
-        p_RV = current_state.get("p_RV", 0.0)
+    def _calculate_pressure_strain_work(self, current_state, mechanics_data):
+        """Calculates Pressure-Strain Work Index (PSWI)."""
+        data = {}
+        p_LV = current_state.get("p_LV", 0.0) * 133.322
+        p_RV = current_state.get("p_RV", 0.0) * 133.322
         
+        eps_LV = mechanics_data.get("mean_E_ff_LV", 0.0)
+        eps_RV = mechanics_data.get("mean_E_ff_RV", 0.0)
+        
+        dE_LV = eps_LV - self.eps_LV_prev
+        dE_RV = eps_RV - self.eps_RV_prev
+        
+        data["work_ps_index_LV"] = p_LV * dE_LV
+        data["work_ps_index_RV"] = p_RV * dE_RV
+        
+        self.eps_LV_prev = eps_LV
+        self.eps_RV_prev = eps_RV
+        return data
+    
+    def _calculate_robin_work(self):
+        """
+        Calculates work done BY the boundary springs ON the mesh.
+        UNSILENCED: This will crash if alpha values are not found or variables mismatch.
+        """
+        du = self.problem.u - self._u_prev if hasattr(self, '_u_prev') else self.problem.u
         u_cur = self.problem.u
-        if self.u_prev is None:
-             # If no previous state, no work is done
-            return {"work_boundary_LV": 0.0, "work_boundary_RV": 0.0, 
-                    "work_boundary_springs": 0.0, "work_boundary_total": 0.0}
-
-        # Kinematics for Work Integration
-        Du = u_cur - self.u_prev 
-        u_avg = 0.5 * (u_cur + self.u_prev) # Midpoint rule for spring force integration
         
-        boundary_work = {}
+        # Tags for boundary
+        tag_epi = self.geometry.markers["EPI"][0]
+        tag_base = self.geometry.markers["BASE"][0]
         
-        # --- 1. Pressure Work (Cavities) ---
-        try:
-            # Try to get facet tags. Prioritize the one passed in geometry.
-            cavity_tags = getattr(self.geometry, "facet_tags", getattr(self.geo, "ffun", self.geo.additional_data.get("markers_facets", None)))
-            
-            if cavity_tags is None:
-                print("WARNING: No facet tags found for boundary work.")
-                return {"work_boundary_total": 0.0}
-            
-            ds_cav = ufl.Measure("ds", domain=self.mesh, subdomain_data=cavity_tags, metadata={"quadrature_degree": 4})
-            n_vec = ufl.FacetNormal(self.mesh)
-            
-            # Lookup markers (Robust fallback)
-            try: lv_marker = self.geo.markers["ENDO_LV"][0]
-            except: lv_marker = 1
-            try: rv_marker = self.geo.markers["ENDO_RV"][0]
-            except: rv_marker = 2
-            
-            total_pressure_work = 0.0
-            MMHG_MM3_TO_J = 1.33322e-7
-
-            for region, p_val, marker in [("LV", p_LV, lv_marker), ("RV", p_RV, rv_marker)]:
-                try:
-                    # p * (n . du)
-                    # p_val is in mmHg. Mesh is in METERS (standard pulse/scifem).
-                    # 1 mmHg = 133.322 Pa.
-                    # Result Integral = mmHg * m^2 * m = mmHg * m^3.
-                    # Convert to J (Pa*m^3): Multiply only by 133.322.
-                    MMHG_TO_PA = 133.322
-                    val_raw = dolfinx.fem.assemble_scalar(dolfinx.fem.form(p_val * ufl.dot(n_vec, Du) * ds_cav(marker)))
-                    val_joules = self.comm.allreduce(val_raw, op=MPI.SUM) * MMHG_TO_PA
-                    boundary_work[f"work_boundary_{region}"] = val_joules
-                    total_pressure_work += val_joules
-                except Exception as e:
-                    boundary_work[f"work_boundary_{region}"] = 0.0
-            
-            # --- 2. Spring/Robin BC Work (Epi + Base) ---
-            # These constants MUST match complete_cycle.py
-            # If units in mesh are mm, alpha needs to be scaled? 
-            # In complete_cycle.py: alpha_epi=1e5 (Pa/m). 
-            # Work = F * dx. If F is Pa/m * m = Pa. Pa * Area * dx.
-            # Let's stick to the raw accumulation and assume consistent units with internal work.
-            
-            alpha_epi = 1e5
-            alpha_base = 1e6
-            
-            try: epi_marker = self.geo.markers["EPI"][0]
-            except: epi_marker = 40 # Standard UKB fallback
-            
-            try: base_marker = self.geo.markers["BASE"][0]
-            except: base_marker = 10 # Standard UKB fallback
-
-            # Work against spring = Integral( Force_spring . du )
-            # Force_spring = alpha * u. 
-            # We use u_avg for the force magnitude during the step.
-            # W = Integral( (alpha * u_avg) . Du )
-            
-            # NOTE: Check units. If mesh is scaled (e.g. 1e-3), u is small. 
-            # Internal work is calculated in Joules (or consistent units).
-            # We assume alpha provided in complete_cycle is consistent with mesh units.
-            
-            term_epi = alpha_epi * ufl.dot(u_avg, Du) * ds_cav(epi_marker)
-            term_base = alpha_base * ufl.dot(u_avg, Du) * ds_cav(base_marker)
-            
-            w_epi_raw = dolfinx.fem.assemble_scalar(dolfinx.fem.form(term_epi))
-            w_base_raw = dolfinx.fem.assemble_scalar(dolfinx.fem.form(term_base))
-            
-            w_spring_total = self.comm.allreduce(w_epi_raw + w_base_raw, op=MPI.SUM)
-            
-            # Scale adjustment: The pressure work had a conversion factor (mmHg -> J).
-            # If Internal Work is calculated in Pascals * m^3 (Joules), and alpha is Pa/m,
-            # Then Pa/m * m * m = Pa * m^2 (Force). Force * m (disp) = Joules.
-            # However, if your mesh is in mm, u is in mm. alpha is Pa/m. 
-            # This unit conversion is tricky. 
-            # Assuming scifem/pulse handles units consistently:
-            # If your mesh is scaled by 1e-3 (meters), then the result is Joules.
-            # If your mesh is in mm, you might need a 1e-6 or 1e-9 factor here.
-            # Based on complete_cycle.py: geometry.x[:] *= scale (1e-3). 
-            # So the mesh IS in meters. The result is Joules.
-            
-            boundary_work["work_boundary_springs"] = w_spring_total
-            boundary_work["work_boundary_total"] = total_pressure_work + w_spring_total
-            
-        except Exception as e:
-            if self.rank == 0: print(f"Error in boundary work calc: {e}")
-            boundary_work = {"work_boundary_total": 0.0}
+        ds_epi = self.geometry.ds(tag_epi)
+        ds_base = self.geometry.ds(tag_base)
         
-        return boundary_work
-
-    def _calculate_pressure_strain_area(self, current_state=None):
-        """Calculate Pressure-Strain Area (PSA) metrics."""
-        current_state = current_state or {}
-        psa_metrics = {}
-        # Simplified: PSA calculation deferred if complex tensor ops needed
-        return psa_metrics
+        # WARNING: Hardcoded default stiffnesses. 
+        # Ideal: Pass these in __init__ from main.py args.
+        alpha_epi_val = 1e5 
+        alpha_base_val = 1e6 
+        
+        # Form definition
+        term_epi = -alpha_epi_val * ufl.inner(u_cur, du) * ds_epi
+        term_base = -alpha_base_val * ufl.inner(u_cur, du) * ds_base
+        
+        # Assembly (No Try/Except!)
+        wd_epi = self.comm.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(term_epi)), op=MPI.SUM)
+        wd_base = self.comm.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(term_base)), op=MPI.SUM)
+            
+        return {"work_robin_epi": wd_epi, "work_robin_base": wd_base}
 
     def _get_regions_to_integrate(self):
-        """Return list of (region_name, cell_tags, markers) tuples for integration."""
         regions = []
-        if self.septum_tags is not None:
-            regions.append(("LV", self.septum_tags, np.array([1])))
-            regions.append(("RV", self.septum_tags, np.array([2])))
-            regions.append(("Septum", self.septum_tags, np.array([3])))
-        if self.aha_tags is not None:
-            for label in range(0, 7):
-                regions.append((f"AHA_{label}", self.aha_tags, np.array([label])))
+        if self.region_tags is not None:
+            regions.append(("LV", self.region_tags, [1])) 
+            regions.append(("RV", self.region_tags, [2]))
+            regions.append(("Septum", self.region_tags, [3]))
+            regions.append(("Whole", self.region_tags, [1, 2, 3, 4]))
         return regions
 
     def store_metrics(self, region_metrics, timestep_idx, t, downsample_factor=1):
-        """Store metrics for a timestep."""
-        if timestep_idx % downsample_factor != 0:
-            return
+        if timestep_idx % downsample_factor != 0: return
         self.metrics_history["time"].append(t)
-        self.metrics_history["timestep"].append(timestep_idx)
-        for metric_name, value in region_metrics.items():
-            self.metrics_history[metric_name].append(value)
+        for key, value in region_metrics.items():
+            self.metrics_history[key].append(value)
 
-    def save_metrics(self, output_dir, downsample_factors=None):
-        """Save metrics to numpy files with downsampling."""
-        if self.rank != 0:
-            return
+    def save_metrics(self, output_dir, downsample_factors=[1]):
+        if self.rank != 0: return
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        if downsample_factors is None:
-            downsample_factors = [1]
-        
         for factor in downsample_factors:
-            downsampled = {}
-            indices = np.arange(0, len(self.metrics_history["time"]), factor)
-            for key, values in self.metrics_history.items():
-                if isinstance(values, list):
-                    downsampled[key] = [values[i] for i in indices if i < len(values)]
-            filename = output_dir / f"metrics_downsample_{factor}.npy"
-            np.save(filename, downsampled, allow_pickle=True)
-            print(f"✓ Saved metrics (downsample={factor}) to {filename}")
+            downsampled = {k: v[::factor] for k, v in self.metrics_history.items()}
+            np.save(output_dir / f"metrics_downsample_{factor}.npy", downsampled, allow_pickle=True)
 
-    def load_aha_tags(self, checkpoint_file):
-        """Load AHA segmentation tags from checkpoint."""
-        pass
-
-    def compute_regional_metrics(self, timestep_idx, t, model_history,
-                                 skip_work_calc=False, current_state=None):
-        """Compute all regional metrics for a timestep."""
+    def compute_regional_metrics(self, timestep_idx, t, model_history, skip_work_calc=False, current_state=None):
         metrics = {}
+        
+        # 1. ALWAYS calculate state variables (Stress/Strain exist at t=0)
+        # This fixes the KeyError because "mean_S_ff_LV" is now always created
+        state_data = self._calculate_state_variables()
+        metrics.update(state_data)
+
+        # 2. CONDITIONALLY calculate work (requires dt)
         if not skip_work_calc and self.has_previous_state:
-            metrics.update(self._calculate_true_work())
-            metrics.update(self._calculate_active_passive_work())
-            metrics.update(self._calculate_boundary_work(current_state))
+            # Mechanics Work
+            work_data = self._calculate_incremental_work()
+            metrics.update(work_data)
+            
+            # PV Loop Work
             metrics.update(self._calculate_pressure_proxies(model_history, current_state))
-            metrics.update(self._calculate_pressure_strain_area(current_state))
+            
+            # PS Work (Pass state_data so we can use current Strain!)
+            metrics.update(self._calculate_pressure_strain_work(current_state, state_data))
+            
+            # Robin Work
+            metrics.update(self._calculate_robin_work())
             
             if self.rank == 0:
-                p_LV = current_state.get("p_LV", model_history.get("p_LV", [0.0])[-1] if "p_LV" in model_history else 0.0)
-                V_LV = current_state.get("V_LV", model_history.get("V_LV", [0.0])[-1] if "V_LV" in model_history else 0.0)
-                w_true_lv = metrics.get("work_true_LV", 0.0)
-                print(f"METRICS STEP | i={timestep_idx}, t={t:.4f} s | p_LV={p_LV:.2f} mmHg, V_LV={V_LV:.2f} mL | True={w_true_lv:.3e}")
+                w_tot = metrics.get("work_true_LV", 0.0)
+                ps_idx = metrics.get("work_ps_index_LV", 0.0)
+                print(f"STATS | t={t:.3f} | W_Tot={w_tot:.4e} | PS_Idx={ps_idx:.4e}")
         
         return metrics

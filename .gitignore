@@ -6,3 +6,9 @@ log/
 *.sbatch.out
 *.sbatch.err
 data/
+
+# Experimental artifacts (plots, analysis scripts)
+*.png
+*.jpg
+*.gif
+*.pdf

@@ -18,9 +18,11 @@
 BPM=${BPM:-75}
 CI=${CI:-0}
 MESH_PATH=${MESH_PATH:-""}
-CHAR_LENGTH=${CHAR_LENGTH:-5.0}
+CHAR_LENGTH=${CHAR_LENGTH:-10.0}
 METRICS_SPACE=${METRICS_SPACE:-"DG0"}
 CIRCULATION_PARAMS=${CIRCULATION_PARAMS:-""}
+ALPHA_EPI=${ALPHA_EPI:-""}
+ALPHA_BASE=${ALPHA_BASE:-""}
 COMMENT=${COMMENT:-"No description provided"}
 
 # --- Resolve Relative Paths to Absolute ---
@@ -68,6 +70,15 @@ fi
 # CI Mode
 if [ "$CI" = "1" ]; then
     ARGS_STR="$ARGS_STR --ci"
+fi
+
+# Spring Stiffness Overrides
+if [ -n "$ALPHA_EPI" ]; then
+    ARGS_STR="$ARGS_STR --alpha_epi $ALPHA_EPI"
+fi
+
+if [ -n "$ALPHA_BASE" ]; then
+    ARGS_STR="$ARGS_STR --alpha_base $ALPHA_BASE"
 fi
 
 date
@@ -135,7 +146,15 @@ RESULTS_WORK=$(find . -maxdepth 1 -type d -name "results_*" | grep -v "geometry"
 
 if [ -d "$RESULTS_WORK" ]; then
     echo "Found raw results: $RESULTS_WORK"
-    # Copy contents to the permanent storage BEFORE post-processing
+    
+    # 1. Check for the Trace Log specifically
+    if [ -f "$RESULTS_WORK/active_mechanics_trace.csv" ]; then
+        echo "✓ Found Active Mechanics Trace Log"
+    else
+        echo "⚠️  WARNING: Trace log missing from results folder"
+    fi
+
+    # 2. Copy contents
     cp -r "$RESULTS_WORK"/* ${RESULTS_DIR}/ 2>/dev/null || true
     echo "✓ Raw data saved to ${RESULTS_DIR}/"
 else
