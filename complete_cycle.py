@@ -662,7 +662,7 @@ if not prestress_fname.exists():
             pulse.unloading.TargetPressure(traction=pressure_lv, target=p_LV_ED, name="LV"),
             pulse.unloading.TargetPressure(traction=pressure_rv, target=p_RV_ED, name="RV"),
         ],
-        ramp_steps=20,
+        ramp_steps=5,
     )
     u_pre = prestress_problem.unload()
     adios4dolfinx.write_function_on_input_mesh(prestress_fname, u_pre, time=0.0, name="u_pre")
@@ -874,23 +874,10 @@ adios4dolfinx.write_meshtags(filename, mesh=geometry.mesh, meshtags=geometry.fac
 adios4dolfinx.write_meshtags(filename, mesh=geometry.mesh, meshtags=geo.additional_data["markers_mt"], meshtag_name="cfun")
 
 # --- Setup "Sublime" Logging ---
-# This file records the heartbeat of the simulation step-by-step
+# Log path definition moved to where metrics calculator is initialized
 trace_log_path = outdir / "active_mechanics_trace.csv"
 
-if comm.rank == 0:
-    with open(trace_log_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "Step", "Time", 
-            "Ta_Input_Func",    # The theoretical value from get_activation(t)
-            "Ta_Solver_Max",    # What the solver actually used
-            "Ta_Metrics_Max",   # What the calculator saw (Must match Solver!)
-            "S_Active_Max",     # The resulting physical stress (kPa)
-            "Work_Active_Inc",  # Incremental work done this step
-            "Sync_Error"        # Check if Solver and Metrics are out of sync
-        ])
-    logger.info(f"Trace log initialized: {trace_log_path}")
-
+# output_file definition
 output_file = outdir / "output.json"
 Ta_history: list[float] = []
 
@@ -923,16 +910,28 @@ metrics_calc = MetricsCalculator(
     problem=problem,
     comm=comm,
     cardiac_model=metrics_model,  # Use DG fiber model for metrics stress
-    metrics_space_type=metrics_type_arg
+    metrics_space_type=metrics_type_arg,
+    alpha_epi=args.alpha_epi,
+    alpha_base=args.alpha_base
 )
+
+# Streamlined logging: Setup CSV trace inside metrics calculator
+metrics_calc.setup_csv_logging(trace_log_path)
 
 if comm.rank == 0:
     logger.info("Metrics calculator initialized for True Work vs Clinical Proxies")
 
 def callback(model, i: int, t: float, save=True):
     # 1. Update Inputs
+    # Note: get_activation is called here primarily to ensure Ta_history is updated and for input logging.
+    # The actual update of the solver's Ta should generally be handled by the circulation model logic (p_BiV_func)
+    # or if this simulation is just feed-forward, then here.
+    # Assuming standard flow where p_BiV_func also calls get_activation, there's no harm calling it here for reading.
     raw_activation_vec = get_activation(t)
+    # Just grab the max for logging purposes (since it's an array [LV, Sept, RV])
+    ta_input_val = np.max(raw_activation_vec)
     Ta_history.append(raw_activation_vec)
+    
     fiber_stress.interpolate(fiber_stress_expr)
     fiber_strain.interpolate(fiber_strain_expr)
     
@@ -970,57 +969,35 @@ def callback(model, i: int, t: float, save=True):
         current_state=current_state
     )
 
-    # 4. SUBLIME LOGGING (Expanded)
-    if comm.rank == 0:
-        s_act_max = region_metrics.get("debug_S_active_max", 0.0)
-        
-        # Energy Breakdown
+    # 4. Streamlined Logging
+    # Enrich metrics with local inputs/states for the trace CSV
+    region_metrics.update(current_state)
+    region_metrics["Ta_Input_Func"] = ta_input_val
+    region_metrics["Ta_Solver"] = max_ta_solver
+    
+    ta_internal = region_metrics.get("debug_Ta_internal_max", 0.0)
+    region_metrics["Sync_Error"] = abs(max_ta_solver - ta_internal)
+
+    # Console Feedback
+    if comm.rank == 0 and (i % 10 == 0 or CI_MODE):
         w_total = region_metrics.get("work_true_LV", 0.0)
-        w_fiber = region_metrics.get("work_fiber_LV", 0.0)
-        w_sheet = region_metrics.get("work_sheet_LV", 0.0)
-        w_normal = region_metrics.get("work_normal_LV", 0.0)
-        w_shear = region_metrics.get("work_shear_LV", 0.0)
-        w_passive = region_metrics.get("work_passive_LV", 0.0)
-        w_robin = region_metrics.get("work_robin_epi", 0.0)
-        
-        # NEW: Pressure-Strain Index
-        w_ps_idx = region_metrics.get("work_ps_index_LV", 0.0)
+        e_ff_lv = region_metrics.get("mean_E_ff_LV", 0.0)
+        v_lv_ml = current_state.get("V_LV", 0.0)
+        print(f"STEP {i:04d} | t={t:.3f} | Ta={max_ta_solver:.1f} | E_ff={e_ff_lv:.3f} | V_LV={v_lv_ml:.1f}mL | W_Tot={w_total:.1e}")
 
-        ta_internal = region_metrics.get("debug_Ta_internal_max", 0.0)
-        sync_error = abs(max_ta_solver - ta_internal)
+        # Detailed print for interactive inspection
+        if CI_MODE or i % 50 == 0:
+             print(f"\n   --- Work Metrics Breakout (Step {i}) ---")
+             # Group by region for clarity
+             for region in ["LV", "RV", "Septum"]:
+                 print(f"   [{region}]")
+                 keys = [k for k in region_metrics.keys() if region in k and "work" in k]
+                 for k in sorted(keys):
+                     val = region_metrics[k]
+                     print(f"     {k:<30}: {val:.4e}")
+             print("   ---------------------------------------\n")
 
-        if i == 0 or not trace_log_path.exists():
-            with open(trace_log_path, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    "Step", "Time", "Ta_Solver", "S_Act_Max",
-                    "W_Total", "W_Fiber", "W_Sheet", "W_Normal", "W_Shear",
-                    "W_Passive", "W_Robin_Epi", "W_PS_Index", # <--- Added
-                    "Sync_Error"
-                ])
-
-        with open(trace_log_path, "a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                i, f"{t:.5f}", 
-                f"{max_ta_solver:.5f}", 
-                f"{s_act_max:.5f}",         
-                f"{w_total:.6e}",
-                f"{w_fiber:.6e}",
-                f"{w_sheet:.6e}",
-                f"{w_normal:.6e}",
-                f"{w_shear:.6e}",
-                f"{w_passive:.6e}",
-                f"{w_robin:.6e}",
-                f"{w_ps_idx:.6e}", # <--- Added
-                f"{sync_error:.1e}"
-            ])
-            
-        if i % 10 == 0:
-            print(f"STEP {i:04d} | t={t:.3f} | W_Tot={w_total:.1e} | W_Fib={w_fiber:.1e} | W_PS_Idx={w_ps_idx:.1e}")
-
-    region_metrics["Ta"] = max_ta_solver
-    # Store metrics
+    # Store metrics (handles CSV writing via metrics_calc.trace_path)
     metrics_calc.store_metrics(region_metrics, i, t, downsample_factor=1)
     metrics_calc.update_state()
 
@@ -1032,14 +1009,14 @@ def callback(model, i: int, t: float, save=True):
         adios4dolfinx.write_function(filename, u=fiber_stress, name="fiber_stress", time=t)
         adios4dolfinx.write_function(filename, u=fiber_strain, name="fiber_strain", time=t)
         
-        out = {k: v[: i + 1] for k, v in model.history.items()}
-        out["Ta"] = Ta_history
-        V_LV = model.history["V_LV"][: i + 1] - error_LV
-        V_RV = model.history["V_RV"][: i + 1] - error_RV
-        out["V_LV"] = V_LV
-        out["V_RV"] = V_RV
-
-        if comm.rank == 0:
+        # Save JSON history only every 10 steps to reduce I/O (redundant with CSV)
+        if comm.rank == 0 and i % 10 == 0:
+            out = {k: v[: i + 1] for k, v in model.history.items()}
+            out["Ta"] = Ta_history
+            V_LV = model.history["V_LV"][: i + 1] - error_LV
+            V_RV = model.history["V_RV"][: i + 1] - error_RV
+            out["V_LV"] = V_LV
+            out["V_RV"] = V_RV
             output_file.write_text(json.dumps(out, indent=4, default=custom_json))
 
 # --- Run Simulation ---

@@ -84,15 +84,31 @@ def main(results_dir_str):
     # --- 3. Work Time Series ---
     # Cumulative work over time
     cum_tensor = np.cumsum(data["work_true_LV"])
+    
+    # helper for robust length
+    def safer_cumsum(key, target_len):
+        arr = data.get(key, np.zeros(target_len))
+        if len(arr) == 0:
+            return np.zeros(target_len)
+        return np.cumsum(arr)
+
     cum_fiber = np.cumsum(data["work_fiber_LV"])
-    cum_normal = np.cumsum(data.get("work_normal_LV", [0]*len(cum_tensor)))
-    cum_shear = np.cumsum(data.get("work_shear_LV", [0]*len(cum_tensor)))
+    cum_normal = safer_cumsum("work_normal_LV", len(cum_tensor))
+    cum_shear = safer_cumsum("work_shear_LV", len(cum_tensor))
+
+    # Align Time and Work lengths
+    n_plot = min(len(time), len(cum_tensor))
+    t_plot = time[:n_plot]
+    cum_tensor = cum_tensor[:n_plot]
+    cum_fiber = cum_fiber[:n_plot]
+    cum_normal = cum_normal[:n_plot]
+    cum_shear = cum_shear[:n_plot]
 
     fig2, ax2 = plt.subplots(figsize=(10, 4))
-    ax2.plot(time, cum_tensor, 'k-', label='Total Internal Work', linewidth=2)
-    ax2.plot(time, cum_fiber, 'r--', label='Fiber Work', linewidth=2)
-    ax2.plot(time, cum_normal, 'g:', label='Normal Work', linewidth=1.5)
-    ax2.plot(time, cum_shear, 'b:', label='Shear Work', linewidth=1.5)
+    ax2.plot(t_plot, cum_tensor, 'k-', label='Total Internal Work', linewidth=2)
+    ax2.plot(t_plot, cum_fiber, 'r--', label='Fiber Work', linewidth=2)
+    ax2.plot(t_plot, cum_normal, 'g:', label='Normal Work', linewidth=1.5)
+    ax2.plot(t_plot, cum_shear, 'b:', label='Shear Work', linewidth=1.5)
     
     ax2.set_xlabel("Time (s)")
     ax2.set_ylabel("Cumulative Work (J)")
@@ -194,12 +210,10 @@ def diagnose_active(results_dir):
 if __name__ == "__main__":
     # Analyze the latest run
     
-    #main("/home/dtsteene/D1/cardiac-work/results/sims/run_946891")
-    diagnose_active("/home/dtsteene/D1/cardiac-work/results/sims/run_946891")
     
     #run both main and diagnose active on /home/dtsteene/D1/cardiac-work/results/sims/run_946891, /home/dtsteene/D1/cardiac-work/results/sims/run_946895, /home/dtsteene/D1/cardiac-work/results/sims/run_946897
     #/home/dtsteene/D1/cardiac-work/results/sims/run_946898
-    for run_id in ["run_946891", "run_946895", "run_946897", "run_946898", "run_946969", "run_946971"]:
+    for run_id in ["run_947252"]:
         results_path = f"/home/dtsteene/D1/cardiac-work/results/sims/{run_id}"
         main(results_path)
         diagnose_active(results_path)
