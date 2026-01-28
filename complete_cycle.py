@@ -37,6 +37,8 @@ import pulse
 import sys
 import argparse
 
+import geometry_generator
+
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Complete cardiac cycle simulation')
 parser.add_argument('bpm', type=int, nargs='?', default=None, help='Heart rate in BPM (default: 75)')
@@ -147,180 +149,7 @@ if comm.rank == 0:
 
 # --- Geometry Generation (Hybrid: V1 Logic + V2 MPI Safety) ---
 
-if comm.rank == 0 and not (geodir / "geometry.bp").exists():
-    logger.info("Generating and processing geometry (Rank 0)...")
-    mode = -1
-    std = 0
-    # Configurable fidelity mesh (default 5.0)
-    char_length = args.char_length
-
-    if args.mesh:
-        # --- CUSTOM MESH PATH ---
-        logger.info(f"Loading CUSTOM MESH from: {args.mesh}")
-        
-        # 1. Read Mesh
-        with dolfinx.io.XDMFFile(MPI.COMM_SELF, args.mesh, "r") as xdmf:
-             mesh_in = xdmf.read_mesh(name="mesh")
-             
-             # Create connectivity to read facet tags (Requires IndexMap for facets)
-             mesh_in.topology.create_connectivity(mesh_in.topology.dim - 1, mesh_in.topology.dim)
-
-             # Custom meshes typically have facet_tags
-             try:
-                 ft_in = xdmf.read_meshtags(mesh_in, name="facet_tags")
-             except:
-                 logger.warning("Could not read 'facet_tags', trying 'mesh_tags'...")
-                 ft_in = xdmf.read_meshtags(mesh_in, name="mesh_tags")
-        
-        # 2. Define Markers (Based on Paraview Inspection)
-        # 40: Epicardium, 30: LV Endo, 20: RV Endo, 10: Base
-        markers = {
-            "BASE": (10, 2),
-            "ENDO_LV": (30, 2),
-            "ENDO_RV": (20, 2),
-            "EPI": (40, 2)
-        }
-        
-        # 3. Create Geometry Object
-        # Note: We must create the object structure expected by the rest of the code
-        # We assume standard LDRB fiber creation is needed since XDMF lacked fibers.
-        
-        # Create minimal Geometry object wrapper or use cardiac_geometries class
-        # Ideally we use cardiac_geometries if possible to get helper methods
-        geo = cardiac_geometries.geometry.Geometry(
-            mesh=mesh_in,
-            markers=markers,
-            ffun=ft_in,
-            f0=None, s0=None, n0=None # Fibers generated below
-        )
-        
-        # NOTE: Custom meshes might NOT require rotation if they are already aligned.
-        # Assuming NO ROTATION for now unless proven otherwise.
-        
-    else:
-        # --- DEFAULT UKB GENERATION ---
-        # Generate base mesh
-        geo = cardiac_geometries.mesh.ukb(
-            outdir=geodir,
-            comm=MPI.COMM_SELF, # Generation happens on rank 0 only initially
-            mode=mode,
-            std=std,
-            case="ED",
-            char_length_max=char_length,
-            char_length_min=char_length,
-            clipped=True,
-        )
-
-        # Rotate Mesh (Base Normal -> X-axis)
-        geo = geo.rotate(target_normal=[1.0, 0.0, 0.0], base_marker="BASE")
-
-    fiber_angles = dict(
-        alpha_endo_lv=60,
-        alpha_epi_lv=-60,
-        alpha_endo_rv=90,
-        alpha_epi_rv=-25,
-        beta_endo_lv=-20,
-        beta_epi_lv=20,
-        beta_endo_rv=0,
-        beta_epi_rv=20,
-    )
-
-    # Generate Fibers (LDRB)
-    # Note: LDRB needs transforming markers to its expected keys
-    ldrb_markers = cardiac_geometries.mesh.transform_markers(geo.markers, clipped=True)
-    
-    # If using custom mesh, clipped=True might not be relevant but transform_markers filters by standard keys which is good.
-    # However, for our custom map, we constructed it with standard keys "ENDO_LV" etc, so it should pass.
-    
-    system = ldrb.dolfinx_ldrb(
-        mesh=geo.mesh,
-        ffun=geo.ffun,
-        markers=ldrb_markers,
-        **fiber_angles,
-        fiber_space="Quadrature_6",
-    )
-    #could change fiber_space to DG_1 or CG_1?
-    # Generate DG0 system for Active Tension Markers (From V1)
-    # This creates markers scalar which helps define LV/RV/Septum regions
-    system_dg0 = ldrb.dolfinx_ldrb(
-        mesh=geo.mesh,
-        ffun=geo.ffun,
-        markers=ldrb_markers,
-        **fiber_angles,
-        fiber_space="DG_0",
-    )
-
-    # --- MPI FIX for V1 ---
-    # V1 used comm.allgather here which crashes on clusters with distributed meshes.
-    # Since we are currently in a "Rank 0 generation" block (MPI.COMM_SELF),
-    # we can just extract the array directly.
-    # (Note: If generation were distributed, we would need a purely local extraction).
-
-    markers_scalar = system_dg0.markers_scalar
-
-    # Get the index map to find total cells (Owned + Ghosts) on this process
-    imap = geo.mesh.topology.index_map(3)
-    num_cells_local = imap.size_local
-    num_ghosts = imap.num_ghosts
-    total_cells = num_cells_local + num_ghosts
-
-    # Create entities for ALL cells on this processor (including ghosts)
-    entities = np.arange(total_cells, dtype=np.int32)
-
-    # Get values for ALL cells (do not slice off the end)
-    values = markers_scalar.x.array[:total_cells].astype(np.int32)
-
-    markers_mt = dolfinx.mesh.meshtags(geo.mesh, 3, entities, values)
-    # ----------------------
-
-    # Additional Vectors for Analysis in DG 1 Space
-    fiber_space = "DG_1"
-    system_fibers = ldrb.dolfinx_ldrb(
-        mesh=geo.mesh,
-        ffun=geo.ffun,
-        markers=cardiac_geometries.mesh.transform_markers(geo.markers, clipped=True),
-        **fiber_angles,
-        fiber_space=fiber_space,
-    )
-
-    # Save Everything
-    additional_data = {
-        "f0_DG_1": system_fibers.f0,
-        "s0_DG_1": system_fibers.s0,
-        "n0_DG_1": system_fibers.n0,
-        "markers_mt": markers_mt, # Saved for V1 active tension logic
-    }
-
-    if (geodir / "geometry.bp").exists():
-        shutil.rmtree(geodir / "geometry.bp")
-
-    cardiac_geometries.geometry.save_geometry(
-        path=geodir / "geometry.bp",
-        mesh=geo.mesh,
-        ffun=geo.ffun,
-        markers=geo.markers,
-        info=geo.info,
-        f0=system.f0,
-        s0=system.s0,
-        n0=system.n0,
-        additional_data=additional_data,
-    )
-
-comm.barrier()
-
-# Load the generated geometry
-logger.info("Loading geometry...")
-geo = cardiac_geometries.geometry.Geometry.from_folder(comm=comm, folder=geodir)
-
-if args.mesh:
-    # Custom mesh assumption: Units in cm (typical for clinical scans)
-    scale = 1e-2
-else:
-    # UKB mesh assumption: Units in mm
-    scale = 1e-3
-
-geo.mesh.geometry.x[:] *= scale
-
+geo = geometry_generator.generate_and_load(comm, outdir, args, logger)
 geometry = pulse.HeartGeometry.from_cardiac_geometries(geo, metadata={"quadrature_degree": 6})
 
 # Store Target Volumes (ED)
@@ -370,9 +199,6 @@ except Exception:
     except Exception as e:
         logger.warning(f"Failed to calc RV volume from surface: {e}")
 
-# Helper to assist with parser_ds above which isn't defined
-def parser_ds(ds_measure, marker_id):
-    return ds_measure(marker_id)
 logger.info(
     f"ED Volumes: LV={lvv_target * volume2ml:.2f} mL, RV={rvv_target * volume2ml:.2f} mL",
 )
