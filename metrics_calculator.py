@@ -8,7 +8,7 @@ import ufl
 import basix.ufl
 
 class MetricsCalculator:
-    def __init__(self, geometry, geo, fiber_field_map, problem, comm, cardiac_model, metrics_space_type=("DG", 0), alpha_epi=1e5, alpha_base=1e6):
+    def __init__(self, geometry, geo, fiber_field_map, problem, comm, cardiac_model, metrics_space_type=("DG", 1), alpha_epi=1e5, alpha_base=1e6):
         self.geometry = geometry
         self.geo = geo
         self.fiber_fields = fiber_field_map
@@ -276,7 +276,9 @@ class MetricsCalculator:
         return proxies
 
     def _calculate_pressure_strain_work(self, current_state, mechanics_data):
-        """Calculates Pressure-Strain Work Index (PSWI)."""
+        """
+        Calculates Pressure-Strain Work Index (PSWI) with detailed Septal breakdown.
+        """
         data = {}
         # Convert to Pa
         p_LV = (current_state.get("p_LV", 0.0) or 0.0) * 133.322
@@ -293,20 +295,32 @@ class MetricsCalculator:
         dE_Septum = eps_Septum - self.eps_Septum_prev
         
         # --- Apply Regional Volume Scaling ---
-        # 1. LV Free Wall Proxy (P_LV * dE_LV * Vol_LV)
+        
+        # 1. LV Free Wall Proxy (Standard)
         data["work_ps_index_LV"] = (p_LV * dE_LV) * self.region_volumes["LV"]
         
-        # 2. RV Free Wall Proxy (P_RV * dE_RV * Vol_RV)
+        # 2. RV Free Wall Proxy (Standard)
         data["work_ps_index_RV"] = (p_RV * dE_RV) * self.region_volumes["RV"]
         
-        # 3. Septum Proxy ((P_LV - P_RV) * dE_Septum * Vol_Septum)
-        # The septum works against the trans-septal pressure gradient.
-        # Check sign convention: If P_LV > P_RV, and Septum shortens (dE < 0), work should be positive?
-        # Standard: Work = Integral( S : dE ). S is tensile > 0. dE is shortening < 0. Work < 0 (Energy consumed/output).
-        # Internal Work by Solver is usually negative (Energy Leaving the system).
-        # Positive Pressure * Negative Strain -> Negative Work. 
-        # So using (P_LV - P_RV) is correct if P_LV is the dominant load.
-        data["work_ps_index_Septum"] = ((p_LV - p_RV) * dE_Septum) * self.region_volumes["Septum"]
+        # 3. Septum Proxies (The Investigation)
+        vol_S = self.region_volumes["Septum"]
+        
+        # Variant A: Net Trans-septal Pressure (The Standard Physics Assumption)
+        # Represents the septum working against the pressure gradient.
+        data["work_ps_index_Septum_Trans"] = ((p_LV - p_RV) * dE_Septum) * vol_S
+        
+        # Variant B: LV Pressure Only
+        # Tests the hypothesis that the Septum is essentially "part of the LV".
+        data["work_ps_index_Septum_PLV"] = (p_LV * dE_Septum) * vol_S
+        
+        # Variant C: RV Pressure Only
+        # Tests the hypothesis that the Septum is dominated by RV mechanics (unlikely, but a good baseline).
+        data["work_ps_index_Septum_PRV"] = (p_RV * dE_Septum) * vol_S
+        
+        # Variant D: Mean Pressure
+        # Represents the septum working against the average hydrostatic load of the heart.
+        p_mean = 0.5 * (p_LV + p_RV)
+        data["work_ps_index_Septum_Mean"] = (p_mean * dE_Septum) * vol_S
         
         # Update History
         self.eps_LV_prev = eps_LV
@@ -457,3 +471,74 @@ class MetricsCalculator:
         print(metrics)
         
         return metrics
+    
+    def _calculate_boundary_work_exact(self, current_state):
+        """
+        Calculates EXACT external work via surface integration: W = Integral( -P * (du . n) * ds )
+        This is the rigorous counterpart to 'P * dV'.
+        """
+        # 1. Setup
+        du = self.problem.u - self._u_prev if hasattr(self, '_u_prev') else self.problem.u
+        n = ufl.FacetNormal(self.mesh)
+        
+        # Pressure (Convert mmHg -> Pa)
+        p_LV = (current_state.get("p_LV", 0.0) or 0.0) * 133.322
+        p_RV = (current_state.get("p_RV", 0.0) or 0.0) * 133.322
+        
+        # 2. Define Measures
+        # We assume standard tags: ENDO_LV (usually 10 or similar) and ENDO_RV.
+        # Check your geometry.markers dictionary for the exact IDs.
+        try:
+            # tag_endo_lv = self.geometry.markers["ENDO_LV"][0]
+            # tag_endo_rv = self.geometry.markers["ENDO_RV"][0]
+            
+            # --- HARDCODED EXAMPLE (REPLACE WITH YOUR TAGS) ---
+            tag_endo_lv = 10  
+            tag_endo_rv = 20
+            # --------------------------------------------------
+            
+            ds = ufl.Measure("ds", domain=self.mesh, subdomain_data=self.geometry.facet_tags)
+        except Exception:
+            # If tags aren't set up, return 0
+            return {}
+
+        # 3. Define Forms
+        # Force = -Pressure * Normal (Normal points OUT of wall, INTO cavity)
+        # Work = Force . Displacement
+        
+        # Total LV Cavity Surface Work
+        form_work_bnd_LV = -p_LV * ufl.inner(du, n) * ds(tag_endo_lv)
+        
+        # Total RV Cavity Surface Work
+        form_work_bnd_RV = -p_RV * ufl.inner(du, n) * ds(tag_endo_rv)
+
+        # --- THE SEPTUM BOUNDARY IDEA ---
+        # To isolate the Septum, we ideally need surface tags specific to the Septum.
+        # e.g., "ENDO_LV_SEPTAL" and "ENDO_RV_SEPTAL".
+        # If you don't have them, we can't mathematically distinguish the septum surface 
+        # from the free wall surface easily without a spatial coordinate check.
+        #
+        # BELOW IS THE LOGIC YOU WOULD USE:
+        """
+        tag_septum_lv = self.geometry.markers.get("SEPTUM_LV", [999])[0]
+        tag_septum_rv = self.geometry.markers.get("SEPTUM_RV", [998])[0]
+        
+        form_work_bnd_Sep_LV = -p_LV * ufl.inner(du, n) * ds(tag_septum_lv)
+        form_work_bnd_Sep_RV = -p_RV * ufl.inner(du, n) * ds(tag_septum_rv)
+        
+        val_sep_lv = self.comm.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(form_work_bnd_Sep_LV)), op=MPI.SUM)
+        val_sep_rv = self.comm.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(form_work_bnd_Sep_RV)), op=MPI.SUM)
+        
+        # Net Boundary Work on Septum (Energy entering Septum from cavities)
+        val_sep_net = val_sep_lv + val_sep_rv 
+        """
+
+        # 4. Assembly (Standard Cavity)
+        w_bnd_LV = self.comm.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(form_work_bnd_LV)), op=MPI.SUM)
+        w_bnd_RV = self.comm.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(form_work_bnd_RV)), op=MPI.SUM)
+
+        return {
+            "work_boundary_exact_LV": w_bnd_LV, 
+            "work_boundary_exact_RV": w_bnd_RV,
+            # "work_boundary_exact_Septum": val_sep_net # Uncomment if tags exist
+        }

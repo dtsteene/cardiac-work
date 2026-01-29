@@ -2,7 +2,7 @@
 
 # --- Slurm Job Configuration ---
 #SBATCH --job-name=cardiac_sim
-#SBATCH --partition=milanq
+#SBATCH --partition=rome16q
 #SBATCH --nodes=1
 #SBATCH --ntasks=8
 #SBATCH --cpus-per-task=1
@@ -12,14 +12,14 @@
 # Use: sbatch --export=BPM=75 run_sim_and_post.sbatch
 # For CI testing (short circuit): sbatch --export=BPM=75,CI=1 run_sim_and_post.sbatch
 # For Custom Mesh: sbatch --export=BPM=75,MESH_PATH="/path/to/mesh.xdmf" run_sim_and_post.sbatch
-# For Parameter Sweep: sbatch --export=BPM=75,CHAR_LENGTH=5.0,METRICS_SPACE="DG0" run_sim_and_post.sbatch
+# For Parameter Sweep: sbatch --export=BPM=75,CHAR_LENGTH=5.0,METRICS_SPACE="DG1" run_sim_and_post.sbatch
 # Add a robust comment: sbatch --export=BPM=75,COMMENT="Testing Quadrature" run_sim_and_post.sbatch
 
 BPM=${BPM:-75}
 CI=${CI:-0}
 MESH_PATH=${MESH_PATH:-""}
 CHAR_LENGTH=${CHAR_LENGTH:-10.0}
-METRICS_SPACE=${METRICS_SPACE:-"DG0"}
+METRICS_SPACE=${METRICS_SPACE:-"DG1"}
 CIRCULATION_PARAMS=${CIRCULATION_PARAMS:-""}
 ALPHA_EPI=${ALPHA_EPI:-""}
 ALPHA_BASE=${ALPHA_BASE:-""}
@@ -175,8 +175,8 @@ cd ${RESULTS_DIR}
 
 # Run unified analysis script (combines all post-processing)
 if [ -f "metrics_downsample_1.npy" ]; then
-    echo "   Running comprehensive analysis (analyze_metrics.py)..."
-    python3 ${SIM_DIR}/analyze_metrics.py . 1
+    echo "   Running comprehensive analysis (run_postprocessing.py)..."
+    python3 ${SIM_DIR}/run_postprocessing.py .
     echo "   ✓ Analysis complete"
 else
     echo "   Note: No metrics_downsample_1.npy found (metrics calculation may have been skipped)"

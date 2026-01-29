@@ -862,7 +862,7 @@ circulation_model = circulation.regazzoni2020.Regazzoni2020(
 )
 
 logger.info(f"Starting coupled simulation at {BPM} BPM (HR={HR_HZ} Hz, RR={RR_INTERVAL:.3f}s)...")
-num_beats = 1  # Single beat simulation
+num_beats = 5  # Single beat simulation
 dt = 0.001
 
 # CI Mode: Only 2 timesteps for quick testing; Production: Full beat
