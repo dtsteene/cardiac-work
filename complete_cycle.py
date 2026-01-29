@@ -42,6 +42,7 @@ import geometry_generator
 # Parse command line arguments
 parser = argparse.ArgumentParser(description='Complete cardiac cycle simulation')
 parser.add_argument('bpm', type=int, nargs='?', default=None, help='Heart rate in BPM (default: 75)')
+parser.add_argument('--beats', type=int, default=1, help='Number of beats to run (default: 1)')
 parser.add_argument('--ci', action='store_true', help='Enable CI mode (2 timesteps only for quick testing)')
 parser.add_argument('--mesh', type=str, default=None, help='Path to custom XDMF mesh (optional)')
 parser.add_argument('--char_length', type=float, default=5.0, help='Mesh characteristic length (default: 5.0)')
@@ -862,7 +863,7 @@ circulation_model = circulation.regazzoni2020.Regazzoni2020(
 )
 
 logger.info(f"Starting coupled simulation at {BPM} BPM (HR={HR_HZ} Hz, RR={RR_INTERVAL:.3f}s)...")
-num_beats = 5  # Single beat simulation
+num_beats = args.beats  # Number of beats to simulate
 dt = 0.001
 
 # CI Mode: Only 2 timesteps for quick testing; Production: Full beat

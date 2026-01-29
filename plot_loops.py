@@ -116,6 +116,11 @@ def plot_clinical_dashboard(metrics, outdir):
         ax_pv_lv.text(0.5, 0.5, f"SV: {sv:.1f} mL", transform=ax_pv_lv.transAxes, 
                       ha='center', bbox=dict(facecolor='white', alpha=0.8))
 
+    if v_RV is not None:
+        sv_rv = v_RV.max() - v_RV.min()
+        ax_pv_rv.text(0.5, 0.5, f"SV: {sv_rv:.1f} mL", transform=ax_pv_rv.transAxes, 
+                      ha='center', bbox=dict(facecolor='white', alpha=0.8))
+
     # --- PLOTTING ROW 2 (Pressure-Strain) ---
     # Note: Septum usually plotted against LV Pressure in clinical echo
     plot_cycle(ax_ps_lv, e_LV, p_LV, 'tab:blue', "LV Pressure-Strain", "Strain (%)", "P_LV (mmHg)")

@@ -9,15 +9,23 @@
 #SBATCH --time=12:00:00
 #SBATCH --exclude=n052
 
-# Use: sbatch --export=BPM=75 run_sim_and_post.sbatch
-# For CI testing (short circuit): sbatch --export=BPM=75,CI=1 run_sim_and_post.sbatch
-# For Custom Mesh: sbatch --export=BPM=75,MESH_PATH="/path/to/mesh.xdmf" run_sim_and_post.sbatch
-# For Parameter Sweep: sbatch --export=BPM=75,CHAR_LENGTH=5.0,METRICS_SPACE="DG1" run_sim_and_post.sbatch
-# Add a robust comment: sbatch --export=BPM=75,COMMENT="Testing Quadrature" run_sim_and_post.sbatch
+# --- NEW: Temporary Log Handling ---
+# This creates the files, but we will merge and delete them inside the script
+#SBATCH --output=init_slurm_%j.out
+#SBATCH --error=init_slurm_%j.err
 
+# --- Usage Examples ---
+# 1. Default (UKB, 1 Beat):         sbatch run_sim.sbatch
+# 2. Multi-beat Run:                sbatch --export=BEATS=10 run_sim.sbatch
+# 3. PAH Mesh (Auto-loads JSON):    sbatch --export=MESH=PAH run_sim.sbatch
+# 4. PAH Mesh (Force Default):      sbatch --export=MESH=PAH,CIRCULATION_PARAMS="DEFAULT" run_sim.sbatch
+# 5. Custom Mesh:                   sbatch --export=MESH="./my_mesh.xdmf" run_sim.sbatch
+
+# --- 1. Variable Defaults ---
+MESH=${MESH:-"UKB"}
 BPM=${BPM:-75}
+BEATS=${BEATS:-1}               
 CI=${CI:-0}
-MESH_PATH=${MESH_PATH:-""}
 CHAR_LENGTH=${CHAR_LENGTH:-10.0}
 METRICS_SPACE=${METRICS_SPACE:-"DG1"}
 CIRCULATION_PARAMS=${CIRCULATION_PARAMS:-""}
@@ -25,54 +33,87 @@ ALPHA_EPI=${ALPHA_EPI:-""}
 ALPHA_BASE=${ALPHA_BASE:-""}
 COMMENT=${COMMENT:-"No description provided"}
 
-# --- Resolve Relative Paths to Absolute ---
-# Since we change directory to WORK_DIR, we must ensure input paths are absolute
-if [ -n "$MESH_PATH" ] && [[ "$MESH_PATH" != /* ]]; then
-    MESH_PATH="${SLURM_SUBMIT_DIR}/${MESH_PATH}"
+# --- 2. Paths & Environment ---
+SUBMIT_DIR=$SLURM_SUBMIT_DIR
+SIM_DIR="/home/dtsteene/D1/cardiac-work"
+DATA_DIR="${SIM_DIR}/data"
+
+# --- 3. Geometry Logic & Parameter Checks ---
+
+if [ "$MESH" == "UKB" ]; then
+    ACTUAL_MESH_PATH=""
+    GEO_TAG="UKB"
+    echo "Geometry: Standard UKB (Generation)"
+
+elif [ "$MESH" == "PAH" ]; then
+    ACTUAL_MESH_PATH="${DATA_DIR}/pah.xdmf"
+    GEO_TAG="PAH"
+    PAH_PARAMS_FILE="${DATA_DIR}/ph_circulation_params.json"
+    
+    echo "Geometry: PAH Preset (${ACTUAL_MESH_PATH})"
+
+    # --- PAH Special Logic ---
+    if [ "$CIRCULATION_PARAMS" == "DEFAULT" ]; then
+        echo "  ! Override: User forced DEFAULT circulation params (Ignoring PAH JSON)."
+        CIRCULATION_PARAMS="" 
+        
+    elif [ -n "$CIRCULATION_PARAMS" ]; then
+        echo "  ! Override: User provided custom circulation params: $CIRCULATION_PARAMS"
+        
+    else
+        if [ -f "$PAH_PARAMS_FILE" ]; then
+            CIRCULATION_PARAMS="$PAH_PARAMS_FILE"
+            echo "  ✓ Auto-loaded PAH Circulation Params: $PAH_PARAMS_FILE"
+        else
+            echo ""
+            echo "❌ CRITICAL ERROR: Circulation Parameters Missing"
+            echo "   Missing: $PAH_PARAMS_FILE"
+            echo "   To Fix: Ensure file exists OR run with CIRCULATION_PARAMS='DEFAULT'"
+            echo ""
+            exit 1
+        fi
+    fi
+
+elif [ "$MESH" == "HEALTHY" ]; then
+    ACTUAL_MESH_PATH="${DATA_DIR}/healthy.xdmf"
+    GEO_TAG="HEALTHY"
+    echo "Geometry: Healthy Preset (${ACTUAL_MESH_PATH})"
+
+else
+    ACTUAL_MESH_PATH="$MESH"
+    if [[ "$ACTUAL_MESH_PATH" != /* ]]; then
+        ACTUAL_MESH_PATH="${SLURM_SUBMIT_DIR}/${ACTUAL_MESH_PATH}"
+    fi
+    GEO_TAG=$(basename "$ACTUAL_MESH_PATH" .xdmf)
+    echo "Geometry: Custom File (${ACTUAL_MESH_PATH})"
 fi
 
+# Resolve Circulation Params Path
 if [ -n "$CIRCULATION_PARAMS" ] && [[ "$CIRCULATION_PARAMS" != /* ]]; then
     CIRCULATION_PARAMS="${SLURM_SUBMIT_DIR}/${CIRCULATION_PARAMS}"
 fi
 
-echo "--- Job Started: $SLURM_JOB_ID ---"
-echo "Job Description: $COMMENT"
-if [ "$CI" = "1" ]; then
-    echo "⚠️  CI MODE ENABLED - Short circuit test (2 timesteps only)"
-else
-    echo "Standard mode: Full cardiac cycle simulation"
-fi
-
-echo "Configuration:"
-echo "  BPM: $BPM"
-echo "  Mesh Length: $CHAR_LENGTH mm"
-echo "  Metrics Space: $METRICS_SPACE"
-echo "  Mesh Path: ${MESH_PATH:-'Standard UKB (Synthetic)'}"
-echo "  Circulation Params: ${CIRCULATION_PARAMS:-'Default (Healthy)'}"
-
+# --- 4. Prepare Arguments for Python ---
 ARGS_STR=""
 
-# Mesh or Generation
-if [ -n "$MESH_PATH" ]; then
-    ARGS_STR="$ARGS_STR --mesh $MESH_PATH"
+# Mesh selection
+if [ -n "$ACTUAL_MESH_PATH" ]; then
+    ARGS_STR="$ARGS_STR --mesh $ACTUAL_MESH_PATH"
 else
     ARGS_STR="$ARGS_STR --char_length $CHAR_LENGTH"
 fi
 
-# Metrics Space (Always)
+ARGS_STR="$ARGS_STR --beats $BEATS"
 ARGS_STR="$ARGS_STR --metrics_space $METRICS_SPACE"
 
-# Circulation Params
 if [ -n "$CIRCULATION_PARAMS" ]; then
     ARGS_STR="$ARGS_STR --circulation_params $CIRCULATION_PARAMS"
 fi
 
-# CI Mode
 if [ "$CI" = "1" ]; then
     ARGS_STR="$ARGS_STR --ci"
 fi
 
-# Spring Stiffness Overrides
 if [ -n "$ALPHA_EPI" ]; then
     ARGS_STR="$ARGS_STR --alpha_epi $ALPHA_EPI"
 fi
@@ -81,120 +122,89 @@ if [ -n "$ALPHA_BASE" ]; then
     ARGS_STR="$ARGS_STR --alpha_base $ALPHA_BASE"
 fi
 
+# --- 5. Setup Logging & Directories ---
+echo "--- Job Started: $SLURM_JOB_ID ---"
 date
 
-# --- Setup Environment ---
+DATE_STR=$(date +%F)
+RESULTS_BASE="${SIM_DIR}/results/sims/${DATE_STR}"
+RESULTS_DIR="${RESULTS_BASE}/${GEO_TAG}_${BEATS}beats_run_${SLURM_JOB_ID}"
+LOG_DIR="${SIM_DIR}/results/log"
+
+mkdir -p ${RESULTS_BASE} ${LOG_DIR} ${RESULTS_DIR}
+
+echo "$COMMENT" > "${RESULTS_DIR}/run_description.txt"
+
+# Define the Final Log Files
+LOG_FILE="${LOG_DIR}/${GEO_TAG}_sim_${SLURM_JOB_ID}.out"
+ERR_FILE="${LOG_DIR}/${GEO_TAG}_sim_${SLURM_JOB_ID}.err"
+
+# --- LOGGING MAGIC STARTS HERE ---
+# 1. Flush current buffer so everything printed so far is saved to init_slurm...
+sync
+
+# 2. Merge the temporary start-up logs into the final logs
+cat "init_slurm_${SLURM_JOB_ID}.out" >> "${LOG_FILE}" 2>/dev/null
+cat "init_slurm_${SLURM_JOB_ID}.err" >> "${ERR_FILE}" 2>/dev/null
+
+# 3. Redirect all FUTURE output to the final logs
+exec 1>>"${LOG_FILE}"
+exec 2>>"${ERR_FILE}"
+
+# 4. Clean up the temporary files from the submit dir
+rm -f "init_slurm_${SLURM_JOB_ID}.out" "init_slurm_${SLURM_JOB_ID}.err"
+# --- LOGGING MAGIC ENDS HERE ---
+
+WORK_DIR="/work/$USER/cardiac_${GEO_TAG}_${SLURM_JOB_ID}"
+mkdir -p ${WORK_DIR}
+export XDG_CACHE_HOME="${WORK_DIR}/.cache"
+
+# --- 6. Environment ---
 module load anaconda3
 eval "$(conda shell.bash hook)"
 conda activate RV
-
-# Enforce single threading for libraries (Crucial for proper MPI behavior + your single-thread post-process)
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 export MPICH_HYDRA_LAUNCHER=fork
 
-echo "Conda environment: $CONDA_DEFAULT_ENV"
-
-# --- Paths ---
-SUBMIT_DIR=$SLURM_SUBMIT_DIR
-# Define where your python scripts actually live (cardiac-work)
-SIM_DIR="/home/dtsteene/D1/cardiac-work"
-
-# Results and Logs destination (Canonical Project Paths)
-RESULTS_BASE="${SIM_DIR}/results/sims"
-LOG_DIR="${SIM_DIR}/results/log"
-mkdir -p ${RESULTS_BASE} ${LOG_DIR}
-
-# Specific job results directory
-RESULTS_DIR="${RESULTS_BASE}/run_${SLURM_JOB_ID}"
-mkdir -p ${RESULTS_DIR}
-
-# Save the description immediately
-echo "$COMMENT" > "${RESULTS_DIR}/run_description.txt"
-
-# Log files (now properly configured)
-LOG_FILE="${LOG_DIR}/simulation_${SLURM_JOB_ID}.out"
-ERR_FILE="${LOG_DIR}/simulation_${SLURM_JOB_ID}.err"
-
-# Redirect output/error to the proper log directory
-exec 1>${LOG_FILE}
-exec 2>${ERR_FILE}
-
-# Temporary Work Directory (Fast I/O)
-WORK_DIR="/work/$USER/cardiac_cycle_${SLURM_JOB_ID}"
-mkdir -p ${WORK_DIR}
-export XDG_CACHE_HOME="${WORK_DIR}/.cache"
-
-# --- 1. Main Simulation (MPI) ---
+# --- 7. Execution ---
 cd ${WORK_DIR}
-echo "1. Running Simulation (MPI) on ${SLURM_NTASKS} CPUs (BPM=${BPM})..."
-echo "   Working directory: ${WORK_DIR}"
-echo "   Results will be saved to: ${RESULTS_DIR}"
-echo "   Logs: ${LOG_FILE}"
+echo "Running Simulation..."
+echo "  Geometry: $GEO_TAG"
+echo "  Beats:    $BEATS"
+echo "  Params:   ${CIRCULATION_PARAMS:-'Default (Internal)'}"
+echo "  Save Dir: $RESULTS_DIR"
 
-# Run complete_cycle.py from cardiac-work directory
 time $CONDA_PREFIX/bin/mpirun -n ${SLURM_NTASKS} -launcher fork $CONDA_PREFIX/bin/python ${SIM_DIR}/complete_cycle.py $BPM $ARGS_STR
 
 echo "✓ Simulation completed"
 
-# --- 2. Data Transfer (Safety Step) ---
-echo "Simulation complete. Transferring raw data..."
-
-# Find the specific result folder generated by the code
-# Updated to find any results directory matching the pattern (standard or custom mesh)
+# --- 8. Data Transfer ---
+echo "Transferring data..."
 RESULTS_WORK=$(find . -maxdepth 1 -type d -name "results_*" | grep -v "geometry" | head -1)
 
 if [ -d "$RESULTS_WORK" ]; then
-    echo "Found raw results: $RESULTS_WORK"
-    
-    # 1. Check for the Trace Log specifically
-    if [ -f "$RESULTS_WORK/active_mechanics_trace.csv" ]; then
-        echo "✓ Found Active Mechanics Trace Log"
-    else
-        echo "⚠️  WARNING: Trace log missing from results folder"
-    fi
-
-    # 2. Copy contents
     cp -r "$RESULTS_WORK"/* ${RESULTS_DIR}/ 2>/dev/null || true
-    echo "✓ Raw data saved to ${RESULTS_DIR}/"
+    echo "✓ Data saved to ${RESULTS_DIR}/"
 else
-    echo "CRITICAL WARNING: No results directory found in work folder."
-    # If sim failed, we might want to exit or inspect partial logs
+    echo "CRITICAL WARNING: No results found in work folder."
 fi
 
-# --- 3. Post-Processing (Serial / Single Thread) ---
-# We run this on the RESULTS_DIR (permanent storage)
-# We use standard 'python' (no mpirun) so it runs as a single process (Rank 0)
-
-echo "------------------------------------------------"
-echo "3. Running Post-Processing Analysis..."
-echo "   Target: ${RESULTS_DIR}"
-
-# Change to results directory for analysis
+# --- 9. Post-Processing ---
+echo "Running Post-Processing..."
 cd ${RESULTS_DIR}
 
-# Run unified analysis script (combines all post-processing)
 if [ -f "metrics_downsample_1.npy" ]; then
-    echo "   Running comprehensive analysis (run_postprocessing.py)..."
     python3 ${SIM_DIR}/run_postprocessing.py .
-    echo "   ✓ Analysis complete"
+    echo "✓ Analysis complete"
 else
-    echo "   Note: No metrics_downsample_1.npy found (metrics calculation may have been skipped)"
+    echo "Skipping analysis (missing metrics file)."
 fi
 
-# Copy logs to results directory for reference
+# Copy logs inside the results folder for easy access
 cp ${LOG_FILE} ${RESULTS_DIR}/simulation.log 2>/dev/null
 cp ${ERR_FILE} ${RESULTS_DIR}/simulation.err 2>/dev/null
 
-echo "✓ Post-processing finished"
-echo ""
-echo "Results saved to:"
-echo "  Simulation outputs: ${RESULTS_DIR}/"
-echo "  Logs: ${LOG_DIR}/"
-
-# --- Cleanup ---
-echo "Cleanup temporary work dir..."
 rm -rf ${WORK_DIR}
-
 echo "--- Job Finished ---"
 date

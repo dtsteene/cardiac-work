@@ -89,7 +89,7 @@ def analyze_proxies(metrics, outdir):
     # --- FIGURE SETUP ---
     fig = plt.figure(figsize=(18, 10))
     gs = gridspec.GridSpec(2, 3, figure=fig, height_ratios=[1, 1.2])
-    fig.suptitle("Quantitative Validation: True Work vs. Proxies", fontsize=16, fontweight='bold')
+    fig.suptitle("True Work vs. Proxies", fontsize=16, fontweight='bold')
 
     # --- ROW 1: TOTAL CYCLE ENERGY COMPARISON (Bar Charts) ---
     
