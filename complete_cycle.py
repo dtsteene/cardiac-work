@@ -563,7 +563,7 @@ problem = pulse.problem.StaticProblem(
     parameters={"mesh_unit": mesh_unit, "u_space": "P_2"},
 )
 
-# Setup Stress/Strain Post-processing
+# Setup Stress/Strain Post-processing - kinematics
 # FIXED: Use full CardiacModel (material + compressibility) instead of material only
 # This ensures stresses include pressure contribution for proper boundary work calculation
 
