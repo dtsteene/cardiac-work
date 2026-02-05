@@ -182,11 +182,29 @@ def plot_engineering_debug(metrics, outdir):
     ax1.plot(time, E_ext_cum, 'k--', linewidth=2, label='External Work (PV Area)')
     ax1.plot(time, E_int_cum, 'b-', linewidth=2, alpha=0.8, label='Internal Work (Strain Energy)')
     
-    # Highlight the discrepancy
-    final_err = (E_ext_cum[-1] - E_int_cum[-1]) / E_ext_cum[-1] * 100
-    ax1.fill_between(time, E_int_cum, E_ext_cum, color='red', alpha=0.1, label='Energy Error')
+    # Calculate Energy Gap (Missing Energy)
+    W_int_end = E_int_cum[-1]
+    W_ext_end = E_ext_cum[-1]
     
-    ax1.set_title(f"Global Energy Balance (Error: {final_err:.1f}%)", fontsize=12, fontweight='bold')
+    # Dissipation Ratio: (Int - Ext) / Int 
+    # If Ext > Int, this is negative (energy creation? or spring work?)
+    # If Int > Ext, this is positive (energy dissipation)
+    if abs(W_int_end) > 1e-9:
+        dissipation_ratio = (W_int_end - W_ext_end) / W_int_end * 100.0
+    else:
+        dissipation_ratio = 0.0
+
+    # Old metric for comparison: relative error
+    final_err = (W_ext_end - W_int_end) / W_ext_end * 100
+    
+    ax1.fill_between(time, E_int_cum, E_ext_cum, color='red', alpha=0.1, label='Energy Gap')
+    
+    # Annotation on the plot
+    text_str = f"Dissipation: {dissipation_ratio:.1f}%\n(Int: {W_int_end:.2f}J, Ext: {W_ext_end:.2f}J)"
+    ax1.text(0.05, 0.85, text_str, transform=ax1.transAxes, 
+             bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'), fontsize=10)
+
+    ax1.set_title(f"Global Energy Balance", fontsize=12, fontweight='bold')
     ax1.set_ylabel("Cumulative Work (Joules)")
     ax1.set_xlabel("Time (s)")
     ax1.legend()
@@ -233,6 +251,102 @@ def plot_engineering_debug(metrics, outdir):
     print(f"✅ Saved: {outpath}")
     plt.close()
 
+def plot_full_hemodynamics(metrics, outdir):
+    """Creates the Clinical Hemodynamics dashboard (Reconstructed Volumes)."""
+    
+    # 1. Retrieve Data
+    v_LV_clin = get_arr(metrics, ["V_LV_Clinical"])
+    v_RV_clin = get_arr(metrics, ["V_RV_Clinical"])
+    p_LV = get_arr(metrics, ["p_LV"])
+    p_RV = get_arr(metrics, ["p_RV"])
+    
+    # Get Time (safely)
+    if p_LV is not None:
+        time = get_arr(metrics, ["time"], len(p_LV))
+    else:
+        time = None
+
+    # Check existence
+    if v_LV_clin is None or v_RV_clin is None:
+        print("⚠ Missing 'V_LV_Clinical' or 'V_RV_Clinical'. Skipping full hemodynamics plot.")
+        return
+
+    # --- FIGURE SETUP ---
+    fig = plt.figure(figsize=(14, 10))
+    gs = gridspec.GridSpec(2, 2, figure=fig)
+    fig.suptitle("Estimated Full Organ Hemodynamics (Reconstructed)", fontsize=18, fontweight='bold')
+
+    ax_pv_lv = fig.add_subplot(gs[0, 0])
+    ax_pv_rv = fig.add_subplot(gs[0, 1])
+    ax_vol = fig.add_subplot(gs[1, 0])
+    ax_pres = fig.add_subplot(gs[1, 1])
+
+    # --- PLOT 1: LV PV Loop (Clinical) ---
+    ax_pv_lv.plot(v_LV_clin, p_LV, 'tab:blue', linewidth=2.5)
+    ax_pv_lv.set_title("LV PV Loop (Clinical)", fontweight='bold')
+    ax_pv_lv.set_xlabel("Volume (mL)")
+    ax_pv_lv.set_ylabel("Pressure (mmHg)")
+    ax_pv_lv.grid(True, alpha=0.3)
+    
+    # Annotate SV and EF
+    sv_lv = v_LV_clin.max() - v_LV_clin.min()
+    edv_lv = v_LV_clin.max()
+    ef_lv = (sv_lv / edv_lv) * 100.0 if edv_lv > 0 else 0
+    text_lv = f"SV: {sv_lv:.1f} mL\nEF: {ef_lv:.1f}%"
+    ax_pv_lv.text(0.5, 0.5, text_lv, transform=ax_pv_lv.transAxes, 
+                  ha='center', va='center', bbox=dict(facecolor='white', alpha=0.9))
+
+    # --- PLOT 2: RV PV Loop (Clinical) ---
+    ax_pv_rv.plot(v_RV_clin, p_RV, 'tab:red', linewidth=2.5)
+    ax_pv_rv.set_title("RV PV Loop (Clinical)", fontweight='bold')
+    ax_pv_rv.set_xlabel("Volume (mL)")
+    ax_pv_rv.set_ylabel("Pressure (mmHg)")
+    ax_pv_rv.grid(True, alpha=0.3)
+    
+    # Annotate SV and EF
+    sv_rv = v_RV_clin.max() - v_RV_clin.min()
+    edv_rv = v_RV_clin.max()
+    ef_rv = (sv_rv / edv_rv) * 100.0 if edv_rv > 0 else 0
+    text_rv = f"SV: {sv_rv:.1f} mL\nEF: {ef_rv:.1f}%"
+    ax_pv_rv.text(0.5, 0.5, text_rv, transform=ax_pv_rv.transAxes, 
+                  ha='center', va='center', bbox=dict(facecolor='white', alpha=0.9))
+
+    # --- PLOT 3: Volume Traces ---
+    if time is not None:
+        ax_vol.plot(time, v_LV_clin, 'tab:blue', linewidth=2, label='LV Volume')
+        ax_vol.plot(time, v_RV_clin, 'tab:red', linewidth=2, label='RV Volume')
+        ax_vol.set_xlabel("Time (s)")
+    else:
+        ax_vol.plot(v_LV_clin, 'tab:blue', linewidth=2, label='LV Volume')
+        ax_vol.plot(v_RV_clin, 'tab:red', linewidth=2, label='RV Volume')
+        ax_vol.set_xlabel("Step")
+
+    ax_vol.set_title("Clinical Volumes over Time", fontweight='bold')
+    ax_vol.set_ylabel("Volume (mL)")
+    ax_vol.legend()
+    ax_vol.grid(True, alpha=0.3)
+
+    # --- PLOT 4: Pressure Traces ---
+    if time is not None:
+        ax_pres.plot(time, p_LV, 'tab:blue', linewidth=2, label='LV Pressure')
+        ax_pres.plot(time, p_RV, 'tab:red', linewidth=2, label='RV Pressure')
+        ax_pres.set_xlabel("Time (s)")
+    else:
+        ax_pres.plot(p_LV, 'tab:blue', linewidth=2, label='LV Pressure')
+        ax_pres.plot(p_RV, 'tab:red', linewidth=2, label='RV Pressure')
+        ax_pres.set_xlabel("Step")
+
+    ax_pres.set_title("Pressures over Time", fontweight='bold')
+    ax_pres.set_ylabel("Pressure (mmHg)")
+    ax_pres.legend()
+    ax_pres.grid(True, alpha=0.3)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    outpath = outdir / "clinical_hemodynamics.png"
+    plt.savefig(outpath, dpi=150)
+    print(f"✅ Saved: {outpath}")
+    plt.close()
+
 # --- Main ---
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -244,3 +358,4 @@ if __name__ == "__main__":
     
     plot_clinical_dashboard(metrics, res_dir)
     plot_engineering_debug(metrics, res_dir)
+    plot_full_hemodynamics(metrics, res_dir)

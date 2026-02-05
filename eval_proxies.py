@@ -12,6 +12,7 @@ Usage:
 """
 
 import sys
+import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
@@ -63,12 +64,26 @@ def calculate_stats(true_power, proxy_power):
         "R_squared": r_val**2
     }
 
-def analyze_proxies(metrics, outdir):
+def analyze_proxies(metrics, outdir, truth_type="total"):
+    # --- PROXY CONFIGURATION (Total vs Fiber) ---
+    if truth_type == "fiber":
+        print("🔍 ANALYSIS MODE: Fiber Work (Projected)")
+        key_lv = "work_fiber_LV"
+        key_rv = "work_fiber_RV"
+        key_sep = "work_fiber_Septum" 
+        title_suffix = "(Fiber Work)"
+    else:
+        print("🔍 ANALYSIS MODE: Total Work (Tensor S:dE)")
+        key_lv = "work_true_LV"
+        key_rv = "work_true_RV"
+        key_sep = "work_true_Septum"
+        title_suffix = "(Total Stress-Strain)"
+
     # --- DATA PREP ---
     # True Work Powers (Watts/step)
-    tru_lv = get_data(metrics, "work_true_LV")
-    tru_sep = get_data(metrics, "work_true_Septum")
-    tru_rv = get_data(metrics, "work_true_RV")
+    tru_lv = get_data(metrics, key_lv)
+    tru_sep = get_data(metrics, key_sep)
+    tru_rv = get_data(metrics, key_rv)
 
     # Proxies - LV
     # 1. PV Loop Proxy (P*dV)
@@ -89,7 +104,7 @@ def analyze_proxies(metrics, outdir):
     # --- FIGURE SETUP ---
     fig = plt.figure(figsize=(18, 10))
     gs = gridspec.GridSpec(2, 3, figure=fig, height_ratios=[1, 1.2])
-    fig.suptitle("True Work vs. Proxies", fontsize=16, fontweight='bold')
+    fig.suptitle(f"True Work vs. Proxies {title_suffix}", fontsize=16, fontweight='bold')
 
     # --- ROW 1: TOTAL CYCLE ENERGY COMPARISON (Bar Charts) ---
     
@@ -216,10 +231,18 @@ def analyze_proxies(metrics, outdir):
     print("="*60)
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python3 eval_proxies.py <results_folder>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Evaluate Clinical Work Proxies against FEM Ground Truth")
+    parser.add_argument("results_folder", type=str, help="Path to the simulation results folder")
+    parser.add_argument("--truth", type=str, choices=["total", "fiber"], default="total", 
+                        help="Definition of Ground Truth: 'total' (Tensor S:dE) or 'fiber' (Fiber Projected)")
     
-    metrics = load_metrics(sys.argv[1])
+    args = parser.parse_args()
+    
+    res_dir = Path(args.results_folder)
+    if not res_dir.exists():
+        print(f"Error: Folder not found: {res_dir}")
+        sys.exit(1)
+
+    metrics = load_metrics(res_dir)
     if metrics:
-        analyze_proxies(metrics, sys.argv[1])
+        analyze_proxies(metrics, res_dir, truth_type=args.truth)

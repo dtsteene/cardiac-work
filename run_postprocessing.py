@@ -140,18 +140,48 @@ def main():
 
     env = os.environ.copy()
 
-    for label, target_dir in [("ALL BEATS", all_beats_dir), ("LAST BEAT", last_beat_dir)]:
+    for label, base_dir in [("ALL BEATS", all_beats_dir), ("LAST BEAT", last_beat_dir)]:
         print(f"\n--- 📊 Generating Reports for {label} ---")
         
-        # 1. Quantify Proxies
-        print(f"   Running eval_proxies.py...")
-        cmd1 = [sys.executable, str(eval_proxies_script), str(target_dir)]
-        subprocess.run(cmd1, env=env, check=False)
-        
-        # 2. Generate Meeting Report
-        print(f"   Running plot_loops.py...")
-        cmd2 = [sys.executable, str(plot_loops_script), str(target_dir)]
-        subprocess.run(cmd2, env=env, check=False)
+        # The metrics file inside the base directory
+        npy_file = base_dir / src_metrics_path.name
+        if not npy_file.exists():
+            print(f"⚠️  Missing metrics file in {base_dir}, skipping...")
+            continue
+
+        # Define Configurations
+        configs = [
+            ("total", "truth_total"), 
+            ("fiber", "truth_fiber")
+        ]
+
+        for truth_mode, subfolder_name in configs:
+            print(f"   👉 Mode: {truth_mode.upper()} -> {subfolder_name}/")
+            
+            # 1. Create Sub-directory
+            work_dir = base_dir / subfolder_name
+            work_dir.mkdir(exist_ok=True)
+            
+            # 2. Symlink Data (Avoid duplication)
+            # Create a link inside 'work_dir' pointing to '../metrics.npy'
+            link_target = work_dir / src_metrics_path.name
+            if not link_target.exists():
+                # Use relative path for portability if moved, or absolute? 
+                # Absolute is safer for script execution.
+                try:
+                    link_target.symlink_to(npy_file)
+                except FileExistsError:
+                    pass
+            
+            # 3. Run Eval Proxies
+            cmd_eval = [sys.executable, str(eval_proxies_script), str(work_dir), "--truth", truth_mode]
+            subprocess.run(cmd_eval, env=env, check=False)
+            
+            # 4. Run Plot Loops (Generates standard clinical dashboard + engineering debug)
+            # Use 'total' engineering debug for consistency, but saves plots in this folder
+            # so the user has a self-contained set of images for this "truth mode".
+            cmd_plot = [sys.executable, str(plot_loops_script), str(work_dir)]
+            subprocess.run(cmd_plot, env=env, check=False)
 
     print(f"\n✅ Analysis pipeline finished for: {results_dir.name}")
 

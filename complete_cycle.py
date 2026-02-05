@@ -46,7 +46,7 @@ parser.add_argument('--beats', type=int, default=1, help='Number of beats to run
 parser.add_argument('--ci', action='store_true', help='Enable CI mode (2 timesteps only for quick testing)')
 parser.add_argument('--mesh', type=str, default=None, help='Path to custom XDMF mesh (optional)')
 parser.add_argument('--char_length', type=float, default=5.0, help='Mesh characteristic length (default: 5.0)')
-parser.add_argument('--metrics_space', type=str, default="DG0", choices=["DG0", "DG1"], help='Function space for metrics (DG0 or DG1)')
+parser.add_argument('--metrics_space', type=str, default="DG0", help='Function space for metrics (e.g., DG0, DG1, Quadrature4, Quadrature6)')
 parser.add_argument('--circulation_params', type=str, default=None, help='Path to JSON file with circulation parameters')
 parser.add_argument('--alpha_epi', type=float, default=1e5, help='Epicardial spring stiffness (Pa/m) (default: 1e5)')
 parser.add_argument('--alpha_base', type=float, default=1e6, help='Basal spring stiffness (Pa/m) (default: 1e6)')
@@ -336,8 +336,15 @@ comm.Barrier()
 history = np.load(outdir / "history.npy", allow_pickle=True).item()
 circ_state = np.load(outdir / "state.npy", allow_pickle=True).item()
 
-error_LV = circ_state["V_LV"] - init_state_circ["V_LV"].magnitude
-error_RV = circ_state["V_RV"] - init_state_circ["V_RV"].magnitude
+error_LV = 0.0 # Deprecated: Offset removed in favor of Ratio Coupling
+error_RV = 0.0 # Deprecated: Offset removed in favor of Ratio Coupling
+
+# Scaling Ratios for Multiplicative Coupling (Ratio = Mesh_ED / Circ_ED)
+ratio_LV = init_state_circ["V_LV"].magnitude / circ_state["V_LV"]
+ratio_RV = init_state_circ["V_RV"].magnitude / circ_state["V_RV"]
+
+if comm.rank == 0:
+    logger.info(f"Coupling Ratios (Mesh/Circ): LV={ratio_LV:.4f}, RV={ratio_RV:.4f}")
 
 # Plotting 0D results (Rank 0 only)
 if comm.rank == 0:
@@ -384,7 +391,7 @@ if comm.rank == 0:
     # Plot one full cardiac cycle starting from ED
     t = np.linspace(0, RR_INTERVAL, 200)
     activation_curve = get_activation(t)
-    ax.plot(t, activation_curve.T, label=['LV', 'Septum', 'RV'], linewidth=2)
+    ax.plot(t, activation_curve.T, label=['LV', 'RV', 'Septum'], linewidth=2)
 
     # Mark cardiac cycle phases
     contraction_end = tc_shifted + TC_ACTIVATION
@@ -624,8 +631,9 @@ def p_BiV_func(V_LV, V_RV, t):
     old_Ta = problem.old_Ta
     dTa = value - old_Ta # Vector subtraction
 
-    new_value_LV = (V_LV - error_LV) * (1.0 / volume2ml)
-    new_value_RV = (V_RV - error_RV) * (1.0 / volume2ml)
+    # Ratio Coupling: Scale 0D volume request by the mesh volume fraction
+    new_value_LV = (V_LV * ratio_LV) * (1.0 / volume2ml)
+    new_value_RV = (V_RV * ratio_RV) * (1.0 / volume2ml)
 
     old_lv_volume = problem.old_lv_volume
     old_rv_volume = problem.old_rv_volume
@@ -728,7 +736,21 @@ metrics_model = pulse.CardiacModel(
     compressibility=comp_metrics,
 )
 
-metrics_type_arg = ("DG", 0) if args.metrics_space == "DG0" else ("DG", 1)
+if args.metrics_space.lower().startswith("quadrature"):
+    try:
+        deg = int(args.metrics_space.lower().replace("quadrature", ""))
+        metrics_type_arg = ("Quadrature", deg)
+    except ValueError:
+        metrics_type_arg = ("Quadrature", 4) # Default fallback
+elif args.metrics_space.startswith("DG"):
+    try:
+        deg = int(args.metrics_space.replace("DG", ""))
+        metrics_type_arg = ("DG", deg)
+    except ValueError:
+        metrics_type_arg = ("DG", 1)
+else:
+    # Default fallback for unknown strings
+    metrics_type_arg = ("DG", 1)
 
 metrics_calc = MetricsCalculator(
     geometry=geometry,
@@ -783,6 +805,11 @@ def callback(model, i: int, t: float, save=True):
         "V_LV": float(lv_volume.value * volume2ml),
         "V_RV": float(rv_volume.value * volume2ml)
     }
+
+    # Clinical Volume Reconstruction (Un-scaling)
+    # V_Clinical = V_Mesh / Ratio
+    current_state["V_LV_Clinical"] = current_state["V_LV"] / ratio_LV
+    current_state["V_RV_Clinical"] = current_state["V_RV"] / ratio_RV
     
     if hasattr(model, "V_LV"):
         current_state.setdefault("V_LV_0D", model.V_LV)
@@ -840,8 +867,9 @@ def callback(model, i: int, t: float, save=True):
         if comm.rank == 0 and i % 10 == 0:
             out = {k: v[: i + 1] for k, v in model.history.items()}
             out["Ta"] = Ta_history
-            V_LV = model.history["V_LV"][: i + 1] - error_LV
-            V_RV = model.history["V_RV"][: i + 1] - error_RV
+            # Ratio Coupling: Scale history volumes for output
+            V_LV = model.history["V_LV"][: i + 1] * ratio_LV
+            V_RV = model.history["V_RV"][: i + 1] * ratio_RV
             out["V_LV"] = V_LV
             out["V_RV"] = V_RV
             output_file.write_text(json.dumps(out, indent=4, default=custom_json))

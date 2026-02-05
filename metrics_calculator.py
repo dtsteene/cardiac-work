@@ -23,12 +23,26 @@ class MetricsCalculator:
         # --- 1. Define Function Spaces ---
         element_type = metrics_space_type[0]
         degree = metrics_space_type[1]
-        
-        # Scalar Space (for Work Density, Strain Energy)
-        self.W_scalar = dolfinx.fem.functionspace(self.mesh, (element_type, degree))
-        
-        # Tensor Space (for Stress S and Strain E)
-        self.W_tensor = dolfinx.fem.functionspace(self.mesh, (element_type, degree, (3, 3)))
+
+        # Determine integration quadrature degree
+        # For Quadrature elements, we MUST integrate with the same degree to match points.
+        # For DG/Lagrange, we default to 4 (as per original code), or higher if needed.
+        if element_type == "Quadrature":
+            self.quadrature_degree = degree
+            # Use basix.ufl to create Quadrature elements explicitly
+            el_scalar = basix.ufl.quadrature_element(self.mesh.topology.cell_name(), degree=degree)
+            self.W_scalar = dolfinx.fem.functionspace(self.mesh, el_scalar)
+            
+            el_tensor = basix.ufl.quadrature_element(self.mesh.topology.cell_name(), value_shape=(3,3), degree=degree)
+            self.W_tensor = dolfinx.fem.functionspace(self.mesh, el_tensor)
+        else:
+            self.quadrature_degree = max(4, degree + 2) # Heuristic: degree=1 -> 4, degree=0 -> 4
+            
+            # Scalar Space (for Work Density, Strain Energy)
+            self.W_scalar = dolfinx.fem.functionspace(self.mesh, (element_type, degree))
+            
+            # Tensor Space (for Stress S and Strain E)
+            self.W_tensor = dolfinx.fem.functionspace(self.mesh, (element_type, degree, (3, 3)))
 
         # --- 2. Define Functions for State Tracking ---
         self.S_total = dolfinx.fem.Function(self.W_tensor, name="S_total")
@@ -65,7 +79,7 @@ class MetricsCalculator:
         try:
             # Helper to integrate volume for a specific tag
             def get_vol(tags):
-                dx_sub = ufl.Measure("dx", domain=self.mesh, subdomain_data=self.region_tags, metadata={"quadrature_degree": 4})
+                dx_sub = ufl.Measure("dx", domain=self.mesh, subdomain_data=self.region_tags, metadata={"quadrature_degree": self.quadrature_degree})
                 val = 0.0
                 for t in tags:
                      val += dolfinx.fem.assemble_scalar(dolfinx.fem.form(dolfinx.fem.Constant(self.mesh, 1.0) * dx_sub(int(t))))
@@ -98,9 +112,9 @@ class MetricsCalculator:
         I = ufl.Identity(3)
         F = ufl.variable(ufl.grad(u) + I)
         C = ufl.variable(F.T * F) 
-        E = 0.5 * (C - I)
+        E = 0.5 * (C - I) # Green-Lagrange Strain Tensor
         
-        S_tot_ufl = self.cardiac_model.S(C)
+        S_tot_ufl = self.cardiac_model.S(C) # Total 2nd Piola-Kirchhoff Stress
         S_act_ufl = self.cardiac_model.active.S(C)
         S_pas_ufl = self.cardiac_model.material.S(C)
         S_cmp_ufl = self.cardiac_model.compressibility.S(C)
@@ -152,7 +166,7 @@ class MetricsCalculator:
 
         for region_name, cell_tags, region_markers in regions:
             # Setup Measure
-            dx_sub = ufl.Measure("dx", domain=self.mesh, subdomain_data=cell_tags, metadata={"quadrature_degree": 4})
+            dx_sub = ufl.Measure("dx", domain=self.mesh, subdomain_data=cell_tags, metadata={"quadrature_degree": self.quadrature_degree})
             
             def assemble_region(expr):
                 val = 0.0
@@ -210,7 +224,7 @@ class MetricsCalculator:
         regions = self._get_regions_to_integrate()
         
         for region_name, cell_tags, region_markers in regions:
-            dx_sub = ufl.Measure("dx", domain=self.mesh, subdomain_data=cell_tags, metadata={"quadrature_degree": 4})
+            dx_sub = ufl.Measure("dx", domain=self.mesh, subdomain_data=cell_tags, metadata={"quadrature_degree": self.quadrature_degree})
             
             def assemble_region(expr):
                 val = 0.0
