@@ -144,7 +144,6 @@ def plot_clinical_dashboard(metrics, outdir):
     print(f" Saved: {outpath}")
     plt.close()
 
-
 def plot_engineering_debug(metrics, outdir):
     """
     Revised Energy Accounting Dashboard.
@@ -159,29 +158,36 @@ def plot_engineering_debug(metrics, outdir):
     
     N = len(time)
 
+    # --- HELPER TO FIX THE BUG ---
+    # This replaces the unsafe "or np.zeros(N)" logic
+    def get_safe(keys):
+        arr = get_arr(metrics, keys, N)
+        return arr if arr is not None else np.zeros(N)
+
     # A. Internal Work (Source: Strain Energy)
     # Prefer 'Whole', fallback to sum of parts
     w_int = get_arr(metrics, ["work_true_Whole"], N)
     if w_int is None:
-        w_lv = get_arr(metrics, ["work_true_LV"], N) or np.zeros(N)
-        w_rv = get_arr(metrics, ["work_true_RV"], N) or np.zeros(N)
-        w_sep = get_arr(metrics, ["work_true_Septum"], N) or np.zeros(N)
-        w_int = w_lv + w_rv + w_sep
+        # Note: You were safe here because you used specific logic previously, 
+        # but using get_safe is cleaner.
+        w_int = get_safe(["work_true_LV"]) + \
+                get_safe(["work_true_RV"]) + \
+                get_safe(["work_true_Septum"])
 
     # B. Boundary Work (Sink 1: The Blood)
     # 1. Proxy Method (P*dV) - The "Clinical" view
-    w_pv_proxy = (get_arr(metrics, ["work_proxy_pv_LV"], N) or np.zeros(N)) + \
-                 (get_arr(metrics, ["work_proxy_pv_RV"], N) or np.zeros(N))
+    # FIXED: Replaced unsafe 'or' with get_safe()
+    w_pv_proxy = get_safe(["work_proxy_pv_LV"]) + \
+                 get_safe(["work_proxy_pv_RV"])
     
     # 2. Exact Method (Integral -P u.n ds) - The "Rigorous" view
-    w_boundary_lv = get_arr(metrics, ["work_boundary_exact_LV"], N) or np.zeros(N)
-    w_boundary_rv = get_arr(metrics, ["work_boundary_exact_RV"], N) or np.zeros(N)
-    w_boundary_exact = w_boundary_lv + w_boundary_rv
+    w_boundary_exact = get_safe(["work_boundary_exact_LV"]) + \
+                       get_safe(["work_boundary_exact_RV"])
 
     # C. Spring Work (Sink 2: The Constraints)
     # Integral -alpha * u * du
-    w_robin = (get_arr(metrics, ["work_robin_epi"], N) or np.zeros(N)) + \
-              (get_arr(metrics, ["work_robin_base"], N) or np.zeros(N))
+    w_robin = get_safe(["work_robin_epi"]) + \
+              get_safe(["work_robin_base"])
 
     # D. Total External Sink (Exact + Robin)
     w_sink_total = w_boundary_exact + w_robin
@@ -224,24 +230,20 @@ def plot_engineering_debug(metrics, outdir):
     ax1.grid(True, alpha=0.3)
 
     # PLOT 2: GEOMETRIC CONSISTENCY (Top Right)
-    # Does P*dV match Surface Integral?
     ax2 = fig.add_subplot(gs[0, 1])
     ax2.plot(time, E_pv_proxy, 'b-', lw=2, label='Proxy (P · dV)')
     ax2.plot(time, E_pv_exact, 'g--', lw=2, label='Exact (∫ -P u·n ds)')
     
-    # If lines diverge, surface tags are wrong
     ax2.set_title("2. Geometric Validation (Mesh Tags Check)", fontsize=14, fontweight='bold')
     ax2.set_ylabel("Boundary Work (Joules)")
     ax2.set_xlabel("Time (s)")
     ax2.legend()
     ax2.grid(True, alpha=0.3)
     
-    # Note for user
     ax2.text(0.5, 0.05, "Lines should overlap perfectly.\nDivergence = Leaky/Wrong Surface Tags.", 
              transform=ax2.transAxes, ha='center', fontsize=9, style='italic', bbox=dict(facecolor='white', alpha=0.8))
 
     # PLOT 3: ENERGY SINK BREAKDOWN (Bottom Left)
-    # Stacked area
     ax3 = fig.add_subplot(gs[1, 0])
     ax3.stackplot(time, 
                   np.cumsum(w_boundary_exact), 
@@ -258,7 +260,6 @@ def plot_engineering_debug(metrics, outdir):
     ax3.grid(True, alpha=0.3)
 
     # PLOT 4: INSTANTANEOUS POWER (Bottom Right)
-    # Helps identify WHEN the error occurs
     ax4 = fig.add_subplot(gs[1, 1])
     ax4.plot(time, w_int, 'b-', lw=1.5, label='Internal Power (Source)')
     ax4.plot(time, w_sink_total, 'k--', lw=1.5, label='External Power (Sink)')
