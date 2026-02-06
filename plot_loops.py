@@ -146,138 +146,152 @@ def plot_clinical_dashboard(metrics, outdir):
 
 def plot_engineering_debug(metrics, outdir):
     """
-    Revised Energy Accounting Dashboard.
-    Validates: Thermodynamics (Conservation), Geometry (Tags), and Mechanics (Sinks).
+    Revised Energy Accounting Dashboard (V2).
+    Validates: 
+    1. Numerical Conservation (Solver Health)
+    2. Geometric Consistency (Tag Health)
+    3. Physics Sanity (Active vs Passive behavior)
     """
     
     # --- 1. GATHER DATA ---
-    time = get_arr(metrics, ["time"])
-    if time is None: 
-        print("Time array missing. Skipping debug.")
-        return
-    
-    N = len(time)
-
-    # --- HELPER TO FIX THE BUG ---
-    # This replaces the unsafe "or np.zeros(N)" logic
+    # Helper to get data safely
+    N = len(metrics["time"])
     def get_safe(keys):
-        arr = get_arr(metrics, keys, N)
-        return arr if arr is not None else np.zeros(N)
+        # Logic to find key in dictionary
+        for k in keys:
+            if k in metrics:
+                # If it's a list, convert to numpy
+                return np.array(metrics[k])
+        return np.zeros(N)
 
-    # A. Internal Work (Source: Strain Energy)
-    # Prefer 'Whole', fallback to sum of parts
-    w_int = get_arr(metrics, ["work_true_Whole"], N)
-    if w_int is None:
-        # Note: You were safe here because you used specific logic previously, 
-        # but using get_safe is cleaner.
-        w_int = get_safe(["work_true_LV"]) + \
-                get_safe(["work_true_RV"]) + \
-                get_safe(["work_true_Septum"])
+    time = np.array(metrics["time"])
 
-    # B. Boundary Work (Sink 1: The Blood)
-    # 1. Proxy Method (P*dV) - The "Clinical" view
-    # FIXED: Replaced unsafe 'or' with get_safe()
-    w_pv_proxy = get_safe(["work_proxy_pv_LV"]) + \
-                 get_safe(["work_proxy_pv_RV"])
+    # --- A. The Sinks (External Outputs) ---
+    # 1. PV Loop Work (The Clinical Output)
+    w_pv_proxy = get_safe(["work_proxy_pv_LV"]) + get_safe(["work_proxy_pv_RV"])
     
-    # 2. Exact Method (Integral -P u.n ds) - The "Rigorous" view
-    w_boundary_exact = get_safe(["work_boundary_exact_LV"]) + \
-                       get_safe(["work_boundary_exact_RV"])
+    # 2. Robin Springs (The Elastic Support)
+    w_robin = get_safe(["work_robin_epi"]) + get_safe(["work_robin_base"])
+    
+    # 3. Exact Boundary Work (for validation only)
+    w_boundary_exact = get_safe(["work_boundary_exact_LV"]) + get_safe(["work_boundary_exact_RV"])
 
-    # C. Spring Work (Sink 2: The Constraints)
-    # Integral -alpha * u * du
-    w_robin = get_safe(["work_robin_epi"]) + \
-              get_safe(["work_robin_base"])
+    # --- B. The Sources (Internal Mechanics) ---
+    # We break the "Total" work into its physical components
+    
+    # Active Work (The Engine)
+    w_active = get_safe(["work_active_Whole"]) 
+    if np.sum(np.abs(w_active)) == 0: # Fallback if 'Whole' is missing
+        w_active = get_safe(["work_active_LV"]) + get_safe(["work_active_RV"]) + get_safe(["work_active_Septum"])
 
-    # D. Total External Sink (Exact + Robin)
-    w_sink_total = w_boundary_exact + w_robin
+    # Passive Work (The Elastic Storage)
+    w_passive = get_safe(["work_passive_Whole"])
+    if np.sum(np.abs(w_passive)) == 0:
+        w_passive = get_safe(["work_passive_LV"]) + get_safe(["work_passive_RV"]) + get_safe(["work_passive_Septum"])
 
-    # --- 2. CUMULATIVE SUMS (JOULES) ---
-    E_int = np.cumsum(w_int)
-    E_sink = np.cumsum(w_sink_total)
-    E_pv_proxy = np.cumsum(w_pv_proxy)
-    E_pv_exact = np.cumsum(w_boundary_exact)
+    # Compressible Work (The Error - Should be zero for incompressible)
+    w_comp = get_safe(["work_comp_Whole"])
+    if np.sum(np.abs(w_comp)) == 0:
+        w_comp = get_safe(["work_comp_LV"]) + get_safe(["work_comp_RV"]) + get_safe(["work_comp_Septum"])
 
-    # --- 3. FIGURE SETUP ---
-    fig = plt.figure(figsize=(16, 12))
-    gs = gridspec.GridSpec(2, 2, figure=fig)
-    fig.suptitle("Engineering Debug: Energy Accounting & Validation", fontsize=18, fontweight='bold')
+    # Total Internal (Sum of parts)
+    w_int_total = w_active + w_passive + w_comp
 
-    # PLOT 1: THE GRAND BALANCE (Top Left)
+
+    # --- 2. FIGURE SETUP ---
+    fig = plt.figure(figsize=(18, 12))
+    gs = gridspec.GridSpec(2, 3, figure=fig) # 2x3 Grid
+    fig.suptitle("Advanced Engineering Debug: Physics & Numerics", fontsize=18, fontweight='bold')
+
+    # ==========================================================
+    # ROW 1: NUMERICAL VALIDATION (Is the math correct?)
+    # ==========================================================
+
+    # PLOT 1: Conservation of Energy (Total In vs Total Out)
     ax1 = fig.add_subplot(gs[0, 0])
-    ax1.plot(time, E_int, 'k-', lw=3, label='Energy Generated (Internal Strain)')
-    ax1.plot(time, E_sink, 'r--', lw=2.5, label='Energy Output (Blood + Springs)')
+    # Note: Internal work is usually negative (generation), External is negative (outflow).
+    # We plot magnitude or consistent signs to compare.
+    # Here assuming standard sign convention where Internal = External.
     
-    # Fill the Error
-    ax1.fill_between(time, E_int, E_sink, color='orange', alpha=0.2, label='Numerical/Viscous Loss')
+    ax1.plot(time, np.cumsum(w_int_total), 'k-', lw=3, label='Total Internal (Act+Pas)')
+    ax1.plot(time, np.cumsum(w_boundary_exact + w_robin), 'r--', lw=2.5, label='Total External (Bnd+Spr)')
     
-    # Stats
-    total_in = E_int[-1]
-    total_out = E_sink[-1]
-    err_pct = ((total_in - total_out) / total_in * 100.0) if abs(total_in) > 1e-6 else 0.0
-    
-    stats_text = (f"Total Generated: {total_in:.2f} J\n"
-                  f"Total Output:    {total_out:.2f} J\n"
-                  f"Imbalance:       {err_pct:.1f}%")
-    
-    ax1.text(0.05, 0.85, stats_text, transform=ax1.transAxes, 
-             bbox=dict(facecolor='white', alpha=0.9, edgecolor='gray'), fontsize=11)
-    
-    ax1.set_title("1. Grand Energy Balance (Conservation)", fontsize=14, fontweight='bold')
-    ax1.set_ylabel("Cumulative Energy (Joules)")
-    ax1.set_xlabel("Time (s)")
-    ax1.legend(loc='lower right')
+    ax1.set_title("1. Solver Health (Conservation)", fontsize=12, fontweight='bold')
+    ax1.set_ylabel("Cumulative Energy (J)")
+    ax1.legend(loc='best')
     ax1.grid(True, alpha=0.3)
+    ax1.text(0.05, 0.05, "Must Overlap Perfectly", transform=ax1.transAxes, fontsize=8, color='red')
 
-    # PLOT 2: GEOMETRIC CONSISTENCY (Top Right)
+    # PLOT 2: Geometric Consistency
     ax2 = fig.add_subplot(gs[0, 1])
-    ax2.plot(time, E_pv_proxy, 'b-', lw=2, label='Proxy (P · dV)')
-    ax2.plot(time, E_pv_exact, 'g--', lw=2, label='Exact (∫ -P u·n ds)')
-    
-    ax2.set_title("2. Geometric Validation (Mesh Tags Check)", fontsize=14, fontweight='bold')
-    ax2.set_ylabel("Boundary Work (Joules)")
-    ax2.set_xlabel("Time (s)")
+    ax2.plot(time, np.cumsum(w_pv_proxy), 'b-', label='Clinical Proxy (P·dV)')
+    ax2.plot(time, np.cumsum(w_boundary_exact), 'g--', label='Exact Surface (∫P·u·n)')
+    ax2.set_title("2. Geometric Tags Check", fontsize=12, fontweight='bold')
     ax2.legend()
     ax2.grid(True, alpha=0.3)
-    
-    ax2.text(0.5, 0.05, "Lines should overlap perfectly.\nDivergence = Leaky/Wrong Surface Tags.", 
-             transform=ax2.transAxes, ha='center', fontsize=9, style='italic', bbox=dict(facecolor='white', alpha=0.8))
 
-    # PLOT 3: ENERGY SINK BREAKDOWN (Bottom Left)
-    ax3 = fig.add_subplot(gs[1, 0])
-    ax3.stackplot(time, 
-                  np.cumsum(w_boundary_exact), 
-                  np.cumsum(w_robin),
-                  labels=['Work on Blood', 'Work on Springs'],
-                  colors=['#d62728', "#2d9f2d"], alpha=0.5)
-    
-    ax3.plot(time, E_int, 'k:', lw=1.5, label='Total Internal Ref')
-    
-    ax3.set_title("3. Where does the Energy go?", fontsize=14, fontweight='bold')
-    ax3.set_ylabel("Cumulative Energy (Joules)")
-    ax3.set_xlabel("Time (s)")
-    ax3.legend(loc='upper left')
+    # PLOT 3: Incompressibility Check
+    ax3 = fig.add_subplot(gs[0, 2])
+    ax3.plot(time, np.cumsum(w_comp), 'm-', lw=2)
+    ax3.set_title("3. Incompressibility Error", fontsize=12, fontweight='bold')
+    ax3.set_ylabel("Compressible Work (J)")
+    ax3.text(0.5, 0.9, "Should be ~Zero", transform=ax3.transAxes, ha='center', color='gray')
     ax3.grid(True, alpha=0.3)
 
-    # PLOT 4: INSTANTANEOUS POWER (Bottom Right)
-    ax4 = fig.add_subplot(gs[1, 1])
-    ax4.plot(time, w_int, 'b-', lw=1.5, label='Internal Power (Source)')
-    ax4.plot(time, w_sink_total, 'k--', lw=1.5, label='External Power (Sink)')
+    # ==========================================================
+    # ROW 2: PHYSICS VALIDATION (Is it a heart?)
+    # ==========================================================
+
+    # PLOT 4: The Components of Internal Work
+    ax4 = fig.add_subplot(gs[1, 0])
     
-    # Highlight max error region
-    power_diff = w_int - w_sink_total
-    ax4.fill_between(time, 0, power_diff, color='orange', alpha=0.3, label='Instantaneous Error')
-
-    ax4.set_title("4. Instantaneous Power Balance", fontsize=14, fontweight='bold')
-    ax4.set_ylabel("Power (Joules/step)")
-    ax4.set_xlabel("Time (s)")
-    ax4.legend(loc='upper right')
+    # Active Work (Should be Monotonic/Large)
+    ax4.plot(time, np.cumsum(w_active), 'r-', lw=2, label='Active (Engine)')
+    
+    # Passive Work (Should Oscillate)
+    ax4.plot(time, np.cumsum(w_passive), 'b-', lw=2, label='Passive (Spring)')
+    
+    ax4.set_title("4. Internal Source Split", fontsize=12, fontweight='bold')
+    ax4.set_ylabel("Cumulative Energy (J)")
+    ax4.legend()
     ax4.grid(True, alpha=0.3)
+    
+    # Check Passive Return
+    passive_residual = np.cumsum(w_passive)[-1]
+    ax4.text(0.95, 0.05, f"Net Passive: {passive_residual:.2e} J\n(Target: 0.0)", 
+             transform=ax4.transAxes, ha='right', bbox=dict(facecolor='white', alpha=0.8))
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    outpath = outdir / "engineering_debug.png"
-    plt.savefig(outpath, dpi=150)
-    print(f" Saved: {outpath}")
+    # PLOT 5: The "Active vs PV" Correlation
+    # This is the plot for your new equation: W_PV ~ W_Active - W_Robin
+    ax5 = fig.add_subplot(gs[1, 1:]) # Spans 2 cols
+    
+    E_active = np.cumsum(w_active)
+    E_PV = np.cumsum(w_pv_proxy)
+    E_Robin = np.cumsum(w_robin)
+    
+    # The Equation: Active = PV + Robin (Signs depend on convention, usually magnitudes sum)
+    # Let's verify the balance: W_Active (source) should match W_Sinks (PV + Robin)
+    
+    ax5.plot(time, E_active, 'r-', lw=3, label='Source: Active Work')
+    ax5.plot(time, E_PV + E_Robin, 'k--', lw=2, label='Sinks: PV Loop + Robin Springs')
+    
+    # Also show just the PV loop to show how much Robin "helps"
+    ax5.plot(time, E_PV, 'b:', lw=1, label='PV Loop Only')
+    
+    ax5.set_title("5. Physics Balance: W_Active ≈ W_PV + W_Robin", fontsize=12, fontweight='bold')
+    ax5.legend()
+    ax5.grid(True, alpha=0.3)
+    
+    # Final Text
+    balance_err = E_active[-1] - (E_PV[-1] + E_Robin[-1]) # Assuming signs are aligned (both neg or both pos)
+    # If signs are opposite in your code, change to E_active[-1] + ...
+    
+    ax5.text(0.5, 0.5, "The Red solid line should match the Black dashed line.\nThe Blue dotted line is what goes to the blood.", 
+             transform=ax5.transAxes, ha='center', fontsize=10, bbox=dict(facecolor='white'))
+
+    plt.tight_layout()
+    plt.savefig(outdir / "engineering_debug_v2.png")
+    print("Saved V2 debug dashboard.")
     plt.close()
 
 
