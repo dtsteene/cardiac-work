@@ -103,11 +103,11 @@ class MetricsCalculator:
                  self.region_volumes["Septum"] = 1.0
                  self.region_volumes["Whole"] = 1.0
 
-            if self.rank == 0:
-                 print(f"MetricsCalculator: Volumes calculated.")
-                 print(f"  LV Free: {self.region_volumes['LV']:.2e} m3")
-                 print(f"  RV Free: {self.region_volumes['RV']:.2e} m3")
-                 print(f"  Septum:  {self.region_volumes['Septum']:.2e} m3")
+            # if self.rank == 0:
+            #      print(f"MetricsCalculator: Volumes calculated.")
+            #      print(f"  LV Free: {self.region_volumes['LV']:.2e} m3")
+            #      print(f"  RV Free: {self.region_volumes['RV']:.2e} m3")
+            #      print(f"  Septum:  {self.region_volumes['Septum']:.2e} m3")
 
         except Exception as e:
             if self.rank == 0: print(f"MetricsCalculator Warning: Could not calc regional volumes ({e}). Using defaults.")
@@ -558,7 +558,7 @@ class MetricsCalculator:
             metrics["work_boundary_exact_LV"] = 0.0
             metrics["work_boundary_exact_RV"] = 0.0    
         
-        print(metrics)
+        #print(metrics)
         
         return metrics
     
@@ -576,8 +576,8 @@ class MetricsCalculator:
         p_RV = (current_state.get("p_RV", 0.0) or 0.0) * 133.322
         
         # 2. Define Measures
-        tag_endo_lv = self.geometry.markers["ENDO_LV"][0]  # Will grab 30
-        tag_endo_rv = self.geometry.markers["ENDO_RV"][0]  # Will grab 20
+        tag_endo_lv = self.geometry.markers["LV"][0]  
+        tag_endo_rv = self.geometry.markers["RV"][0]  
         
         ds = ufl.Measure("ds", domain=self.mesh, subdomain_data=self.geometry.facet_tags)
     

@@ -2,7 +2,7 @@
 
 # --- Slurm Job Configuration ---
 #SBATCH --job-name=cardiac_sim
-#SBATCH --partition=fpgaq 
+#SBATCH --partition=nasq 
 #SBATCH --nodes=1
 #SBATCH --ntasks=8
 #SBATCH --cpus-per-task=1

@@ -62,7 +62,7 @@ else:
 CI_MODE = args.ci or bool(os.getenv("CI"))
 
 if CI_MODE:
-    print("⚠️  CI MODE ENABLED - Short circuit test (2 timesteps only)")
+    print(" CI MODE ENABLED - Short circuit test (2 timesteps only)")
 else:
     print("✓ PRODUCTION MODE - Full simulation")
 
@@ -164,41 +164,8 @@ def parser_ds(ds_measure, marker_id):
 lvv_target = 0.0
 rvv_target = 0.0
 
-try:
-    lvv_target = comm.allreduce(geometry.volume("LV"), op=MPI.SUM)
-except Exception:
-    # Fallback for meshes without volume tags (Surface Integral)
-    # V = 1/3 * int(x . n) ds
-    logger.info("Volume tag 'LV' not found. Calculating cavity volume from surface 'ENDO_LV'...")
-    x = ufl.SpatialCoordinate(geometry.mesh)
-    n = ufl.FacetNormal(geometry.mesh)
-    # Note: Normal points OUT of the domain (into the cavity).
-    # So V_cavity = -1/3 * int(x.n) ds(endo)? 
-    # Or is it positive? Divergence theorem on the HOLE?
-    # Usually V = -1/3 int(x.n) ds_endo if n points OUT of wall (INTO cavity).
-    # Let's verify sign convention.
-    try:
-        ds_lv = parser_ds(geometry.ds, geometry.markers["ENDO_LV"][0])
-        val = dolfinx.fem.assemble_scalar(dolfinx.fem.form(-1.0/3.0 * ufl.dot(x, n) * ds_lv))
-        lvv_target = comm.allreduce(val, op=MPI.SUM)
-    # RECOMMENDED FIX
-    except Exception as e:
-        logger.error(f"CRITICAL: Could not calculate LV Volume via tag OR surface integral: {e}")
-        # Stop the script immediately
-        raise RuntimeError("Cannot determine LV target volume. Check mesh markers.")
-
-try:
-    rvv_target = comm.allreduce(geometry.volume("RV"), op=MPI.SUM)
-except Exception:
-    logger.info("Volume tag 'RV' not found. Calculating cavity volume from surface 'ENDO_RV'...")
-    x = ufl.SpatialCoordinate(geometry.mesh)
-    n = ufl.FacetNormal(geometry.mesh)
-    try:
-        ds_rv = parser_ds(geometry.ds, geometry.markers["ENDO_RV"][0])
-        val = dolfinx.fem.assemble_scalar(dolfinx.fem.form(-1.0/3.0 * ufl.dot(x, n) * ds_rv))
-        rvv_target = comm.allreduce(val, op=MPI.SUM)
-    except Exception as e:
-        logger.warning(f"Failed to calc RV volume from surface: {e}")
+lvv_target = comm.allreduce(geometry.volume("LV"), op=MPI.SUM)
+rvv_target = comm.allreduce(geometry.volume("RV"), op=MPI.SUM)
 
 logger.info(
     f"ED Volumes: LV={lvv_target * volume2ml:.2f} mL, RV={rvv_target * volume2ml:.2f} mL",
@@ -474,8 +441,8 @@ pressure_lv = pulse.Variable(dolfinx.fem.Constant(geometry.mesh, 0.0), "kPa")
 pressure_rv = pulse.Variable(dolfinx.fem.Constant(geometry.mesh, 0.0), "kPa")
 
 # FIX: Use ENDO_LV/RV markers directly for surface traction if "LV"/"RV" missing
-lv_marker_id = geometry.markers["LV"][0] if "LV" in geometry.markers else geometry.markers["ENDO_LV"][0]
-rv_marker_id = geometry.markers["RV"][0] if "RV" in geometry.markers else geometry.markers["ENDO_RV"][0]
+lv_marker_id = geometry.markers["LV"][0] 
+rv_marker_id = geometry.markers["RV"][0] 
 
 neumann_lv = pulse.NeumannBC(traction=pressure_lv, marker=lv_marker_id)
 neumann_rv = pulse.NeumannBC(traction=pressure_rv, marker=rv_marker_id)
@@ -528,19 +495,9 @@ s0_map = pulse.utils.map_vector_field(
 x = ufl.SpatialCoordinate(geometry.mesh)
 n = ufl.FacetNormal(geometry.mesh)
 
-try:
-    lvv_unloaded = comm.allreduce(geometry.volume("LV"), op=MPI.SUM)
-except:
-    ds_lv = parser_ds(geometry.ds, geometry.markers["ENDO_LV"][0])
-    val = dolfinx.fem.assemble_scalar(dolfinx.fem.form(-1.0/3.0 * ufl.dot(x, n) * ds_lv))
-    lvv_unloaded = comm.allreduce(val, op=MPI.SUM)
 
-try:
-    rvv_unloaded = comm.allreduce(geometry.volume("RV"), op=MPI.SUM)
-except:
-    ds_rv = parser_ds(geometry.ds, geometry.markers["ENDO_RV"][0])
-    val = dolfinx.fem.assemble_scalar(dolfinx.fem.form(-1.0/3.0 * ufl.dot(x, n) * ds_rv))
-    rvv_unloaded = comm.allreduce(val, op=MPI.SUM)
+lvv_unloaded = comm.allreduce(geometry.volume("LV"), op=MPI.SUM)
+rvv_unloaded = comm.allreduce(geometry.volume("RV"), op=MPI.SUM)
 
 logger.info(f"Unloaded volumes: LV={lvv_unloaded * volume2ml:.2f} mL, RV={rvv_unloaded * volume2ml:.2f} mL")
 
