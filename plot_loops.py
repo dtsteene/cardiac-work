@@ -144,115 +144,141 @@ def plot_clinical_dashboard(metrics, outdir):
     print(f"✅ Saved: {outpath}")
     plt.close()
 
+
 def plot_engineering_debug(metrics, outdir):
-    """Creates the energy balance analysis for the engineering team."""
+    """
+    Revised Energy Accounting Dashboard.
+    Validates: Thermodynamics (Conservation), Geometry (Tags), and Mechanics (Sinks).
+    """
     
-    # 1. Get Instantaneous Power (Work per step)
-    # True Internal Work (Sum of regions)
-    w_true_lv = get_arr(metrics, ["work_true_LV"])
-    w_true_rv = get_arr(metrics, ["work_true_RV"])
-    w_true_sep = get_arr(metrics, ["work_true_Septum"])
-    
-    if w_true_lv is None:
-        print("⚠ Missing work metrics. Skipping energy debug.")
+    # --- 1. GATHER DATA ---
+    time = get_arr(metrics, ["time"])
+    if time is None: 
+        print("Time array missing. Skipping debug.")
         return
-
-    # Total Internal Power
-    # Note: If 'work_true_Whole' exists, use it. Else sum regions.
-    w_int_total_step = get_arr(metrics, ["work_true_Whole"])
-    if w_int_total_step is None:
-        w_int_total_step = w_true_lv + w_true_rv + w_true_sep
-
-    # External Power (PV Proxies)
-    w_pv_lv_step = get_arr(metrics, ["work_proxy_pv_LV"], len(w_int_total_step))
-    w_pv_rv_step = get_arr(metrics, ["work_proxy_pv_RV"], len(w_int_total_step))
-    w_ext_total_step = w_pv_lv_step + w_pv_rv_step
-
-    # 2. Integrate to get Cumulative Energy (Joules)
-    E_int_cum = np.cumsum(w_int_total_step)
-    E_ext_cum = np.cumsum(w_ext_total_step)
     
-    # Time array
-    time = get_arr(metrics, ["time"], len(w_int_total_step))
+    N = len(time)
 
-    # --- FIGURE ---
-    fig = plt.figure(figsize=(15, 10))
+    # A. Internal Work (Source: Strain Energy)
+    # Prefer 'Whole', fallback to sum of parts
+    w_int = get_arr(metrics, ["work_true_Whole"], N)
+    if w_int is None:
+        w_lv = get_arr(metrics, ["work_true_LV"], N) or np.zeros(N)
+        w_rv = get_arr(metrics, ["work_true_RV"], N) or np.zeros(N)
+        w_sep = get_arr(metrics, ["work_true_Septum"], N) or np.zeros(N)
+        w_int = w_lv + w_rv + w_sep
+
+    # B. Boundary Work (Sink 1: The Blood)
+    # 1. Proxy Method (P*dV) - The "Clinical" view
+    w_pv_proxy = (get_arr(metrics, ["work_proxy_pv_LV"], N) or np.zeros(N)) + \
+                 (get_arr(metrics, ["work_proxy_pv_RV"], N) or np.zeros(N))
+    
+    # 2. Exact Method (Integral -P u.n ds) - The "Rigorous" view
+    w_boundary_lv = get_arr(metrics, ["work_boundary_exact_LV"], N) or np.zeros(N)
+    w_boundary_rv = get_arr(metrics, ["work_boundary_exact_RV"], N) or np.zeros(N)
+    w_boundary_exact = w_boundary_lv + w_boundary_rv
+
+    # C. Spring Work (Sink 2: The Constraints)
+    # Integral -alpha * u * du
+    w_robin = (get_arr(metrics, ["work_robin_epi"], N) or np.zeros(N)) + \
+              (get_arr(metrics, ["work_robin_base"], N) or np.zeros(N))
+
+    # D. Total External Sink (Exact + Robin)
+    w_sink_total = w_boundary_exact + w_robin
+
+    # --- 2. CUMULATIVE SUMS (JOULES) ---
+    E_int = np.cumsum(w_int)
+    E_sink = np.cumsum(w_sink_total)
+    E_pv_proxy = np.cumsum(w_pv_proxy)
+    E_pv_exact = np.cumsum(w_boundary_exact)
+
+    # --- 3. FIGURE SETUP ---
+    fig = plt.figure(figsize=(16, 12))
     gs = gridspec.GridSpec(2, 2, figure=fig)
-    fig.suptitle("Engineering Debug: Energy Balance & Consistency", fontsize=16, fontweight='bold')
+    fig.suptitle("Engineering Debug: Energy Accounting & Validation", fontsize=18, fontweight='bold')
 
-    # PLOT 1: Cumulative Energy (The "Devil's Advocate" Plot)
+    # PLOT 1: THE GRAND BALANCE (Top Left)
     ax1 = fig.add_subplot(gs[0, 0])
-    ax1.plot(time, E_ext_cum, 'k--', linewidth=2, label='External Work (PV Area)')
-    ax1.plot(time, E_int_cum, 'b-', linewidth=2, alpha=0.8, label='Internal Work (Strain Energy)')
+    ax1.plot(time, E_int, 'k-', lw=3, label='Energy Generated (Internal Strain)')
+    ax1.plot(time, E_sink, 'r--', lw=2.5, label='Energy Output (Blood + Springs)')
     
-    # Calculate Energy Gap (Missing Energy)
-    W_int_end = E_int_cum[-1]
-    W_ext_end = E_ext_cum[-1]
+    # Fill the Error
+    ax1.fill_between(time, E_int, E_sink, color='orange', alpha=0.2, label='Numerical/Viscous Loss')
     
-    # Dissipation Ratio: (Int - Ext) / Int 
-    # If Ext > Int, this is negative (energy creation? or spring work?)
-    # If Int > Ext, this is positive (energy dissipation)
-    if abs(W_int_end) > 1e-9:
-        dissipation_ratio = (W_int_end - W_ext_end) / W_int_end * 100.0
-    else:
-        dissipation_ratio = 0.0
-
-    # Old metric for comparison: relative error
-    final_err = (W_ext_end - W_int_end) / W_ext_end * 100
+    # Stats
+    total_in = E_int[-1]
+    total_out = E_sink[-1]
+    err_pct = ((total_in - total_out) / total_in * 100.0) if abs(total_in) > 1e-6 else 0.0
     
-    ax1.fill_between(time, E_int_cum, E_ext_cum, color='red', alpha=0.1, label='Energy Gap')
+    stats_text = (f"Total Generated: {total_in:.2f} J\n"
+                  f"Total Output:    {total_out:.2f} J\n"
+                  f"Imbalance:       {err_pct:.1f}%")
     
-    # Annotation on the plot
-    text_str = f"Dissipation: {dissipation_ratio:.1f}%\n(Int: {W_int_end:.2f}J, Ext: {W_ext_end:.2f}J)"
-    ax1.text(0.05, 0.85, text_str, transform=ax1.transAxes, 
-             bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'), fontsize=10)
-
-    ax1.set_title(f"Global Energy Balance", fontsize=12, fontweight='bold')
-    ax1.set_ylabel("Cumulative Work (Joules)")
+    ax1.text(0.05, 0.85, stats_text, transform=ax1.transAxes, 
+             bbox=dict(facecolor='white', alpha=0.9, edgecolor='gray'), fontsize=11)
+    
+    ax1.set_title("1. Grand Energy Balance (Conservation)", fontsize=14, fontweight='bold')
+    ax1.set_ylabel("Cumulative Energy (Joules)")
     ax1.set_xlabel("Time (s)")
-    ax1.legend()
+    ax1.legend(loc='lower right')
     ax1.grid(True, alpha=0.3)
 
-    # PLOT 2: Septum Pressure Proxy Investigation
-    # Compare True Septum Work vs the Proxies
+    # PLOT 2: GEOMETRIC CONSISTENCY (Top Right)
+    # Does P*dV match Surface Integral?
     ax2 = fig.add_subplot(gs[0, 1])
+    ax2.plot(time, E_pv_proxy, 'b-', lw=2, label='Proxy (P · dV)')
+    ax2.plot(time, E_pv_exact, 'g--', lw=2, label='Exact (∫ -P u·n ds)')
     
-    w_sep_true_cum = np.cumsum(w_true_sep)
-    ax2.plot(time, w_sep_true_cum, 'k-', linewidth=2.5, label='True Septal Work')
-    
-    # Try to find the proxies we added
-    proxies = {
-        "work_ps_index_Septum_Trans": ("Trans-Septal (P_LV - P_RV)", "green"),
-        "work_ps_index_Septum_PLV":   ("LV Pressure Only", "blue"),
-        "work_ps_index_Septum_PRV":   ("RV Pressure Only", "red"),
-        "work_ps_index_Septum":       ("Standard (Old)", "gray")
-    }
-    
-    for key, (label, color) in proxies.items():
-        arr = get_arr(metrics, [key], len(time))
-        if arr is not None:
-            ax2.plot(time, np.cumsum(arr), linestyle='--', color=color, label=f'Proxy: {label}')
-
-    ax2.set_title("Septum Work: True vs Proxies", fontsize=12, fontweight='bold')
-    ax2.set_ylabel("Cumulative Work (Joules)")
-    ax2.legend(fontsize=9)
+    # If lines diverge, surface tags are wrong
+    ax2.set_title("2. Geometric Validation (Mesh Tags Check)", fontsize=14, fontweight='bold')
+    ax2.set_ylabel("Boundary Work (Joules)")
+    ax2.set_xlabel("Time (s)")
+    ax2.legend()
     ax2.grid(True, alpha=0.3)
+    
+    # Note for user
+    ax2.text(0.5, 0.05, "Lines should overlap perfectly.\nDivergence = Leaky/Wrong Surface Tags.", 
+             transform=ax2.transAxes, ha='center', fontsize=9, style='italic', bbox=dict(facecolor='white', alpha=0.8))
 
-    # PLOT 3: Instantaneous Power (Where does the error happen?)
-    ax3 = fig.add_subplot(gs[1, :])
-    ax3.plot(time, w_int_total_step, 'b-', label='Internal Power (S:dE)')
-    ax3.plot(time, w_ext_total_step, 'k--', label='External Power (P*dV)')
-    ax3.set_title("Instantaneous Power Input", fontsize=12, fontweight='bold')
-    ax3.set_ylabel("Power (Watts/Step)")
+    # PLOT 3: ENERGY SINK BREAKDOWN (Bottom Left)
+    # Stacked area
+    ax3 = fig.add_subplot(gs[1, 0])
+    ax3.stackplot(time, 
+                  np.cumsum(w_boundary_exact), 
+                  np.cumsum(w_robin),
+                  labels=['Work on Blood', 'Work on Springs'],
+                  colors=['#d62728', "#2d9f2d"], alpha=0.5)
+    
+    ax3.plot(time, E_int, 'k:', lw=1.5, label='Total Internal Ref')
+    
+    ax3.set_title("3. Where does the Energy go?", fontsize=14, fontweight='bold')
+    ax3.set_ylabel("Cumulative Energy (Joules)")
     ax3.set_xlabel("Time (s)")
-    ax3.legend()
+    ax3.legend(loc='upper left')
     ax3.grid(True, alpha=0.3)
+
+    # PLOT 4: INSTANTANEOUS POWER (Bottom Right)
+    # Helps identify WHEN the error occurs
+    ax4 = fig.add_subplot(gs[1, 1])
+    ax4.plot(time, w_int, 'b-', lw=1.5, label='Internal Power (Source)')
+    ax4.plot(time, w_sink_total, 'k--', lw=1.5, label='External Power (Sink)')
+    
+    # Highlight max error region
+    power_diff = w_int - w_sink_total
+    ax4.fill_between(time, 0, power_diff, color='orange', alpha=0.3, label='Instantaneous Error')
+
+    ax4.set_title("4. Instantaneous Power Balance", fontsize=14, fontweight='bold')
+    ax4.set_ylabel("Power (Joules/step)")
+    ax4.set_xlabel("Time (s)")
+    ax4.legend(loc='upper right')
+    ax4.grid(True, alpha=0.3)
 
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     outpath = outdir / "engineering_debug.png"
     plt.savefig(outpath, dpi=150)
-    print(f"✅ Saved: {outpath}")
+    print(f" Saved: {outpath}")
     plt.close()
+
 
 def plot_full_hemodynamics(metrics, outdir):
     """Creates the Clinical Hemodynamics dashboard (Reconstructed Volumes)."""
@@ -271,7 +297,7 @@ def plot_full_hemodynamics(metrics, outdir):
 
     # Check existence
     if v_LV_clin is None or v_RV_clin is None:
-        print("⚠ Missing 'V_LV_Clinical' or 'V_RV_Clinical'. Skipping full hemodynamics plot.")
+        print(" Missing 'V_LV_Clinical' or 'V_RV_Clinical'. Skipping full hemodynamics plot.")
         return
 
     # --- FIGURE SETUP ---
@@ -347,7 +373,7 @@ def plot_full_hemodynamics(metrics, outdir):
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     outpath = outdir / "clinical_hemodynamics.png"
     plt.savefig(outpath, dpi=150)
-    print(f"✅ Saved: {outpath}")
+    print(f"Saved: {outpath}")
     plt.close()
 
 def plot_stress_decomposition(metrics, outdir):
@@ -431,7 +457,7 @@ def plot_stress_decomposition(metrics, outdir):
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     outpath = outdir / "stress_analysis.png"
     plt.savefig(outpath, dpi=150)
-    print(f"✅ Saved: {outpath}")
+    print(f" Saved: {outpath}")
     plt.close()
 
 # --- Main ---
