@@ -56,6 +56,12 @@ class MetricsCalculator:
         # Initialize Previous State to Zero
         self.E_prev.x.array[:] = 0.0
 
+        # --- Cauchy Stress Functions (Current Configuration) ---
+        self.sigma_total = dolfinx.fem.Function(self.W_tensor, name="sigma_total")
+        self.sigma_active = dolfinx.fem.Function(self.W_tensor, name="sigma_active")
+        self.sigma_passive = dolfinx.fem.Function(self.W_tensor, name="sigma_passive")
+        self.sigma_comp = dolfinx.fem.Function(self.W_tensor, name="sigma_comp")
+
         # --- 3. Setup UFL Expressions ---
         self._setup_expressions()
 
@@ -115,8 +121,8 @@ class MetricsCalculator:
         E = 0.5 * (C - I) # Green-Lagrange Strain Tensor
         
         S_tot_ufl = self.cardiac_model.S(C) # Total 2nd Piola-Kirchhoff Stress
-        S_act_ufl = self.cardiac_model.active.S(C)
-        S_pas_ufl = self.cardiac_model.material.S(C)
+        S_act_ufl = self.cardiac_model.active.S(C, dev=True) # Active component (use deviatoric if compressible)
+        S_pas_ufl = self.cardiac_model.material.S(C, dev=True) # use c dev instead
         S_cmp_ufl = self.cardiac_model.compressibility.S(C)
 
         points = self.W_tensor.element.interpolation_points
@@ -125,6 +131,21 @@ class MetricsCalculator:
         self.expr_S_active = dolfinx.fem.Expression(S_act_ufl, points)
         self.expr_S_passive = dolfinx.fem.Expression(S_pas_ufl, points)
         self.expr_S_comp = dolfinx.fem.Expression(S_cmp_ufl, points)
+
+        # --- Cauchy Stress Expressions (Push Forward) ---
+        J = ufl.det(F)
+        def push_forward(S):
+            return (1.0 / J) * F * S * F.T
+
+        sigma_tot_ufl = push_forward(S_tot_ufl)
+        sigma_act_ufl = push_forward(S_act_ufl)
+        sigma_pas_ufl = push_forward(S_pas_ufl)
+        sigma_cmp_ufl = push_forward(S_cmp_ufl)
+
+        self.expr_sigma_total = dolfinx.fem.Expression(sigma_tot_ufl, points)
+        self.expr_sigma_active = dolfinx.fem.Expression(sigma_act_ufl, points)
+        self.expr_sigma_passive = dolfinx.fem.Expression(sigma_pas_ufl, points)
+        self.expr_sigma_comp = dolfinx.fem.Expression(sigma_cmp_ufl, points)
 
     def update_state(self):
         """Called at the END of a timestep to shift Current -> Prev."""
@@ -147,6 +168,12 @@ class MetricsCalculator:
         self.S_total.interpolate(self.expr_S_total)
         self.S_active.interpolate(self.expr_S_active)
 
+        # Interpolate Cauchy Components
+        self.sigma_total.interpolate(self.expr_sigma_total)
+        self.sigma_active.interpolate(self.expr_sigma_active)
+        self.sigma_passive.interpolate(self.expr_sigma_passive)
+        self.sigma_comp.interpolate(self.expr_sigma_comp)
+
         # --- B. Integration ---
         data = {}
 
@@ -159,7 +186,23 @@ class MetricsCalculator:
         data["debug_S_active_max"] = np.max(self.S_active.x.array)
 
         regions = self._get_regions_to_integrate()
+        
+        # --- Current Configuration Vectors from F ---
+        u = self.problem.u
+        F = ufl.variable(ufl.grad(u) + ufl.Identity(3))
+        
         f0 = self.fiber_fields['f0']
+        s0 = self.fiber_fields['s0']
+        n0 = self.fiber_fields['n0']
+
+        # Push forward and normalize: v = F*v0 / |F*v0|
+        def push_vec(v0):
+            v_cur = F * v0
+            return v_cur / ufl.sqrt(ufl.inner(v_cur, v_cur))
+
+        f_cur = push_vec(f0)
+        s_cur = push_vec(s0)
+        n_cur = push_vec(n0)
 
         # Helper: Project Tensor T onto direction v
         def proj(T, v): return ufl.inner(ufl.dot(T, v), v)
@@ -179,14 +222,40 @@ class MetricsCalculator:
             vol = assemble_region(dolfinx.fem.Constant(self.mesh, 1.0))
             
             if vol > 1e-12:
-                S_active_mag = ufl.sqrt(ufl.inner(self.S_active, self.S_active))
+                # Reference Stresses (Green-Lagrange)
                 data[f"mean_S_ff_{region_name}"] = assemble_region(proj(self.S_total, f0)) / vol
                 data[f"mean_E_ff_{region_name}"] = assemble_region(proj(self.E_cur, f0)) / vol
-                data[f"mean_S_active_{region_name}"] = assemble_region(S_active_mag) / vol
+                
+                # Cauchy Stresses (True Stress) - Total
+                data[f"mean_sigma_ff_{region_name}"] = assemble_region(proj(self.sigma_total, f_cur)) / vol
+                data[f"mean_sigma_ss_{region_name}"] = assemble_region(proj(self.sigma_total, s_cur)) / vol
+                data[f"mean_sigma_nn_{region_name}"] = assemble_region(proj(self.sigma_total, n_cur)) / vol
+                
+                # Cauchy Stresses - Active
+                data[f"mean_sigma_ff_active_{region_name}"] = assemble_region(proj(self.sigma_active, f_cur)) / vol
+                data[f"mean_sigma_ss_active_{region_name}"] = assemble_region(proj(self.sigma_active, s_cur)) / vol
+                data[f"mean_sigma_nn_active_{region_name}"] = assemble_region(proj(self.sigma_active, n_cur)) / vol
+
+                # Cauchy Stresses - Passive
+                data[f"mean_sigma_ff_passive_{region_name}"] = assemble_region(proj(self.sigma_passive, f_cur)) / vol
+                data[f"mean_sigma_ss_passive_{region_name}"] = assemble_region(proj(self.sigma_passive, s_cur)) / vol
+                data[f"mean_sigma_nn_passive_{region_name}"] = assemble_region(proj(self.sigma_passive, n_cur)) / vol
+
+                # Cauchy Stresses - Compressibility
+                data[f"mean_sigma_ff_comp_{region_name}"] = assemble_region(proj(self.sigma_comp, f_cur)) / vol
+                data[f"mean_sigma_ss_comp_{region_name}"] = assemble_region(proj(self.sigma_comp, s_cur)) / vol
+                data[f"mean_sigma_nn_comp_{region_name}"] = assemble_region(proj(self.sigma_comp, n_cur)) / vol
+
+                # Cauchy Stresses - Magnitudes (Frobenius Norm)
+                mag = lambda T: ufl.sqrt(ufl.inner(T, T))
+                data[f"mean_sigma_mag_{region_name}"] = assemble_region(mag(self.sigma_total)) / vol
+                data[f"mean_sigma_mag_active_{region_name}"] = assemble_region(mag(self.sigma_active)) / vol
+                data[f"mean_sigma_mag_passive_{region_name}"] = assemble_region(mag(self.sigma_passive)) / vol
+                data[f"mean_sigma_mag_comp_{region_name}"] = assemble_region(mag(self.sigma_comp)) / vol
+
             else:
                 data[f"mean_S_ff_{region_name}"] = 0.0
                 data[f"mean_E_ff_{region_name}"] = 0.0
-                data[f"mean_S_active_{region_name}"] = 0.0
                 
         return data
 
@@ -373,7 +442,7 @@ class MetricsCalculator:
             regions.append(("LV", self.region_tags, [1])) 
             regions.append(("RV", self.region_tags, [2]))
             regions.append(("Septum", self.region_tags, [3]))
-            regions.append(("Whole", self.region_tags, [1, 2, 3, 4]))
+            regions.append(("Whole", self.region_tags, [1, 2, 3])) #no 4
         return regions
 
     def setup_csv_logging(self, file_path):
@@ -452,35 +521,42 @@ class MetricsCalculator:
             # D. Robin Work
             metrics.update(self._calculate_robin_work())
             
+            # E. Boundary Work via Surface Integration (Exact)
+            metrics.update(self._calculate_boundary_work_exact(current_state))
+            
             if self.rank == 0:
                 w_tot = metrics.get("work_true_LV", 0.0)
                 ps_idx = metrics.get("work_ps_index_LV", 0.0)
                 print(f"STATS | t={t:.3f} | W_Tot={w_tot:.4e} | PS_Idx={ps_idx:.4e}")
 
         elif not self.has_previous_state:
-             # Initialize all work keys to 0.0 at Step 0 to "reserve" the CSV columns.
-             # We perform a dummy call to get the keys, but we don't use the values.
-             # Note: This requires temporary state setup or manual key definition.
-             # Safer approach: Manually define the expected keys based on regions.
-             region_suffixes = [r[0] for r in self._get_regions_to_integrate()]
-             
-             # Mechanics keys
-             prefixes = ["work_true", "work_active", "work_passive", "work_comp", 
-                         "work_fiber", "work_sheet", "work_normal", "work_shear", "work_passive_fiber"]
-             for r in region_suffixes:
-                 for p in prefixes:
-                     metrics[f"{p}_{r}"] = 0.0
+            # Initialize all work keys to 0.0 at Step 0 to "reserve" the CSV columns.
+            # We perform a dummy call to get the keys, but we don't use the values.
+            # Note: This requires temporary state setup or manual key definition.
+            # Safer approach: Manually define the expected keys based on regions.
+            region_suffixes = [r[0] for r in self._get_regions_to_integrate()]
 
-             # Robin keys
-             metrics["work_robin_epi"] = 0.0
-             metrics["work_robin_base"] = 0.0
-             
-             # PV/PS keys
-             metrics["work_proxy_pv_LV"] = 0.0
-             metrics["work_proxy_pv_RV"] = 0.0
-             metrics["work_ps_index_LV"] = 0.0
-             metrics["work_ps_index_RV"] = 0.0
-             metrics["work_ps_index_Septum"] = 0.0
+            # Mechanics keys
+            prefixes = ["work_true", "work_active", "work_passive", "work_comp", 
+                        "work_fiber", "work_sheet", "work_normal", "work_shear", "work_passive_fiber"]
+            for r in region_suffixes:
+                for p in prefixes:
+                    metrics[f"{p}_{r}"] = 0.0
+
+            # Robin keys
+            metrics["work_robin_epi"] = 0.0
+            metrics["work_robin_base"] = 0.0
+
+            # PV/PS keys
+            metrics["work_proxy_pv_LV"] = 0.0
+            metrics["work_proxy_pv_RV"] = 0.0
+            metrics["work_ps_index_LV"] = 0.0
+            metrics["work_ps_index_RV"] = 0.0
+            metrics["work_ps_index_Septum"] = 0.0
+            
+            #exact work keys
+            metrics["work_boundary_exact_LV"] = 0.0
+            metrics["work_boundary_exact_RV"] = 0.0    
         
         print(metrics)
         
@@ -500,22 +576,11 @@ class MetricsCalculator:
         p_RV = (current_state.get("p_RV", 0.0) or 0.0) * 133.322
         
         # 2. Define Measures
-        # We assume standard tags: ENDO_LV (usually 10 or similar) and ENDO_RV.
-        # Check your geometry.markers dictionary for the exact IDs.
-        try:
-            # tag_endo_lv = self.geometry.markers["ENDO_LV"][0]
-            # tag_endo_rv = self.geometry.markers["ENDO_RV"][0]
-            
-            # --- HARDCODED EXAMPLE (REPLACE WITH YOUR TAGS) ---
-            tag_endo_lv = 10  
-            tag_endo_rv = 20
-            # --------------------------------------------------
-            
-            ds = ufl.Measure("ds", domain=self.mesh, subdomain_data=self.geometry.facet_tags)
-        except Exception:
-            # If tags aren't set up, return 0
-            return {}
-
+        tag_endo_lv = self.geometry.markers["ENDO_LV"][0]  # Will grab 30
+        tag_endo_rv = self.geometry.markers["ENDO_RV"][0]  # Will grab 20
+        
+        ds = ufl.Measure("ds", domain=self.mesh, subdomain_data=self.geometry.facet_tags)
+    
         # 3. Define Forms
         # Force = -Pressure * Normal (Normal points OUT of wall, INTO cavity)
         # Work = Force . Displacement
@@ -526,27 +591,7 @@ class MetricsCalculator:
         # Total RV Cavity Surface Work
         form_work_bnd_RV = -p_RV * ufl.inner(du, n) * ds(tag_endo_rv)
 
-        # --- THE SEPTUM BOUNDARY IDEA ---
-        # To isolate the Septum, we ideally need surface tags specific to the Septum.
-        # e.g., "ENDO_LV_SEPTAL" and "ENDO_RV_SEPTAL".
-        # If you don't have them, we can't mathematically distinguish the septum surface 
-        # from the free wall surface easily without a spatial coordinate check.
-        #
-        # BELOW IS THE LOGIC YOU WOULD USE:
-        """
-        tag_septum_lv = self.geometry.markers.get("SEPTUM_LV", [999])[0]
-        tag_septum_rv = self.geometry.markers.get("SEPTUM_RV", [998])[0]
         
-        form_work_bnd_Sep_LV = -p_LV * ufl.inner(du, n) * ds(tag_septum_lv)
-        form_work_bnd_Sep_RV = -p_RV * ufl.inner(du, n) * ds(tag_septum_rv)
-        
-        val_sep_lv = self.comm.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(form_work_bnd_Sep_LV)), op=MPI.SUM)
-        val_sep_rv = self.comm.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(form_work_bnd_Sep_RV)), op=MPI.SUM)
-        
-        # Net Boundary Work on Septum (Energy entering Septum from cavities)
-        val_sep_net = val_sep_lv + val_sep_rv 
-        """
-
         # 4. Assembly (Standard Cavity)
         w_bnd_LV = self.comm.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(form_work_bnd_LV)), op=MPI.SUM)
         w_bnd_RV = self.comm.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(form_work_bnd_RV)), op=MPI.SUM)
@@ -554,5 +599,4 @@ class MetricsCalculator:
         return {
             "work_boundary_exact_LV": w_bnd_LV, 
             "work_boundary_exact_RV": w_bnd_RV,
-            # "work_boundary_exact_Septum": val_sep_net # Uncomment if tags exist
         }

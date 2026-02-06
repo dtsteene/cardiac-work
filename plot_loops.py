@@ -13,6 +13,9 @@ Generates two key figures for the meeting:
    - Instantaneous Work Power
    - Septum Pressure Proxy Comparison
 
+3. clinical_hemodynamics.png:
+    - Reconstructed LV & RV PV Loops (Clinical)
+    
 Usage:
   python3 plot_loops.py <path_to_results_folder>
 """
@@ -347,6 +350,90 @@ def plot_full_hemodynamics(metrics, outdir):
     print(f"✅ Saved: {outpath}")
     plt.close()
 
+def plot_stress_decomposition(metrics, outdir):
+    """Creates stress_analysis.png with component breakdown."""
+    
+    # Get Time and Pressures
+    p_LV = get_arr(metrics, ["p_LV"])
+    p_RV = get_arr(metrics, ["p_RV"])
+    if p_LV is None: return
+    time = get_arr(metrics, ["time"], len(p_LV))
+
+    regions = ["LV", "Septum", "RV"]
+    # Decluttered: Fiber (Directional) and Total Magnitude (Scalar)
+    directions = ["ff", "mag"] 
+    titles = ["Fiber Direction", "Total Magnitude"]
+    
+    fig = plt.figure(figsize=(12, 12)) # Thinner since fewer columns
+    gs = gridspec.GridSpec(3, 2, figure=fig)
+    fig.suptitle("Cauchy Stress Decomposition (Current Config)", fontsize=18, fontweight='bold')
+
+    for r_idx, region in enumerate(regions):
+        # Determine Ref Pressure for overlay
+        # LV/Sep -> LV Pressure, RV -> RV Pressure
+        p_ref = p_LV if region in ["LV", "Septum"] else p_RV
+        p_color = 'gray'
+        
+        for d_idx, direction in enumerate(directions):
+            ax = fig.add_subplot(gs[r_idx, d_idx])
+            
+            # Get Data
+            sigma_tot = get_arr(metrics, [f"mean_sigma_{direction}_{region}"], len(time))
+            sigma_act = get_arr(metrics, [f"mean_sigma_{direction}_active_{region}"], len(time))
+            sigma_pas = get_arr(metrics, [f"mean_sigma_{direction}_passive_{region}"], len(time))
+            sigma_cmp = get_arr(metrics, [f"mean_sigma_{direction}_comp_{region}"], len(time))
+            
+            # Combine Passive + Comp for total mechanics
+            if sigma_pas is not None and sigma_cmp is not None:
+                # Note: sigma_tot essentially equals Act + Pas + Comp
+                pass # We largely use Tot and Act for the plot logic below
+
+            # Convert to kPa
+            if sigma_tot is not None: sigma_tot *= 1e-3
+            if sigma_act is not None: sigma_act *= 1e-3
+            
+            # PLOT STRESS (Simplified Shading Logic)
+            if sigma_tot is not None and sigma_act is not None:
+                # 1. Active Stress (Input Potential)
+                ax.plot(time, sigma_act, color='orange', linestyle='--', linewidth=1.5, label='Active (Input)')
+                
+                # 2. Total Stress (Actual Output)
+                ax.plot(time, sigma_tot, 'k-', linewidth=2.5, label='Total (Output)')
+                
+                # 3. "Useful Stress" = Area under Total
+                ax.fill_between(time, 0, sigma_tot, color='blue', alpha=0.1, label='Useful Stress')
+                
+                # 4. "Elastic Loss" = Difference between Active and Total
+                # Only shade where Active > Total (typical shortening loss)
+                ax.fill_between(time, sigma_tot, sigma_act, 
+                                where=(sigma_act > sigma_tot),
+                                color='orange', alpha=0.2, hatch='///', label='Elastic Loss')
+
+            ax.set_ylabel("Stress (kPa)")
+            if r_idx == 2: ax.set_xlabel("Time (s)")
+            
+            if r_idx == 0: ax.set_title(f"{titles[d_idx]} Direction", fontweight='bold')
+            if d_idx == 0: ax.text(-0.25, 0.5, region, transform=ax.transAxes, fontsize=14, fontweight='bold', va='center', rotation=90)
+            
+            # Legends on specific plots only to avoid clutter
+            if r_idx == 0 and d_idx == 0:
+                ax.legend(loc='upper right', fontsize=8, framealpha=0.9)
+
+            # PRESSURE OVERLAY (Right Axis)
+            ax2 = ax.twinx()
+            ax2.plot(time, p_ref, color=p_color, linestyle=':', linewidth=1.5, alpha=0.7)
+            ax2.set_ylabel("Pressure (mmHg)", color=p_color)
+            ax2.tick_params(axis='y', labelcolor=p_color)
+            ax2.grid(False) # Turn off grid for second axis
+
+            ax.grid(True, alpha=0.3)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    outpath = outdir / "stress_analysis.png"
+    plt.savefig(outpath, dpi=150)
+    print(f"✅ Saved: {outpath}")
+    plt.close()
+
 # --- Main ---
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -359,3 +446,4 @@ if __name__ == "__main__":
     plot_clinical_dashboard(metrics, res_dir)
     plot_engineering_debug(metrics, res_dir)
     plot_full_hemodynamics(metrics, res_dir)
+    plot_stress_decomposition(metrics, res_dir)
