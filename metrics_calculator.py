@@ -56,6 +56,9 @@ class MetricsCalculator:
         # Initialize Previous State to Zero
         self.E_prev.x.array[:] = 0.0
 
+        self.S_prev = dolfinx.fem.Function(self.W_tensor, name="S_prev")
+        self.S_prev.x.array[:] = 0.0
+
         # --- Cauchy Stress Functions (Current Configuration) ---
         self.sigma_total = dolfinx.fem.Function(self.W_tensor, name="sigma_total")
         self.sigma_active = dolfinx.fem.Function(self.W_tensor, name="sigma_active")
@@ -120,27 +123,30 @@ class MetricsCalculator:
         C = ufl.variable(F.T * F) 
         E = 0.5 * (C - I) # Green-Lagrange Strain Tensor
         
-        S_tot_ufl = self.cardiac_model.S(C) # Total 2nd Piola-Kirchhoff Stress
-        S_act_ufl = self.cardiac_model.active.S(C, dev=True) # Active component (use deviatoric if compressible)
-        S_pas_ufl = self.cardiac_model.material.S(C, dev=True) # use c dev instead
-        S_cmp_ufl = self.cardiac_model.compressibility.S(C)
+        # --- SAVE THESE AS SELF ---
+        # These are the exact mathematical definitions
+        self.S_tot_ufl = self.cardiac_model.S(C) # Total 2nd Piola-Kirchhoff Stress
+        self.S_act_ufl = self.cardiac_model.active.S(C, dev=True) # Active component (use deviatoric if compressible)
+        self.S_pas_ufl = self.cardiac_model.material.S(C, dev=True) # use c dev instead
+        self.S_cmp_ufl = self.cardiac_model.compressibility.S(C)
 
         points = self.W_tensor.element.interpolation_points
         self.expr_E = dolfinx.fem.Expression(E, points)
-        self.expr_S_total = dolfinx.fem.Expression(S_tot_ufl, points)
-        self.expr_S_active = dolfinx.fem.Expression(S_act_ufl, points)
-        self.expr_S_passive = dolfinx.fem.Expression(S_pas_ufl, points)
-        self.expr_S_comp = dolfinx.fem.Expression(S_cmp_ufl, points)
+        self.expr_S_total = dolfinx.fem.Expression(self.S_tot_ufl, points)
+        self.expr_S_active = dolfinx.fem.Expression(self.S_act_ufl, points)
+        self.expr_S_passive = dolfinx.fem.Expression(self.S_pas_ufl, points)
+        self.expr_S_comp = dolfinx.fem.Expression(self.S_cmp_ufl, points)
+
 
         # --- Cauchy Stress Expressions (Push Forward) ---
         J = ufl.det(F)
         def push_forward(S):
             return (1.0 / J) * F * S * F.T
 
-        sigma_tot_ufl = push_forward(S_tot_ufl)
-        sigma_act_ufl = push_forward(S_act_ufl)
-        sigma_pas_ufl = push_forward(S_pas_ufl)
-        sigma_cmp_ufl = push_forward(S_cmp_ufl)
+        sigma_tot_ufl = push_forward(self.S_tot_ufl)
+        sigma_act_ufl = push_forward(self.S_act_ufl)
+        sigma_pas_ufl = push_forward(self.S_pas_ufl)
+        sigma_cmp_ufl = push_forward(self.S_cmp_ufl)
 
         self.expr_sigma_total = dolfinx.fem.Expression(sigma_tot_ufl, points)
         self.expr_sigma_active = dolfinx.fem.Expression(sigma_act_ufl, points)
@@ -150,6 +156,7 @@ class MetricsCalculator:
     def update_state(self):
         """Called at the END of a timestep to shift Current -> Prev."""
         self.E_prev.x.array[:] = self.E_cur.x.array[:]
+        self.S_prev.x.array[:] = self.S_total.x.array[:]
         
         # Track displacement for boundary work
         if not hasattr(self, '_u_prev'):
@@ -261,20 +268,24 @@ class MetricsCalculator:
 
     def _calculate_incremental_work(self):
         """
-        Calculates Work Densities (S : dE).
-        Run this only when previous state exists.
+        Calculates Work Densities (S : dE) using EXACT UFL evaluation.
         """
-        # 1. Update interpolations needed for work (Passive/Comp)
+        # We still update the "Functions" because we might want to save them to VTX 
+        # or use them for other things, but we won't use them for the integral below.
         self.S_passive.interpolate(self.expr_S_passive)
         self.S_comp.interpolate(self.expr_S_comp)
         
+        # Strain increment (Interpolated is fine here, as Strain is continuous)
         dE = self.E_cur - self.E_prev
         
-        # 2. Define Work Densities (UFL)
-        wd_total = ufl.inner(self.S_total, dE)
-        wd_active = ufl.inner(self.S_active, dE)
-        wd_passive = ufl.inner(self.S_passive, dE)
-        wd_comp = ufl.inner(self.S_comp, dE)
+        # --- THE FIX: Use UFL Expressions, NOT Functions ---
+        # Old: wd_total = ufl.inner(self.S_total, dE)
+        # New: Use self.S_tot_ufl (Exact stress at every quadrature point)
+        
+        wd_total = ufl.inner(self.S_tot_ufl, dE)
+        wd_active = ufl.inner(self.S_act_ufl, dE)
+        wd_passive = ufl.inner(self.S_pas_ufl, dE)
+        wd_comp = ufl.inner(self.S_cmp_ufl, dE)
         
         f0 = self.fiber_fields['f0']
         s0 = self.fiber_fields['s0'] 
@@ -282,11 +293,14 @@ class MetricsCalculator:
         
         def proj(T, v): return ufl.inner(ufl.dot(T, v), v)
         
-        wd_fiber = proj(self.S_total, f0) * proj(dE, f0)
-        wd_sheet = proj(self.S_total, s0) * proj(dE, s0)
-        wd_normal = proj(self.S_total, n0) * proj(dE, n0)
+        # Use S_tot_ufl here too!
+        wd_fiber = proj(self.S_tot_ufl, f0) * proj(dE, f0)
+        wd_sheet = proj(self.S_tot_ufl, s0) * proj(dE, s0)
+        wd_normal = proj(self.S_tot_ufl, n0) * proj(dE, n0)
+        
+        # Shear is whatever remains
         wd_shear = wd_total - (wd_fiber + wd_sheet + wd_normal)
-        wd_passive_fiber = proj(self.S_passive, f0) * proj(dE, f0)
+        wd_passive_fiber = proj(self.S_pas_ufl, f0) * proj(dE, f0)
 
         # 3. Integration
         data = {}

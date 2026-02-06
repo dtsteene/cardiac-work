@@ -141,7 +141,7 @@ def plot_clinical_dashboard(metrics, outdir):
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     outpath = outdir / "loops.png"
     plt.savefig(outpath, dpi=150)
-    print(f"✅ Saved: {outpath}")
+    print(f" Saved: {outpath}")
     plt.close()
 
 
