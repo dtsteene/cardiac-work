@@ -458,11 +458,17 @@ def plot_stress_decomposition(metrics, outdir):
                 
                 # 2. Total Stress (Actual Output)
                 ax.plot(time, sigma_tot, 'k-', linewidth=2.5, label='Total (Output)')
+
+                # 3. Hydrostatic/Bulk Stress (New for Incompressible Debug)
+                if sigma_cmp is not None:
+                    # In Incompressible: sigma_cmp = -pI. 
+                    # If this is large negative, it means high hydrostatic pressure support.
+                    ax.plot(time, sigma_cmp, color='cyan', linestyle='-.', linewidth=1, alpha=0.8, label='Hydrostatic (-pI)')
                 
-                # 3. "Useful Stress" = Area under Total
+                # 4. "Useful Stress" = Area under Total
                 ax.fill_between(time, 0, sigma_tot, color='blue', alpha=0.1, label='Useful Stress')
                 
-                # 4. "Elastic Loss" = Difference between Active and Total
+                # 5. "Elastic Loss" = Difference between Active and Total
                 # Only shade where Active > Total (typical shortening loss)
                 ax.fill_between(time, sigma_tot, sigma_act, 
                                 where=(sigma_act > sigma_tot),

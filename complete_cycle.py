@@ -50,6 +50,7 @@ parser.add_argument('--metrics_space', type=str, default="DG0", help='Function s
 parser.add_argument('--circulation_params', type=str, default=None, help='Path to JSON file with circulation parameters')
 parser.add_argument('--alpha_epi', type=float, default=1e5, help='Epicardial spring stiffness (Pa/m) (default: 1e5)')
 parser.add_argument('--alpha_base', type=float, default=1e6, help='Basal spring stiffness (Pa/m) (default: 1e6)')
+parser.add_argument('--incompressible', action='store_true', help='Use incompressible formulation')
 args = parser.parse_args()
 
 # Determine BPM
@@ -381,7 +382,7 @@ if comm.rank == 0:
 
 # --- Setup Problem (From V1: Uses Scifem and markers_mt) ---
 
-def setup_problem(geometry, f0, s0, material_params, alpha_epi_val=1e5, alpha_base_val=1e6):
+def setup_problem(geometry, f0, s0, material_params, alpha_epi_val=1e5, alpha_base_val=1e6, incompressible=False):
     material = pulse.HolzapfelOgden(f0=f0, s0=s0, **material_params)
 
     # Use scifem to create simple function space based on markers_mt
@@ -397,7 +398,15 @@ def setup_problem(geometry, f0, s0, material_params, alpha_epi_val=1e5, alpha_ba
 
     Ta = pulse.Variable(dolfinx.fem.Function(V_Ta), "kPa")
     active_model = pulse.ActiveStress(f0, activation=Ta)
-    comp_model = pulse.compressibility.Compressible2()
+    
+    if incompressible:
+        comp_model = pulse.compressibility.Incompressible()
+        if comm.rank == 0:
+            print("Using Incompressible formulation")
+    else:
+        comp_model = pulse.compressibility.Compressible2()
+        if comm.rank == 0:
+            print("Using Compressible formulation")
 
     model = pulse.CardiacModel(
         material=material,
@@ -418,16 +427,44 @@ def setup_problem(geometry, f0, s0, material_params, alpha_epi_val=1e5, alpha_ba
 
     def dirichlet_bc(V: dolfinx.fem.FunctionSpace):
         facets = geometry.facet_tags.find(geometry.markers["BASE"][0])
-        dofs = dolfinx.fem.locate_dofs_topological(V.sub(0), 2, facets)
-        return [dolfinx.fem.dirichletbc(0.0, dofs, V.sub(0))]
+        
+        try:
+            # --- CASE 1: Standard / Compressible ---
+            # Try to access the X-component subspace (.sub(0))
+            # This works for standard VectorFunctionSpaces
+            V_x = V.sub(0)
+            dofs = dolfinx.fem.locate_dofs_topological(V_x, 2, facets)
+            return [dolfinx.fem.dirichletbc(0.0, dofs, V_x)]
+            
+        except AssertionError:
+            # --- CASE 2: Incompressible (Mixed Space) ---
+            # The AssertionError "num_sub_elements > i" confirms we are in a 
+            # nested subspace where .sub(0) is not accessible.
+            
+            # We cannot isolate X, so we apply a Full Clamp (0,0,0) to the base.
+            # This prevents sliding and rigid body motion.
+            
+            if comm.rank == 0:
+                print("Warning: Incompressible Mode detected - Applying Full Base Clamp (0,0,0)")
+            
+            # Locate DOFs for the FULL vector on the base
+            dofs = dolfinx.fem.locate_dofs_topological(V, 2, facets)
+            
+            # Create a vector zero function (0,0,0)
+            u_zero = dolfinx.fem.Function(V)
+            u_zero.x.array[:] = 0.0
+            
+            # Apply BC to the full vector space V
+            return [dolfinx.fem.dirichletbc(u_zero, dofs)]
 
     return model, robin, dirichlet_bc, Ta
 
 
 material_params = pulse.HolzapfelOgden.transversely_isotropic_parameters()
+# Use Compressible for Prestressing always (Hybrid Strategy)
 model, robin, dirichlet_bc, Ta = setup_problem(
     geometry=geometry, f0=geo.f0, s0=geo.s0, material_params=material_params,
-    alpha_epi_val=args.alpha_epi, alpha_base_val=args.alpha_base
+    alpha_epi_val=args.alpha_epi, alpha_base_val=args.alpha_base, incompressible=False
 )
 
 # --- Prestressing (Inverse Elasticity) ---
@@ -453,7 +490,7 @@ bcs_prestress = pulse.BoundaryConditions(
 
 prestress_fname = outdir / "prestress_biv_inverse.bp"
 if not prestress_fname.exists():
-    logger.info("Start prestressing...")
+    logger.info("Start prestressing (Using Compressible Formulation for Stability)...")
     prestress_problem = pulse.unloading.PrestressProblem(
         geometry=geometry,
         model=model,
@@ -501,8 +538,12 @@ rvv_unloaded = comm.allreduce(geometry.volume("RV"), op=MPI.SUM)
 
 logger.info(f"Unloaded volumes: LV={lvv_unloaded * volume2ml:.2f} mL, RV={rvv_unloaded * volume2ml:.2f} mL")
 
+if args.incompressible:
+    logger.info("Warning: Hybrid Prestressing Strategy Active (Compressible Unloading -> Incompressible Forward)")
+
 model, robin, dirichlet_bc, Ta = setup_problem(
     geometry=geometry, f0=f0_quad, s0=s0_quad, material_params=material_params,
+    incompressible=args.incompressible
 )
 
 lv_volume = dolfinx.fem.Constant(geometry.mesh, dolfinx.default_scalar_type(lvv_unloaded))
@@ -512,6 +553,8 @@ rv_volume = dolfinx.fem.Constant(geometry.mesh, dolfinx.default_scalar_type(rvv_
 lv_marker = "LV" if "LV" in geometry.markers else "ENDO_LV"
 rv_marker = "RV" if "RV" in geometry.markers else "ENDO_RV"
 
+# Note on Cavity for Incompressible:
+# pulse.problem.Cavity usually handles u from Mixed Space automatically if passed the right function
 cavities = [
     pulse.problem.Cavity(marker=lv_marker, volume=lv_volume),
     pulse.problem.Cavity(marker=rv_marker, volume=rv_volume),
@@ -527,13 +570,20 @@ problem = pulse.problem.StaticProblem(
     parameters={"mesh_unit": mesh_unit, "u_space": "P_2"},
 )
 
+# Extract Displacement for Post-Processing
+if args.incompressible:
+    # In mixed space, problem.u returns the displacement sub-function
+    u_disp = problem.u 
+else:
+    u_disp = problem.u
+
 # Setup Stress/Strain Post-processing - kinematics
 # FIXED: Use full CardiacModel (material + compressibility) instead of material only
 # This ensures stresses include pressure contribution for proper boundary work calculation
 
 W = dolfinx.fem.functionspace(geometry.mesh, ("DG", 1))
 I = ufl.Identity(3)
-F = ufl.variable(ufl.grad(problem.u) + I)
+F = ufl.variable(ufl.grad(u_disp) + I)
 C = F.T * F
 E = 0.5 * (C - I)
 f_map = (F * f0_map) / ufl.sqrt(ufl.inner(F * f0_map, F * f0_map))
@@ -549,7 +599,11 @@ fiber_strain = dolfinx.fem.Function(W, name="fiber_strain")
 fiber_strain_expr = dolfinx.fem.Expression(ufl.inner(E * f0_map, f0_map), W.element.interpolation_points)
 
 # Writers
-vtx = dolfinx.io.VTXWriter(geometry.mesh.comm, outdir / "displacement.bp", [problem.u], engine="BP4")
+vtx_u = dolfinx.io.VTXWriter(geometry.mesh.comm, outdir / "displacement.bp", [u_disp], engine="BP4")
+vtx_p = None
+if args.incompressible:
+    # problem.p returns pressure subfunction
+    vtx_p = dolfinx.io.VTXWriter(geometry.mesh.comm, outdir / "pressure.bp", [problem.p], engine="BP4")
 # Edited to include Ta
 vtx_stress = dolfinx.io.VTXWriter(geometry.mesh.comm, outdir / "stress_strain.bp", [fiber_stress, fiber_strain, Ta.value], engine="BP4")
 
@@ -570,7 +624,9 @@ for i in range(ramp_steps):
     if comm.rank == 0:
         logger.info(f"Inflation Step {i + 1}/{ramp_steps}: pLV={plv:.2f} kPa, pRV={prv:.2f} kPa")
 
-vtx.write(0.0)
+vtx_u.write(0.0)
+if vtx_p:
+    vtx_p.write(0.0)
 vtx_stress.write(0.0)
 
 # Store old values (handling Array for Ta due to scifem/V1)
@@ -728,7 +784,8 @@ metrics_calc = MetricsCalculator(
     cardiac_model=metrics_model,  # <--- PASS THE CORRECTED MODEL
     metrics_space_type=metrics_type_arg,
     alpha_epi=args.alpha_epi,
-    alpha_base=args.alpha_base
+    alpha_base=args.alpha_base,
+    hydro_pressure=problem.p if args.incompressible else None
 )
 
 # Streamlined logging: Setup CSV trace inside metrics calculator
@@ -824,7 +881,9 @@ def callback(model, i: int, t: float, save=True):
 
     # 5. Save Files
     if save:
-        vtx.write(t)
+        vtx_u.write(t)
+        if vtx_p:
+            vtx_p.write(t)
         vtx_stress.write(t)
         adios4dolfinx.write_function(filename, u=problem.u, name="displacement", time=t)
         adios4dolfinx.write_function(filename, u=fiber_stress, name="fiber_stress", time=t)

@@ -6,13 +6,21 @@ from mpi4py import MPI
 import dolfinx
 import ufl
 import basix.ufl
+import pulse
 
 class MetricsCalculator:
-    def __init__(self, geometry, geo, fiber_field_map, problem, comm, cardiac_model, metrics_space_type=("DG", 1), alpha_epi=1e5, alpha_base=1e6):
+    def __init__(self, geometry, geo, fiber_field_map, problem, comm, cardiac_model, metrics_space_type=("DG", 1), alpha_epi=1e5, alpha_base=1e6, hydro_pressure=None):
         self.geometry = geometry
         self.geo = geo
         self.fiber_fields = fiber_field_map
         self.cardiac_model = cardiac_model
+        
+        # Register pressure for stress calculations if incompressible
+        if hydro_pressure is not None:
+             if isinstance(self.cardiac_model.compressibility, pulse.compressibility.Incompressible):
+                 self.cardiac_model.compressibility.register(hydro_pressure)
+                 if comm.rank == 0:
+                     print("MetricsCalculator: Registered hydrostatic pressure for stress calculation.")
         self.problem = problem
         self.comm = comm
         self.rank = comm.rank

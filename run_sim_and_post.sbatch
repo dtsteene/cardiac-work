@@ -31,6 +31,7 @@ METRICS_SPACE=${METRICS_SPACE:-"DG1"}
 CIRCULATION_PARAMS=${CIRCULATION_PARAMS:-""}
 ALPHA_EPI=${ALPHA_EPI:-""}
 ALPHA_BASE=${ALPHA_BASE:-""}
+INCOMPRESSIBLE=${INCOMPRESSIBLE:-0}
 COMMENT=${COMMENT:-"No description provided"}
 
 # --- 2. Paths & Environment ---
@@ -120,6 +121,10 @@ fi
 
 if [ -n "$ALPHA_BASE" ]; then
     ARGS_STR="$ARGS_STR --alpha_base $ALPHA_BASE"
+fi
+
+if [ "$INCOMPRESSIBLE" = "1" ]; then
+    ARGS_STR="$ARGS_STR --incompressible"
 fi
 
 # --- 5. Setup Logging & Directories ---
