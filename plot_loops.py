@@ -197,6 +197,24 @@ def plot_engineering_debug(metrics, outdir):
     # Total Internal (Sum of parts)
     w_int_total = w_active + w_passive + w_comp
 
+    # Fix: Ensure all arrays match the minimum length (e.g. if time is longer than data)
+    arrays_to_sync = [w_int_total, w_pv_proxy, w_robin, w_boundary_exact, w_active, w_passive, w_comp]
+    min_len = len(time)
+    for arr in arrays_to_sync:
+        if len(arr) < min_len:
+            min_len = len(arr)
+    
+    if min_len < len(time) or any(len(arr) > min_len for arr in arrays_to_sync):
+        print(f"⚠️  Alignment: Truncating arrays to {min_len} steps")
+        time = time[:min_len]
+        w_int_total = w_int_total[:min_len]
+        w_pv_proxy = w_pv_proxy[:min_len]
+        w_robin = w_robin[:min_len]
+        w_boundary_exact = w_boundary_exact[:min_len]
+        w_active = w_active[:min_len]
+        w_passive = w_passive[:min_len]
+        w_comp = w_comp[:min_len]
+
 
     # --- 2. FIGURE SETUP ---
     fig = plt.figure(figsize=(18, 12))

@@ -29,6 +29,8 @@ class MetricsCalculator:
         # For DG/Lagrange, we default to 4 (as per original code), or higher if needed.
         if element_type == "Quadrature":
             self.quadrature_degree = degree
+            if self.rank == 0:
+                 print(f"MetricsCalculator: Using Quadrature Element (Deg {degree}). Quadrature Degree for Integration: {self.quadrature_degree}")
             # Use basix.ufl to create Quadrature elements explicitly
             el_scalar = basix.ufl.quadrature_element(self.mesh.topology.cell_name(), degree=degree)
             self.W_scalar = dolfinx.fem.functionspace(self.mesh, el_scalar)
@@ -58,6 +60,13 @@ class MetricsCalculator:
 
         self.S_prev = dolfinx.fem.Function(self.W_tensor, name="S_prev")
         self.S_prev.x.array[:] = 0.0
+
+        self.S_active_prev = dolfinx.fem.Function(self.W_tensor, name="S_active_prev")
+        self.S_active_prev.x.array[:] = 0.0
+        self.S_passive_prev = dolfinx.fem.Function(self.W_tensor, name="S_passive_prev")
+        self.S_passive_prev.x.array[:] = 0.0
+        self.S_comp_prev = dolfinx.fem.Function(self.W_tensor, name="S_comp_prev")
+        self.S_comp_prev.x.array[:] = 0.0
 
         # --- Cauchy Stress Functions (Current Configuration) ---
         self.sigma_total = dolfinx.fem.Function(self.W_tensor, name="sigma_total")
@@ -126,8 +135,8 @@ class MetricsCalculator:
         # --- SAVE THESE AS SELF ---
         # These are the exact mathematical definitions
         self.S_tot_ufl = self.cardiac_model.S(C) # Total 2nd Piola-Kirchhoff Stress
-        self.S_act_ufl = self.cardiac_model.active.S(C, dev=True) # Active component (use deviatoric if compressible)
-        self.S_pas_ufl = self.cardiac_model.material.S(C, dev=True) # use c dev instead
+        self.S_act_ufl = self.cardiac_model.active.S(C, dev=False) # Active component (use deviatoric if compressible)
+        self.S_pas_ufl = self.cardiac_model.material.S(C, dev=False) # use c dev instead
         self.S_cmp_ufl = self.cardiac_model.compressibility.S(C)
 
         points = self.W_tensor.element.interpolation_points
@@ -158,6 +167,10 @@ class MetricsCalculator:
         self.E_prev.x.array[:] = self.E_cur.x.array[:]
         self.S_prev.x.array[:] = self.S_total.x.array[:]
         
+        self.S_active_prev.x.array[:] = self.S_active.x.array[:]
+        self.S_passive_prev.x.array[:] = self.S_passive.x.array[:]
+        self.S_comp_prev.x.array[:] = self.S_comp.x.array[:]
+
         # Track displacement for boundary work
         if not hasattr(self, '_u_prev'):
             self._u_prev = dolfinx.fem.Function(self.problem.u.function_space)
@@ -268,7 +281,7 @@ class MetricsCalculator:
 
     def _calculate_incremental_work(self):
         """
-        Calculates Work Densities (S : dE) using EXACT UFL evaluation.
+        Calculates Work Densities (S : dE) using Trapezoidal Rule (0.5 * (S_new + S_old) : dE).
         """
         # We still update the "Functions" because we might want to save them to VTX 
         # or use them for other things, but we won't use them for the integral below.
@@ -278,14 +291,11 @@ class MetricsCalculator:
         # Strain increment (Interpolated is fine here, as Strain is continuous)
         dE = self.E_cur - self.E_prev
         
-        # --- THE FIX: Use UFL Expressions, NOT Functions ---
-        # Old: wd_total = ufl.inner(self.S_total, dE)
-        # New: Use self.S_tot_ufl (Exact stress at every quadrature point)
-        
-        wd_total = ufl.inner(self.S_tot_ufl, dE)
-        wd_active = ufl.inner(self.S_act_ufl, dE)
-        wd_passive = ufl.inner(self.S_pas_ufl, dE)
-        wd_comp = ufl.inner(self.S_cmp_ufl, dE)
+        # Trapezoidal: 0.5 * (S_curr + S_prev) : dE
+        wd_total = 0.5 * ufl.inner(self.S_tot_ufl + self.S_prev, dE)
+        wd_active = 0.5 * ufl.inner(self.S_act_ufl + self.S_active_prev, dE)
+        wd_passive = 0.5 * ufl.inner(self.S_pas_ufl + self.S_passive_prev, dE)
+        wd_comp = 0.5 * ufl.inner(self.S_cmp_ufl + self.S_comp_prev, dE)
         
         f0 = self.fiber_fields['f0']
         s0 = self.fiber_fields['s0'] 
@@ -293,14 +303,14 @@ class MetricsCalculator:
         
         def proj(T, v): return ufl.inner(ufl.dot(T, v), v)
         
-        # Use S_tot_ufl here too!
-        wd_fiber = proj(self.S_tot_ufl, f0) * proj(dE, f0)
-        wd_sheet = proj(self.S_tot_ufl, s0) * proj(dE, s0)
-        wd_normal = proj(self.S_tot_ufl, n0) * proj(dE, n0)
+        # Directional Work (Trapezoidal)
+        wd_fiber = 0.5 * (proj(self.S_tot_ufl, f0) + proj(self.S_prev, f0)) * proj(dE, f0)
+        wd_sheet = 0.5 * (proj(self.S_tot_ufl, s0) + proj(self.S_prev, s0)) * proj(dE, s0)
+        wd_normal = 0.5 * (proj(self.S_tot_ufl, n0) + proj(self.S_prev, n0)) * proj(dE, n0)
         
         # Shear is whatever remains
         wd_shear = wd_total - (wd_fiber + wd_sheet + wd_normal)
-        wd_passive_fiber = proj(self.S_pas_ufl, f0) * proj(dE, f0)
+        wd_passive_fiber = 0.5 * (proj(self.S_pas_ufl, f0) + proj(self.S_passive_prev, f0)) * proj(dE, f0)
 
         # 3. Integration
         data = {}
