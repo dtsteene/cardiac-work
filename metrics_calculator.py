@@ -135,8 +135,8 @@ class MetricsCalculator:
         # --- SAVE THESE AS SELF ---
         # These are the exact mathematical definitions
         self.S_tot_ufl = self.cardiac_model.S(C) # Total 2nd Piola-Kirchhoff Stress
-        self.S_act_ufl = self.cardiac_model.active.S(C, dev=False) # Active component (use deviatoric if compressible)
-        self.S_pas_ufl = self.cardiac_model.material.S(C, dev=False) # use c dev instead
+        self.S_act_ufl = self.cardiac_model.active.S(C, dev=True) # Active component (use deviatoric if compressible)
+        self.S_pas_ufl = self.cardiac_model.material.S(C, dev=True) # use c dev instead
         self.S_cmp_ufl = self.cardiac_model.compressibility.S(C)
 
         points = self.W_tensor.element.interpolation_points

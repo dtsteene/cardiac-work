@@ -683,31 +683,41 @@ fiber_fields_map = {
     'c0': None,    # Circumferential (will be computed if needed)
 }
 
-# Supervisor suggestion: build a metrics-only CardiacModel with DG-space fibers
-material_metrics = pulse.HolzapfelOgden(f0=f0_map, s0=s0_map, **material_params)
-active_metrics = pulse.ActiveStress(f0_map, activation=Ta)
-comp_metrics = pulse.compressibility.Compressible2()
+# [FIX 1] Use the High-Fidelity Quadrature Fibers for the metrics model
+# We must use 'f0_quad' (Integration Point values), not 'f0_map' (Nodal projection).
+# This ensures the active stress tensor (Ta * f x f) is identical to the solver's.
+active_metrics_high_res = pulse.ActiveStress(f0_quad, activation=Ta)
+
+# [FIX 2] Reuse the Solver's exact physics objects
+# This prevents "Zombie" parameters where the metrics use different bulk moduli or material constants.
 metrics_model = pulse.CardiacModel(
-    material=material_metrics,
-    active=active_metrics,
-    compressibility=comp_metrics,
+    material=model.material,             # Reuse Solver's Material Instance
+    active=active_metrics_high_res,      # Use High-Res Fibers
+    compressibility=model.compressibility # Reuse Solver's Compressibility Instance
 )
 
-if args.metrics_space.lower().startswith("quadrature"):
-    try:
-        deg = int(args.metrics_space.lower().replace("quadrature", ""))
-        metrics_type_arg = ("Quadrature", deg)
-    except ValueError:
-        metrics_type_arg = ("Quadrature", 4) # Default fallback
-elif args.metrics_space.startswith("DG"):
-    try:
-        deg = int(args.metrics_space.replace("DG", ""))
-        metrics_type_arg = ("DG", deg)
-    except ValueError:
-        metrics_type_arg = ("DG", 1)
-else:
-    # Default fallback for unknown strings
-    metrics_type_arg = ("DG", 1)
+# [FIX 3] Force Metrics Space to Match Solver Resolution
+# We override the command line argument to avoid "Resolution Mismatch" errors.
+# The solver uses Quadrature-6, so the metrics must too to prevent interpolation crashes.
+metrics_type_arg = ("Quadrature", 6)
+if comm.rank == 0:
+    logger.info(f"Forcing metrics space to {metrics_type_arg} to match solver fidelity.")
+
+# if args.metrics_space.lower().startswith("quadrature"):
+#     try:
+#         deg = int(args.metrics_space.lower().replace("quadrature", ""))
+#         metrics_type_arg = ("Quadrature", deg)
+#     except ValueError:
+#         metrics_type_arg = ("Quadrature", 4) # Default fallback
+# elif args.metrics_space.startswith("DG"):
+#     try:
+#         deg = int(args.metrics_space.replace("DG", ""))
+#         metrics_type_arg = ("DG", deg)
+#     except ValueError:
+#         metrics_type_arg = ("DG", 1)
+# else:
+#     # Default fallback for unknown strings
+#     metrics_type_arg = ("DG", 1)
 
 metrics_calc = MetricsCalculator(
     geometry=geometry,
@@ -715,7 +725,7 @@ metrics_calc = MetricsCalculator(
     fiber_field_map=fiber_fields_map,
     problem=problem,
     comm=comm,
-    cardiac_model=metrics_model,  # Use DG fiber model for metrics stress
+    cardiac_model=metrics_model,  # <--- PASS THE CORRECTED MODEL
     metrics_space_type=metrics_type_arg,
     alpha_epi=args.alpha_epi,
     alpha_base=args.alpha_base
