@@ -608,8 +608,11 @@ class MetricsCalculator:
         p_RV = (current_state.get("p_RV", 0.0) or 0.0) * 133.322
         
         # 2. Define Measures
-        tag_endo_lv = self.geometry.markers["LV"][0]  
-        tag_endo_rv = self.geometry.markers["RV"][0]  
+        lv_marker_name = "LV" if "LV" in self.geometry.markers else "ENDO_LV"
+        rv_marker_name = "RV" if "RV" in self.geometry.markers else "ENDO_RV"
+
+        tag_endo_lv = self.geometry.markers[lv_marker_name][0]  
+        tag_endo_rv = self.geometry.markers[rv_marker_name][0]  
         
         ds = ufl.Measure("ds", domain=self.mesh, subdomain_data=self.geometry.facet_tags)
     

@@ -165,8 +165,12 @@ def parser_ds(ds_measure, marker_id):
 lvv_target = 0.0
 rvv_target = 0.0
 
-lvv_target = comm.allreduce(geometry.volume("LV"), op=MPI.SUM)
-rvv_target = comm.allreduce(geometry.volume("RV"), op=MPI.SUM)
+# Determine correct markers for volume calculation
+lv_vol_marker = "LV" if "LV" in geometry.markers else "ENDO_LV"
+rv_vol_marker = "RV" if "RV" in geometry.markers else "ENDO_RV"
+
+lvv_target = comm.allreduce(geometry.volume(lv_vol_marker), op=MPI.SUM)
+rvv_target = comm.allreduce(geometry.volume(rv_vol_marker), op=MPI.SUM)
 
 logger.info(
     f"ED Volumes: LV={lvv_target * volume2ml:.2f} mL, RV={rvv_target * volume2ml:.2f} mL",
@@ -478,8 +482,11 @@ pressure_lv = pulse.Variable(dolfinx.fem.Constant(geometry.mesh, 0.0), "kPa")
 pressure_rv = pulse.Variable(dolfinx.fem.Constant(geometry.mesh, 0.0), "kPa")
 
 # FIX: Use ENDO_LV/RV markers directly for surface traction if "LV"/"RV" missing
-lv_marker_id = geometry.markers["LV"][0] 
-rv_marker_id = geometry.markers["RV"][0] 
+lv_marker_name = "LV" if "LV" in geometry.markers else "ENDO_LV"
+rv_marker_name = "RV" if "RV" in geometry.markers else "ENDO_RV"
+
+lv_marker_id = geometry.markers[lv_marker_name][0] 
+rv_marker_id = geometry.markers[rv_marker_name][0]
 
 neumann_lv = pulse.NeumannBC(traction=pressure_lv, marker=lv_marker_id)
 neumann_rv = pulse.NeumannBC(traction=pressure_rv, marker=rv_marker_id)
@@ -532,9 +539,12 @@ s0_map = pulse.utils.map_vector_field(
 x = ufl.SpatialCoordinate(geometry.mesh)
 n = ufl.FacetNormal(geometry.mesh)
 
+# Determine correct markers for volume calculation
+lv_marker = "LV" if "LV" in geometry.markers else "ENDO_LV"
+rv_marker = "RV" if "RV" in geometry.markers else "ENDO_RV"
 
-lvv_unloaded = comm.allreduce(geometry.volume("LV"), op=MPI.SUM)
-rvv_unloaded = comm.allreduce(geometry.volume("RV"), op=MPI.SUM)
+lvv_unloaded = comm.allreduce(geometry.volume(lv_marker), op=MPI.SUM)
+rvv_unloaded = comm.allreduce(geometry.volume(rv_marker), op=MPI.SUM)
 
 logger.info(f"Unloaded volumes: LV={lvv_unloaded * volume2ml:.2f} mL, RV={rvv_unloaded * volume2ml:.2f} mL")
 
@@ -548,10 +558,6 @@ model, robin, dirichlet_bc, Ta = setup_problem(
 
 lv_volume = dolfinx.fem.Constant(geometry.mesh, dolfinx.default_scalar_type(lvv_unloaded))
 rv_volume = dolfinx.fem.Constant(geometry.mesh, dolfinx.default_scalar_type(rvv_unloaded))
-
-# Use correct markers for Cavity definitions
-lv_marker = "LV" if "LV" in geometry.markers else "ENDO_LV"
-rv_marker = "RV" if "RV" in geometry.markers else "ENDO_RV"
 
 # Note on Cavity for Incompressible:
 # pulse.problem.Cavity usually handles u from Mixed Space automatically if passed the right function
