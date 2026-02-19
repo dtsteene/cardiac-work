@@ -2,11 +2,11 @@
 
 # --- Slurm Job Configuration ---
 #SBATCH --job-name=cardiac_sim
-#SBATCH --partition=hgx2q  
+#SBATCH --partition=mi50q    
 #SBATCH --nodes=1
 #SBATCH --ntasks=8
 #SBATCH --cpus-per-task=1
-#SBATCH --time=1:00:00
+#SBATCH --time=2:00:00
 #SBATCH --exclude=n052
 
 # --- NEW: Temporary Log Handling ---

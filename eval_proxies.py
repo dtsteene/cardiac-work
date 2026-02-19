@@ -13,6 +13,7 @@ Usage:
 
 import sys
 import argparse
+import json
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
@@ -229,6 +230,27 @@ def analyze_proxies(metrics, outdir, truth_type="total"):
     pr("RV: PV (P*dV)", stats_rv_pv)
     pr("RV: PS (P*dE)", stats_rv_ps)
     print("="*60)
+
+    # --- SAVE STATS TO JSON ---
+    stats_out = {
+        "metadata": {"truth_type": truth_type},
+        "LV": {
+            "PV": stats_lv_pv, "PS": stats_lv_ps,
+            "Correlation_Slope_PV": m_pv, "Correlation_Slope_PS": m_ps
+        },
+        "Septum": {
+            "Trans": s_trans, "PLV": s_plv, "Mean": s_mean,
+            "Correlation_Slope_Trans": m_trans, "Correlation_Slope_PLV": m_plv
+        },
+        "RV": {
+            "PV": stats_rv_pv, "PS": stats_rv_ps,
+            "Correlation_Slope_PV": m_rv_pv
+        }
+    }
+    json_path = Path(outdir) / "proxy_stats.json"
+    with open(json_path, 'w') as f:
+        json.dump(stats_out, f, indent=4)
+    print(f"✅ Saved stats JSON: {json_path.name}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate Clinical Work Proxies against FEM Ground Truth")

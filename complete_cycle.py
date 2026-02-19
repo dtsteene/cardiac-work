@@ -507,7 +507,7 @@ if not prestress_fname.exists():
             pulse.unloading.TargetPressure(traction=pressure_lv, target=p_LV_ED, name="LV"),
             pulse.unloading.TargetPressure(traction=pressure_rv, target=p_RV_ED, name="RV"),
         ],
-        ramp_steps=5,
+        ramp_steps=20,
     )
     u_pre = prestress_problem.unload()
     adios4dolfinx.write_function_on_input_mesh(prestress_fname, u_pre, time=0.0, name="u_pre")

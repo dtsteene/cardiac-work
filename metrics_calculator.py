@@ -95,6 +95,10 @@ class MetricsCalculator:
         self.eps_LV_prev = 0.0
         self.eps_RV_prev = 0.0
         self.eps_Septum_prev = 0.0
+
+        # Pressure History for Trapezoidal Boundary Work
+        self.p_LV_prev = 0.0
+        self.p_RV_prev = 0.0
         
         # Region Tags
         self.region_tags = geo.additional_data.get("markers_mt", None)
@@ -381,10 +385,14 @@ class MetricsCalculator:
         if abs(dV_RV) > 1e-5: dV_RV = 0.0
         
         # 5. CALCULATE WORK (External Work P*dV in Joules)
-        proxies["work_proxy_pv_LV"] = p_LV_Pa * dV_LV
-        proxies["work_proxy_pv_RV"] = p_RV_Pa * dV_RV
+        # Upgrade to Trapezoidal Rule (2nd Order): W = avg(P) * dV
+        p_LV_avg = 0.5 * (p_LV_Pa + self.p_LV_prev)
+        p_RV_avg = 0.5 * (p_RV_Pa + self.p_RV_prev)
         
-        # Update Previous State
+        proxies["work_proxy_pv_LV"] = p_LV_avg * dV_LV
+        proxies["work_proxy_pv_RV"] = p_RV_avg * dV_RV
+        
+        # Update Previous State (Volumes only - Pressures handled in boundary calc)
         self.V_LV_prev = V_LV_m3
         self.V_RV_prev = V_RV_m3
         
@@ -409,32 +417,36 @@ class MetricsCalculator:
         dE_RV = eps_RV - self.eps_RV_prev
         dE_Septum = eps_Septum - self.eps_Septum_prev
         
+        # Trapezoidal Pressures (Pa)
+        p_LV_avg = 0.5 * (p_LV + self.p_LV_prev)
+        p_RV_avg = 0.5 * (p_RV + self.p_RV_prev)
+
         # --- Apply Regional Volume Scaling ---
         
         # 1. LV Free Wall Proxy (Standard)
-        data["work_ps_index_LV"] = (p_LV * dE_LV) * self.region_volumes["LV"]
+        data["work_ps_index_LV"] = (p_LV_avg * dE_LV) * self.region_volumes["LV"]
         
         # 2. RV Free Wall Proxy (Standard)
-        data["work_ps_index_RV"] = (p_RV * dE_RV) * self.region_volumes["RV"]
+        data["work_ps_index_RV"] = (p_RV_avg * dE_RV) * self.region_volumes["RV"]
         
         # 3. Septum Proxies (The Investigation)
         vol_S = self.region_volumes["Septum"]
         
         # Variant A: Net Trans-septal Pressure (The Standard Physics Assumption)
         # Represents the septum working against the pressure gradient.
-        data["work_ps_index_Septum_Trans"] = ((p_LV - p_RV) * dE_Septum) * vol_S
+        data["work_ps_index_Septum_Trans"] = ((p_LV_avg - p_RV_avg) * dE_Septum) * vol_S
         
         # Variant B: LV Pressure Only
         # Tests the hypothesis that the Septum is essentially "part of the LV".
-        data["work_ps_index_Septum_PLV"] = (p_LV * dE_Septum) * vol_S
+        data["work_ps_index_Septum_PLV"] = (p_LV_avg * dE_Septum) * vol_S
         
         # Variant C: RV Pressure Only
         # Tests the hypothesis that the Septum is dominated by RV mechanics (unlikely, but a good baseline).
-        data["work_ps_index_Septum_PRV"] = (p_RV * dE_Septum) * vol_S
+        data["work_ps_index_Septum_PRV"] = (p_RV_avg * dE_Septum) * vol_S
         
         # Variant D: Mean Pressure
         # Represents the septum working against the average hydrostatic load of the heart.
-        p_mean = 0.5 * (p_LV + p_RV)
+        p_mean = 0.5 * (p_LV_avg + p_RV_avg)
         data["work_ps_index_Septum_Mean"] = (p_mean * dE_Septum) * vol_S
         
         # Update History
@@ -447,10 +459,20 @@ class MetricsCalculator:
     def _calculate_robin_work(self):
         """
         Calculates work done BY the boundary springs ON the mesh.
+        Trapezoidal Rule: W = avg(Force) * Displacement = -k * avg(u) * du
         """
         du = self.problem.u - self._u_prev if hasattr(self, '_u_prev') else self.problem.u
         u_cur = self.problem.u
         
+        # Trapezoidal Average Displacement for Force Calculation
+        # (Must handle the first step where _u_prev might not be fully set or is 0)
+        if hasattr(self, '_u_prev'):
+             u_avg_epi = 0.5 * (u_cur + self._u_prev)
+             u_avg_base = 0.5 * (u_cur + self._u_prev)
+        else:
+             u_avg_epi = u_cur
+             u_avg_base = u_cur
+
         # Tags for boundary
         tag_epi = self.geometry.markers["EPI"][0]
         tag_base = self.geometry.markers["BASE"][0]
@@ -458,9 +480,9 @@ class MetricsCalculator:
         ds_epi = self.geometry.ds(tag_epi)
         ds_base = self.geometry.ds(tag_base)
         
-        # Form definition
-        term_epi = -self.alpha_epi * ufl.inner(u_cur, du) * ds_epi
-        term_base = -self.alpha_base * ufl.inner(u_cur, du) * ds_base
+        # Form definition (Using Average Displacement for Force)
+        term_epi = -self.alpha_epi * ufl.inner(u_avg_epi, du) * ds_epi
+        term_base = -self.alpha_base * ufl.inner(u_avg_base, du) * ds_base
         
         # Assembly (No Try/Except!)
         wd_epi = self.comm.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(term_epi)), op=MPI.SUM)
@@ -589,6 +611,11 @@ class MetricsCalculator:
             #exact work keys
             metrics["work_boundary_exact_LV"] = 0.0
             metrics["work_boundary_exact_RV"] = 0.0    
+
+            # Initialize Pressure History for Trapezoidal Integration
+            if current_state:
+                self.p_LV_prev = (current_state.get("p_LV", 0.0) or 0.0) * 133.322
+                self.p_RV_prev = (current_state.get("p_RV", 0.0) or 0.0) * 133.322
         
         #print(metrics)
         
@@ -598,6 +625,7 @@ class MetricsCalculator:
         """
         Calculates EXACT external work via surface integration: W = Integral( -P * (du . n) * ds )
         This is the rigorous counterpart to 'P * dV'.
+        USING TRAPEZOIDAL RULE: W = - 0.5 * (P_new + P_old) * Integral( du . n )
         """
         # 1. Setup
         du = self.problem.u - self._u_prev if hasattr(self, '_u_prev') else self.problem.u
@@ -607,6 +635,14 @@ class MetricsCalculator:
         p_LV = (current_state.get("p_LV", 0.0) or 0.0) * 133.322
         p_RV = (current_state.get("p_RV", 0.0) or 0.0) * 133.322
         
+        # Trapezoidal Average Pressure
+        p_LV_avg = 0.5 * (p_LV + self.p_LV_prev)
+        p_RV_avg = 0.5 * (p_RV + self.p_RV_prev)
+        
+        # Update History
+        self.p_LV_prev = p_LV
+        self.p_RV_prev = p_RV
+
         # 2. Define Measures
         lv_marker_name = "LV" if "LV" in self.geometry.markers else "ENDO_LV"
         rv_marker_name = "RV" if "RV" in self.geometry.markers else "ENDO_RV"
@@ -621,10 +657,10 @@ class MetricsCalculator:
         # Work = Force . Displacement
         
         # Total LV Cavity Surface Work
-        form_work_bnd_LV = -p_LV * ufl.inner(du, n) * ds(tag_endo_lv)
+        form_work_bnd_LV = -p_LV_avg * ufl.inner(du, n) * ds(tag_endo_lv)
         
         # Total RV Cavity Surface Work
-        form_work_bnd_RV = -p_RV * ufl.inner(du, n) * ds(tag_endo_rv)
+        form_work_bnd_RV = -p_RV_avg * ufl.inner(du, n) * ds(tag_endo_rv)
 
         
         # 4. Assembly (Standard Cavity)

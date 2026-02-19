@@ -21,6 +21,7 @@ Usage:
 """
 
 import sys
+import json
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
@@ -219,7 +220,7 @@ def plot_engineering_debug(metrics, outdir):
     # --- 2. FIGURE SETUP ---
     fig = plt.figure(figsize=(18, 12))
     gs = gridspec.GridSpec(2, 3, figure=fig) # 2x3 Grid
-    fig.suptitle("Advanced Engineering Debug: Physics & Numerics", fontsize=18, fontweight='bold')
+    fig.suptitle("Engineering Debug: Physics & Numerics", fontsize=18, fontweight='bold')
 
     # ==========================================================
     # ROW 1: NUMERICAL VALIDATION (Is the math correct?)
@@ -308,7 +309,7 @@ def plot_engineering_debug(metrics, outdir):
              transform=ax5.transAxes, ha='center', fontsize=10, bbox=dict(facecolor='white'))
 
     plt.tight_layout()
-    plt.savefig(outdir / "engineering_debug_v2.png")
+    plt.savefig(outdir / "engineering_debug.png")
     print("Saved V2 debug dashboard.")
     plt.close()
 
@@ -450,6 +451,8 @@ def plot_stress_decomposition(metrics, outdir):
             # Convert to kPa
             if sigma_tot is not None: sigma_tot *= 1e-3
             if sigma_act is not None: sigma_act *= 1e-3
+            if sigma_pas is not None: sigma_pas *= 1e-3
+            if sigma_cmp is not None: sigma_cmp *= 1e-3
             
             # PLOT STRESS (Simplified Shading Logic)
             if sigma_tot is not None and sigma_act is not None:
@@ -499,6 +502,165 @@ def plot_stress_decomposition(metrics, outdir):
     print(f" Saved: {outpath}")
     plt.close()
 
+def save_hemodynamics_json(metrics, outdir):
+    data = {}
+    
+    def get_max(key):
+        arr = get_arr(metrics, [key])
+        return float(np.max(arr)) if arr is not None else None
+    
+    data["Pressures"] = {
+        "LV_Peak": get_max("p_LV"),
+        "RV_Peak": get_max("p_RV"),
+        "LA_Mean": float(np.mean(get_arr(metrics, ["p_LA"]))) if get_arr(metrics, ["p_LA"]) is not None else None
+    }
+    
+    # Volumes (Try Clinical first, then raw)
+    v_lv = get_arr(metrics, ["V_LV_Clinical"])
+    if v_lv is None: v_lv = get_arr(metrics, ["V_LV"])
+    
+    v_rv = get_arr(metrics, ["V_RV_Clinical"])
+    if v_rv is None: v_rv = get_arr(metrics, ["V_RV"])
+    
+    if v_lv is not None:
+        edv_lv = float(np.max(v_lv))
+        esv_lv = float(np.min(v_lv))
+        sv_lv = edv_lv - esv_lv
+        ef_lv = (sv_lv / edv_lv * 100) if edv_lv > 0 else 0
+        data["LV"] = {"EDV_mL": edv_lv, "ESV_mL": esv_lv, "SV_mL": sv_lv, "EF_pct": ef_lv}
+    
+    if v_rv is not None:
+        edv_rv = float(np.max(v_rv))
+        esv_rv = float(np.min(v_rv))
+        sv_rv = edv_rv - esv_rv
+        ef_rv = (sv_rv / edv_rv * 100) if edv_rv > 0 else 0
+        data["RV"] = {"EDV_mL": edv_rv, "ESV_mL": esv_rv, "SV_mL": sv_rv, "EF_pct": ef_rv}
+        
+    outpath = Path(outdir) / "hemodynamics.json"
+    with open(outpath, 'w') as f:
+        json.dump(data, f, indent=4)
+    print(f"✅ Saved stats: {outpath.name}")
+
+def save_detailed_stats(metrics, outdir):
+    """Calculates hard engineering and mechanical statistics and saves to JSON."""
+    stats = {}
+    
+    # --- 1. ENGINEERING DEBUG STATS ---
+    # Recreating logic from plot_engineering_debug to ensure identical numbers
+    N = len(metrics["time"])
+    def get_safe(keys):
+        for k in keys:
+            if k in metrics: return np.array(metrics[k])
+        return np.zeros(N)
+
+    time = np.array(metrics["time"])
+    
+    # Sinks
+    w_pv_proxy = get_safe(["work_proxy_pv_LV"]) + get_safe(["work_proxy_pv_RV"])
+    w_robin = get_safe(["work_robin_epi"]) + get_safe(["work_robin_base"])
+    w_boundary_exact = get_safe(["work_boundary_exact_LV"]) + get_safe(["work_boundary_exact_RV"])
+
+    # Sources
+    w_active = get_safe(["work_active_Whole"]) 
+    if np.sum(np.abs(w_active)) == 0:
+        w_active = get_safe(["work_active_LV"]) + get_safe(["work_active_RV"]) + get_safe(["work_active_Septum"])
+
+    w_passive = get_safe(["work_passive_Whole"])
+    if np.sum(np.abs(w_passive)) == 0:
+        w_passive = get_safe(["work_passive_LV"]) + get_safe(["work_passive_RV"]) + get_safe(["work_passive_Septum"])
+
+    w_comp = get_safe(["work_comp_Whole"])
+    if np.sum(np.abs(w_comp)) == 0:
+        w_comp = get_safe(["work_comp_LV"]) + get_safe(["work_comp_RV"]) + get_safe(["work_comp_Septum"])
+
+    w_int_total = w_active + w_passive + w_comp
+
+    # Sync lengths
+    arrays_map = {
+        "w_int_total": w_int_total, "w_pv_proxy": w_pv_proxy, "w_robin": w_robin, 
+        "w_boundary_exact": w_boundary_exact, "w_active": w_active, 
+        "w_passive": w_passive, "w_comp": w_comp
+    }
+    
+    min_len = len(time)
+    for k, arr in arrays_map.items():
+        if len(arr) < min_len: min_len = len(arr)
+        
+    # Truncate if needed
+    if min_len < len(time):
+        for k in arrays_map:
+            arrays_map[k] = arrays_map[k][:min_len]
+
+    # Calculate Integrals (Joules) - final cumulative sum
+    def total(arr): return float(np.sum(arr)) # Assuming arrays are effectively dW. cumsum[-1] == sum
+
+    E_int_total = total(arrays_map["w_int_total"])
+    E_ext_total = total(arrays_map["w_boundary_exact"] + arrays_map["w_robin"])
+    E_pv = total(arrays_map["w_pv_proxy"])
+    E_boundary = total(arrays_map["w_boundary_exact"])
+    E_active = total(arrays_map["w_active"])
+    E_passive = total(arrays_map["w_passive"])
+    E_comp = total(arrays_map["w_comp"])
+    E_robin = total(arrays_map["w_robin"])
+
+    stats["Engineering_Integrals"] = {
+        "Solver_Conservation_Error_J": E_int_total - E_ext_total,
+        "Solver_Conservation_Error_Pct": (E_int_total - E_ext_total)/E_int_total * 100 if abs(E_int_total) > 1e-6 else 0,
+        "Geometric_Consistency_Error_J": E_pv - E_boundary,
+        "Incompressibility_Error_J": E_comp,
+        "Net_Passive_Work_J": E_passive,
+        "Physics_Balance_Error_J": E_active - (E_pv + E_robin) # Source - Sinks
+    }
+
+    # --- 2. STRESS ANALYSIS STATS ---
+    stats["Stress_Analysis_kPa"] = {}
+    regions = ["LV", "Septum", "RV"]
+    directions = ["ff", "mag"]
+    
+    for region in regions:
+        r_stats = {}
+        for direction in directions:
+            # Keys like "mean_sigma_ff_LV"
+            k_base = f"mean_sigma_{direction}"
+            
+            # Fetch arrays (converted to kPa)
+            def get_stress_kpa(suffix):
+                key = f"{k_base}_{suffix}_{region}"
+                # Handle base case (total) which has no suffix in key pattern used in plot
+                if suffix == "total": key = f"{k_base}_{region}"
+                
+                arr = get_arr(metrics, [key], min_len)
+                return arr * 1e-3 if arr is not None else None
+
+            s_tot = get_stress_kpa("total")
+            s_act = get_stress_kpa("active")
+            s_pas = get_stress_kpa("passive")
+            
+            d_stats = {}
+            if s_tot is not None:
+                d_stats["Max_Total"] = float(np.max(s_tot))
+                d_stats["Mean_Total"] = float(np.mean(s_tot))
+            if s_act is not None:
+                d_stats["Max_Active"] = float(np.max(s_act))
+                d_stats["Mean_Active"] = float(np.mean(s_act))
+            if s_pas is not None:
+                d_stats["Max_Passive"] = float(np.max(s_pas))
+                d_stats["Mean_Passive"] = float(np.mean(s_pas))
+            
+            if s_act is not None and s_tot is not None:
+                diff = s_act - s_tot
+                loss = np.where(diff > 0, diff, 0)
+                d_stats["Mean_Elastic_Loss"] = float(np.mean(loss))
+
+            r_stats[direction] = d_stats
+        stats["Stress_Analysis_kPa"][region] = r_stats
+
+    # Save
+    outpath = Path(outdir) / "detailed_stats.json"
+    with open(outpath, 'w') as f:
+        json.dump(stats, f, indent=4)
+    print(f"✅ Saved detailed stats: {outpath.name}")
+
 # --- Main ---
 if __name__ == "__main__":
     if len(sys.argv) < 2:
@@ -512,3 +674,5 @@ if __name__ == "__main__":
     plot_engineering_debug(metrics, res_dir)
     plot_full_hemodynamics(metrics, res_dir)
     plot_stress_decomposition(metrics, res_dir)
+    save_hemodynamics_json(metrics, res_dir)
+    save_detailed_stats(metrics, res_dir)
