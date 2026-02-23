@@ -8,12 +8,17 @@ import ldrb
 import cardiac_geometries
 import cardiac_geometries.geometry
 
-def generate_and_load(comm, outdir, args, logger):
+def generate_and_load(comm, outdir, args, logger, manual_refinement=False, geodir=None):
     """
     Handles the generation (on Rank 0) and loading (on all Ranks) of the geometry.
     Returns the loaded cardiac_geometries.geometry.Geometry object.
+
+    geodir: optional override for the geometry directory. If None, defaults to
+            outdir / "geometry". Pass a pre-built geometry path to skip generation
+            entirely and load a previously tagged geometry from disk.
     """
-    geodir = outdir / "geometry"
+    if geodir is None:
+        geodir = outdir / "geometry"
 
     # ========================================================================
     # PHASE 1: GENERATION (Rank 0 Only)
@@ -98,10 +103,36 @@ def generate_and_load(comm, outdir, args, logger):
         values = markers_scalar.x.array[:total_cells].astype(np.int32)
         markers_mt = dolfinx.mesh.meshtags(geo.mesh, 3, entities, values)
 
-        # Write markers for debug
+        # Write markers for debug / editor input
         with dolfinx.io.XDMFFile(MPI.COMM_SELF, outdir / "markers_scalar.xdmf", "w") as xdmf:
             xdmf.write_mesh(geo.mesh)
             xdmf.write_meshtags(markers_mt, geo.mesh.geometry)
+
+        # --- OPTIONAL MANUAL REFINEMENT ---
+        # Open the interactive Septum Tag Editor so the user can correct the
+        # LDRB-generated septum boundary before it flows into the FEM solver.
+        # After the window is closed, editor.tags holds the final assignments
+        # (1=LV, 2=RV, 3=Septum) which are used to rebuild markers_mt.
+        # These tags end up in geometry.bp → additional_data["markers_mt"] →
+        # scifem.create_space_of_simple_functions → correct DOF assignment in FEniCSx.
+        if manual_refinement:
+            from septum_editor import SeptumEditor
+            xdmf_path = outdir / "markers_scalar.xdmf"
+            logger.info("=" * 60)
+            logger.info("MANUAL REFINEMENT: Launching Septum Tag Editor.")
+            logger.info("Edit septum tags, then close the window to continue.")
+            logger.info("(Press S inside the editor to also persist edits to disk.)")
+            logger.info("=" * 60)
+            editor = SeptumEditor(xdmf_path, output_path=None)
+            editor.run()  # blocks until window is closed
+            # Rebuild markers_mt from the editor's in-memory tags.
+            # This captures all edits regardless of whether the user pressed S.
+            updated_values = editor.tags[:total_cells].astype(np.int32)
+            markers_mt = dolfinx.mesh.meshtags(geo.mesh, 3, entities, updated_values)
+            n_lv   = int((updated_values == 1).sum())
+            n_rv   = int((updated_values == 2).sum())
+            n_sept = int((updated_values == 3).sum())
+            logger.info(f"Manual refinement complete — LV={n_lv}, RV={n_rv}, Septum={n_sept} cells.")
 
         # 3. System for Viz (DG1)
         fiber_space = "DG_1"
@@ -158,3 +189,116 @@ def generate_and_load(comm, outdir, args, logger):
     geo.mesh.geometry.x[:] *= scale
 
     return geo
+
+
+if __name__ == "__main__":
+    import argparse
+    
+    # Configure logging
+    logging.basicConfig(level=logging.INFO)
+    logger = logging.getLogger(__name__)
+    
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description="Generate and inspect cardiac geometries"
+    )
+    parser.add_argument(
+        "-o", "--output-dir",
+        type=str,
+        default="./geometries",
+        help="Output directory for geometry subdirectories (default: ./geometries)"
+    )
+    parser.add_argument(
+        "--single",
+        type=str,
+        choices=["ukb", "pah", "healthy"],
+        default=None,
+        help="Generate only a single geometry type instead of all three"
+    )
+    parser.add_argument(
+        "-m", "--mesh",
+        type=str,
+        default=None,
+        help="Path to custom mesh XDMF file (only used with --single)"
+    )
+    parser.add_argument(
+        "-c", "--char-length",
+        type=float,
+        default=5.0,
+        help="Characteristic mesh length in mm (default: 5.0)"
+    )
+    parser.add_argument(
+        "--manual-refinement",
+        action="store_true",
+        help="Launch interactive Septum Tag Editor after LDRB tagging to manually correct tags before saving"
+    )
+
+    cli_args = parser.parse_args()
+    
+    # Create MPI communicator
+    comm = MPI.COMM_WORLD
+    
+    # Define geometry configurations
+    geometry_configs = {
+        "ukb": {
+            "mesh": None,  # None means use synthetic UKB
+            "outdir": Path(cli_args.output_dir) / "ukb"
+        },
+        "healthy": {
+            "mesh": "/Users/daniel/Documents/master/data/meshes 2/healthy.xdmf",
+            "outdir": Path(cli_args.output_dir) / "healthy"
+        },
+        "pah": {
+            "mesh": "/Users/daniel/Documents/master/data/meshes 2/pah.xdmf",
+            "outdir": Path(cli_args.output_dir) / "pah"
+        }
+    }
+    
+    # Determine which geometries to generate
+    if cli_args.single:
+        if cli_args.single == "ukb":
+            to_generate = ["ukb"]
+        elif cli_args.single in geometry_configs:
+            to_generate = [cli_args.single]
+            # Override mesh path if provided
+            if cli_args.mesh:
+                geometry_configs[cli_args.single]["mesh"] = cli_args.mesh
+    else:
+        to_generate = ["ukb", "healthy", "pah"]
+    
+    # Generate geometries
+    for geo_type in to_generate:
+        config = geometry_configs[geo_type]
+        outdir = config["outdir"]
+        mesh_path = config["mesh"]
+        
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Generating {geo_type.upper()} geometry...")
+        logger.info(f"{'='*60}")
+        
+        outdir.mkdir(parents=True, exist_ok=True)
+        
+        # Create arguments namespace for generate_and_load
+        args = argparse.Namespace(
+            char_length=cli_args.char_length,
+            mesh=mesh_path,
+        )
+        
+        # Log info
+        logger.info(f"Output directory: {outdir}")
+        logger.info(f"Mesh: {mesh_path if mesh_path else 'UKB synthetic'}")
+        logger.info(f"Characteristic length: {args.char_length} mm")
+        
+        # Generate and load geometry
+        geo = generate_and_load(comm, outdir, args, logger,
+                                manual_refinement=cli_args.manual_refinement)
+        
+        logger.info(f"✓ {geo_type.upper()} geometry generated successfully!")
+        logger.info(f"  Mesh: {geo.mesh}")
+        logger.info(f"  Number of cells: {geo.mesh.topology.index_map(3).size_local}")
+        logger.info(f"  Output files saved to: {outdir}\n")
+    
+    logger.info("="*60)
+    logger.info("All geometries completed!")
+    logger.info("="*60)
+

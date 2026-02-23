@@ -51,6 +51,12 @@ parser.add_argument('--circulation_params', type=str, default=None, help='Path t
 parser.add_argument('--alpha_epi', type=float, default=1e5, help='Epicardial spring stiffness (Pa/m) (default: 1e5)')
 parser.add_argument('--alpha_base', type=float, default=1e6, help='Basal spring stiffness (Pa/m) (default: 1e6)')
 parser.add_argument('--incompressible', action='store_true', help='Use incompressible formulation')
+parser.add_argument('--manual-refinement', action='store_true',
+                    help='Launch interactive Septum Tag Editor after LDRB tagging to manually correct septum region before simulation')
+parser.add_argument('--geometry-dir', type=str, default=None,
+                    help='Path to a pre-built geometry directory (containing geometry.bp). '
+                         'Skips all geometry generation and loads directly from this path. '
+                         'Use after a local --manual-refinement prep run.')
 args = parser.parse_args()
 
 # Determine BPM
@@ -132,7 +138,7 @@ comm = MPI.COMM_WORLD
 if comm.rank == 0:
     outdir.mkdir(parents=True, exist_ok=True)
 comm.barrier()
-geodir = outdir / "geometry"
+geodir = Path(args.geometry_dir) if args.geometry_dir else None
 
 circulation.log.setup_logging(logging.INFO)
 logger = logging.getLogger("pulse")
@@ -151,7 +157,9 @@ if comm.rank == 0:
 
 # --- Geometry Generation (Hybrid: V1 Logic + V2 MPI Safety) ---
 
-geo = geometry_generator.generate_and_load(comm, outdir, args, logger)
+geo = geometry_generator.generate_and_load(comm, outdir, args, logger,
+                                           manual_refinement=args.manual_refinement,
+                                           geodir=geodir)
 geometry = pulse.HeartGeometry.from_cardiac_geometries(geo, metadata={"quadrature_degree": 6})
 
 # Store Target Volumes (ED)

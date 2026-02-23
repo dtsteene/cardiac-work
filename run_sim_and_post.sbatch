@@ -15,16 +15,17 @@
 #SBATCH --error=init_slurm_%j.err
 
 # --- Usage Examples ---
-# 1. Default (UKB, 1 Beat):         sbatch run_sim.sbatch
-# 2. Multi-beat Run:                sbatch --export=BEATS=10 run_sim.sbatch
-# 3. PAH Mesh (Auto-loads JSON):    sbatch --export=MESH=PAH run_sim.sbatch
-# 4. PAH Mesh (Force Default):      sbatch --export=MESH=PAH,CIRCULATION_PARAMS="DEFAULT" run_sim.sbatch
-# 5. Custom Mesh:                   sbatch --export=MESH="./my_mesh.xdmf" run_sim.sbatch
+# 1. Default (UKB, 1 Beat):            sbatch run_sim.sbatch
+# 2. Multi-beat Run:                   sbatch --export=BEATS=10 run_sim.sbatch
+# 3. PAH Mesh (Auto-loads JSON):       sbatch --export=MESH=PAH run_sim.sbatch
+# 4. PAH Mesh (Force Default):         sbatch --export=MESH=PAH,CIRCULATION_PARAMS="DEFAULT" run_sim.sbatch
+# 5. Custom Mesh:                      sbatch --export=MESH="./my_mesh.xdmf" run_sim.sbatch
+# 6. Pre-tagged Geometry (skip gen):   sbatch --export=GEOMETRY_DIR="/home/dtsteene/D1/cardiac-work/data/geometries/ukb_tagged" run_sim.sbatch
 
 # --- 1. Variable Defaults ---
 MESH=${MESH:-"UKB"}
 BPM=${BPM:-75}
-BEATS=${BEATS:-1}               
+BEATS=${BEATS:-1}
 CI=${CI:-0}
 CHAR_LENGTH=${CHAR_LENGTH:-10.0}
 METRICS_SPACE=${METRICS_SPACE:-"DG1"}
@@ -33,6 +34,10 @@ ALPHA_EPI=${ALPHA_EPI:-""}
 ALPHA_BASE=${ALPHA_BASE:-""}
 INCOMPRESSIBLE=${INCOMPRESSIBLE:-0}
 COMMENT=${COMMENT:-"No description provided"}
+# Path to a pre-built, manually tagged geometry directory (skips generation entirely).
+# Prep locally with: python geometry_generator.py --manual-refinement --single ukb -o ./tagged_geos
+# Then rsync to the server and point GEOMETRY_DIR at it.
+GEOMETRY_DIR=${GEOMETRY_DIR:-""}
 
 # --- 2. Paths & Environment ---
 SUBMIT_DIR=$SLURM_SUBMIT_DIR
@@ -125,6 +130,11 @@ fi
 
 if [ "$INCOMPRESSIBLE" = "1" ]; then
     ARGS_STR="$ARGS_STR --incompressible"
+fi
+
+if [ -n "$GEOMETRY_DIR" ]; then
+    ARGS_STR="$ARGS_STR --geometry-dir $GEOMETRY_DIR"
+    echo "Geometry: Pre-built (skipping generation) → $GEOMETRY_DIR"
 fi
 
 # --- 5. Setup Logging & Directories ---
