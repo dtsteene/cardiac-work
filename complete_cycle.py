@@ -364,7 +364,7 @@ def get_activation(t):
         RR=RR_INTERVAL,
     )(t)
     # V1 Logic: Return array for spatially varying tension
-    return np.array([100 * value, 70 * value, 100 * value])
+    return np.array([100 * value, 100 * value, 100 * value])
 
 if comm.rank == 0:
     fig, ax = plt.subplots(figsize=(12, 5))

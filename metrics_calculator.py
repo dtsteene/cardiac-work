@@ -99,6 +99,7 @@ class MetricsCalculator:
         # Pressure History for Trapezoidal Boundary Work
         self.p_LV_prev = 0.0
         self.p_RV_prev = 0.0
+        self._p_initialized = False
         
         # Region Tags
         self.region_tags = geo.additional_data.get("markers_mt", None)
@@ -136,6 +137,30 @@ class MetricsCalculator:
         except Exception as e:
             if self.rank == 0: print(f"MetricsCalculator Warning: Could not calc regional volumes ({e}). Using defaults.")
             self.region_volumes = defaultdict(lambda: 1.0)
+
+        # --- Marker Diagnostic (verify all cells are tagged) ---
+        if self.region_tags is not None and self.rank == 0:
+            tag_values = self.region_tags.values
+            unique, counts = np.unique(tag_values, return_counts=True)
+            total_cells = self.mesh.topology.index_map(3).size_local
+            tagged_cells = len(tag_values)
+            print(f"\n{'='*60}")
+            print(f"  METRICS CALCULATOR — Region Marker Diagnostic")
+            print(f"{'='*60}")
+            print(f"  Total mesh cells (local): {total_cells}")
+            print(f"  Tagged cells:             {tagged_cells}")
+            for u, c in zip(unique, counts):
+                label = {0: "UNASSIGNED", 1: "LV FreeWall", 2: "RV FreeWall", 3: "Septum", 4: "Other"}.get(int(u), f"Unknown({u})")
+                print(f"    Marker {int(u):2d} ({label:>14s}): {c:6d} cells")
+            unassigned = counts[unique == 0].sum() if 0 in unique else 0
+            if unassigned > 0:
+                print(f"  WARNING: {unassigned} cells have marker 0 (unassigned)!")
+                print(f"           These cells contribute to solver S:dE but NOT to metrics 'Whole' region.")
+            else:
+                print(f"  OK: All cells assigned to regions 1/2/3.")
+            for rname, rvol in self.region_volumes.items():
+                print(f"  Volume {rname:>8s}: {rvol:.4e} m^3")
+            print(f"{'='*60}\n")
 
     def _setup_expressions(self):
         u = self.problem.u
@@ -199,6 +224,8 @@ class MetricsCalculator:
         self.E_cur.interpolate(self.expr_E)
         self.S_total.interpolate(self.expr_S_total)
         self.S_active.interpolate(self.expr_S_active)
+        self.S_passive.interpolate(self.expr_S_passive)
+        self.S_comp.interpolate(self.expr_S_comp)
 
         # Interpolate Cauchy Components
         self.sigma_total.interpolate(self.expr_sigma_total)
@@ -254,9 +281,13 @@ class MetricsCalculator:
             vol = assemble_region(dolfinx.fem.Constant(self.mesh, 1.0))
             
             if vol > 1e-12:
-                # Reference Stresses (Green-Lagrange)
+                # Reference Stresses and Strains (2nd PK / Green-Lagrange)
                 data[f"mean_S_ff_{region_name}"] = assemble_region(proj(self.S_total, f0)) / vol
+                data[f"mean_S_ss_{region_name}"] = assemble_region(proj(self.S_total, s0)) / vol
+                data[f"mean_S_nn_{region_name}"] = assemble_region(proj(self.S_total, n0)) / vol
                 data[f"mean_E_ff_{region_name}"] = assemble_region(proj(self.E_cur, f0)) / vol
+                data[f"mean_E_ss_{region_name}"] = assemble_region(proj(self.E_cur, s0)) / vol
+                data[f"mean_E_nn_{region_name}"] = assemble_region(proj(self.E_cur, n0)) / vol
                 
                 # Cauchy Stresses (True Stress) - Total
                 data[f"mean_sigma_ff_{region_name}"] = assemble_region(proj(self.sigma_total, f_cur)) / vol
@@ -287,7 +318,11 @@ class MetricsCalculator:
 
             else:
                 data[f"mean_S_ff_{region_name}"] = 0.0
+                data[f"mean_S_ss_{region_name}"] = 0.0
+                data[f"mean_S_nn_{region_name}"] = 0.0
                 data[f"mean_E_ff_{region_name}"] = 0.0
+                data[f"mean_E_ss_{region_name}"] = 0.0
+                data[f"mean_E_nn_{region_name}"] = 0.0
                 
         return data
 
@@ -295,11 +330,9 @@ class MetricsCalculator:
         """
         Calculates Work Densities (S : dE) using Trapezoidal Rule (0.5 * (S_new + S_old) : dE).
         """
-        # We still update the "Functions" because we might want to save them to VTX 
-        # or use them for other things, but we won't use them for the integral below.
-        self.S_passive.interpolate(self.expr_S_passive)
-        self.S_comp.interpolate(self.expr_S_comp)
-        
+        # S_passive and S_comp are already interpolated by _calculate_state_variables()
+        # which is always called before this method.
+
         # Strain increment (Interpolated is fine here, as Strain is continuous)
         dE = self.E_cur - self.E_prev
         
@@ -458,36 +491,44 @@ class MetricsCalculator:
     
     def _calculate_robin_work(self):
         """
-        Calculates work done BY the boundary springs ON the mesh.
-        Trapezoidal Rule: W = avg(Force) * Displacement = -k * avg(u) * du
+        Work done BY boundary springs ON the mesh.
+        Matches solver _robin_form (perpendicular=False):
+          R = k*(u.NN)*(NN.u_test)*cofnorm*ds
+        with Nanson: NN = cofN/|cofN|, cofN = J*F^{-T}*N
         """
         du = self.problem.u - self._u_prev if hasattr(self, '_u_prev') else self.problem.u
         u_cur = self.problem.u
         
-        # Trapezoidal Average Displacement for Force Calculation
-        # (Must handle the first step where _u_prev might not be fully set or is 0)
-        if hasattr(self, '_u_prev'):
-             u_avg_epi = 0.5 * (u_cur + self._u_prev)
-             u_avg_base = 0.5 * (u_cur + self._u_prev)
-        else:
-             u_avg_epi = u_cur
-             u_avg_base = u_cur
+        u_avg = 0.5 * (u_cur + self._u_prev) if hasattr(self, '_u_prev') else u_cur
 
-        # Tags for boundary
+        # Deformed normal via Nanson (must match solver _robin_form exactly)
+        # Solver: nn = outer(NN,NN) [perpendicular=False], cofnorm * ds
+        # R = k * (u.NN) * (NN.u_test) * cofnorm * ds
+        N = ufl.FacetNormal(self.mesh)
+        I = ufl.Identity(3)
+        F = ufl.grad(u_cur) + I
+        J = ufl.det(F)
+        cof = J * ufl.inv(F).T
+        cofN = ufl.dot(cof, N)
+        cofnorm = ufl.sqrt(ufl.inner(cofN, cofN))
+        NN = cofN / cofnorm
+
+        # Normal projections only (Robin resists normal displacement)
+        u_n = ufl.dot(u_avg, NN)
+        du_n = ufl.dot(du, NN)
+
         tag_epi = self.geometry.markers["EPI"][0]
         tag_base = self.geometry.markers["BASE"][0]
-        
         ds_epi = self.geometry.ds(tag_epi)
         ds_base = self.geometry.ds(tag_base)
-        
-        # Form definition (Using Average Displacement for Force)
-        term_epi = -self.alpha_epi * ufl.inner(u_avg_epi, du) * ds_epi
-        term_base = -self.alpha_base * ufl.inner(u_avg_base, du) * ds_base
-        
-        # Assembly (No Try/Except!)
+
+        # dW = -k * (u_avg.NN) * (NN.du) * cofnorm * ds
+        term_epi = -self.alpha_epi * u_n * du_n * cofnorm * ds_epi
+        term_base = -self.alpha_base * u_n * du_n * cofnorm * ds_base
+
         wd_epi = self.comm.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(term_epi)), op=MPI.SUM)
         wd_base = self.comm.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(term_base)), op=MPI.SUM)
-            
+
         return {"work_robin_epi": wd_epi, "work_robin_base": wd_base}
 
     def _get_regions_to_integrate(self):
@@ -551,7 +592,14 @@ class MetricsCalculator:
 
     def compute_regional_metrics(self, timestep_idx, t, model_history, skip_work_calc=False, current_state=None):
         metrics = {}
-        
+
+        # Initialize pressure history on first call (independent of has_previous_state)
+        # This prevents the trapezoidal average from using p_prev=0 at the first work step.
+        if not self._p_initialized and current_state:
+            self.p_LV_prev = (current_state.get("p_LV", 0.0) or 0.0) * 133.322
+            self.p_RV_prev = (current_state.get("p_RV", 0.0) or 0.0) * 133.322
+            self._p_initialized = True
+
         # 1. ALWAYS calculate state variables (Stress/Strain exist at t=0)
         # This fixes the KeyError because "mean_S_ff_LV" is now always created
         state_data = self._calculate_state_variables()
@@ -610,12 +658,7 @@ class MetricsCalculator:
             
             #exact work keys
             metrics["work_boundary_exact_LV"] = 0.0
-            metrics["work_boundary_exact_RV"] = 0.0    
-
-            # Initialize Pressure History for Trapezoidal Integration
-            if current_state:
-                self.p_LV_prev = (current_state.get("p_LV", 0.0) or 0.0) * 133.322
-                self.p_RV_prev = (current_state.get("p_RV", 0.0) or 0.0) * 133.322
+            metrics["work_boundary_exact_RV"] = 0.0
         
         #print(metrics)
         
@@ -623,22 +666,37 @@ class MetricsCalculator:
     
     def _calculate_boundary_work_exact(self, current_state):
         """
-        Calculates EXACT external work via surface integration: W = Integral( -P * (du . n) * ds )
-        This is the rigorous counterpart to 'P * dV'.
-        USING TRAPEZOIDAL RULE: W = - 0.5 * (P_new + P_old) * Integral( du . n )
+        Calculates EXACT external work via surface integration with Nanson's formula:
+            W = -P_avg * ∫ du · (J F⁻ᵀ N) dS₀
+
+        The cavity pressure is a follower load acting on the DEFORMED surface.
+        Nanson's formula transforms the reference normal/area to the current config:
+            n da = J F⁻ᵀ N dA
+
+        Without this transform, the boundary work is underestimated at large deformations.
+        TRAPEZOIDAL RULE applied to pressure: P_avg = 0.5 * (P_new + P_old)
         """
         # 1. Setup
         du = self.problem.u - self._u_prev if hasattr(self, '_u_prev') else self.problem.u
-        n = ufl.FacetNormal(self.mesh)
-        
+        N = ufl.FacetNormal(self.mesh)  # Reference normal
+
+        # Deformation gradient (current configuration)
+        I = ufl.Identity(3)
+        F = ufl.grad(self.problem.u) + I
+        J = ufl.det(F)
+
+        # Nanson's formula: n da = J F⁻ᵀ N dA
+        # This is the deformed area-weighted normal expressed on the reference surface
+        cofac_F_N = J * ufl.dot(ufl.inv(F).T, N)
+
         # Pressure (Convert mmHg -> Pa)
         p_LV = (current_state.get("p_LV", 0.0) or 0.0) * 133.322
         p_RV = (current_state.get("p_RV", 0.0) or 0.0) * 133.322
-        
+
         # Trapezoidal Average Pressure
         p_LV_avg = 0.5 * (p_LV + self.p_LV_prev)
         p_RV_avg = 0.5 * (p_RV + self.p_RV_prev)
-        
+
         # Update History
         self.p_LV_prev = p_LV
         self.p_RV_prev = p_RV
@@ -647,27 +705,22 @@ class MetricsCalculator:
         lv_marker_name = "LV" if "LV" in self.geometry.markers else "ENDO_LV"
         rv_marker_name = "RV" if "RV" in self.geometry.markers else "ENDO_RV"
 
-        tag_endo_lv = self.geometry.markers[lv_marker_name][0]  
-        tag_endo_rv = self.geometry.markers[rv_marker_name][0]  
-        
-        ds = ufl.Measure("ds", domain=self.mesh, subdomain_data=self.geometry.facet_tags)
-    
-        # 3. Define Forms
-        # Force = -Pressure * Normal (Normal points OUT of wall, INTO cavity)
-        # Work = Force . Displacement
-        
-        # Total LV Cavity Surface Work
-        form_work_bnd_LV = -p_LV_avg * ufl.inner(du, n) * ds(tag_endo_lv)
-        
-        # Total RV Cavity Surface Work
-        form_work_bnd_RV = -p_RV_avg * ufl.inner(du, n) * ds(tag_endo_rv)
+        tag_endo_lv = self.geometry.markers[lv_marker_name][0]
+        tag_endo_rv = self.geometry.markers[rv_marker_name][0]
 
-        
-        # 4. Assembly (Standard Cavity)
+        ds = ufl.Measure("ds", domain=self.mesh, subdomain_data=self.geometry.facet_tags)
+
+        # 3. Define Forms (with Nanson transform for follower-load pressure)
+        # Force per ref area = -P * J * F⁻ᵀ * N
+        # Work = Force · du integrated over reference surface dS₀
+        form_work_bnd_LV = -p_LV_avg * ufl.inner(du, cofac_F_N) * ds(tag_endo_lv)
+        form_work_bnd_RV = -p_RV_avg * ufl.inner(du, cofac_F_N) * ds(tag_endo_rv)
+
+        # 4. Assembly
         w_bnd_LV = self.comm.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(form_work_bnd_LV)), op=MPI.SUM)
         w_bnd_RV = self.comm.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(form_work_bnd_RV)), op=MPI.SUM)
 
         return {
-            "work_boundary_exact_LV": w_bnd_LV, 
+            "work_boundary_exact_LV": w_bnd_LV,
             "work_boundary_exact_RV": w_bnd_RV,
         }
