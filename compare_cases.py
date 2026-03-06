@@ -37,25 +37,31 @@ from pathlib import Path
 
 def load_metrics(folder):
     """
-    Load metrics from folder. Prefers analysis_last_beat/ subdirectory if present,
-    then falls back to the folder itself.
+    Load metrics from folder. Search order:
+      1. analysis/last_beat/  (new layout)
+      2. analysis_last_beat/  (legacy layout)
+      3. metrics/             (new layout, full data)
+      4. root folder          (legacy layout)
     """
     path = Path(folder)
 
-    last_beat = path / "analysis_last_beat"
-    if last_beat.exists():
-        files = sorted(last_beat.glob("metrics_downsample_*.npy"),
-                       key=lambda p: len(str(p)))
+    # Try new layout first, then legacy
+    search_dirs = [
+        path / "analysis" / "last_beat",
+        path / "analysis_last_beat",
+        path / "metrics",
+        path,
+    ]
+    for d in search_dirs:
+        if not d.exists():
+            continue
+        files = sorted(d.glob("metrics_downsample_*.npy"), key=lambda p: len(str(p)))
         if files:
-            print(f"  Loading (last beat): {files[0]}")
+            print(f"  Loading: {files[0]}")
             return np.load(files[0], allow_pickle=True).item()
 
-    files = sorted(path.glob("metrics_downsample_*.npy"), key=lambda p: len(str(p)))
-    if not files:
-        print(f"  No metrics found in {folder}")
-        return None
-    print(f"  Loading (direct): {files[0]}")
-    return np.load(files[0], allow_pickle=True).item()
+    print(f"  No metrics found in {folder}")
+    return None
 
 
 def total_work(m, key):

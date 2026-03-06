@@ -32,9 +32,13 @@ def main():
     print(f"Starting Analysis on: {results_dir}")
 
     # --- 0. Run Metrics Computation if Needed ---
-    metrics_files = sorted(list(results_dir.glob("metrics_downsample_*.npy")))
+    metrics_subdir = results_dir / "metrics"
+    # Look in metrics/ first, then root (legacy)
+    metrics_files = sorted(list(metrics_subdir.glob("metrics_downsample_*.npy")))
+    if not metrics_files:
+        metrics_files = sorted(list(results_dir.glob("metrics_downsample_*.npy")))
     sim_params_file = results_dir / "simulation_params.json"
-    checkpoint_file = results_dir / "function_checkpoint.bp"
+    checkpoint_file = results_dir / "solver" / "checkpoint.bp"
 
     if not metrics_files and sim_params_file.exists() and checkpoint_file.exists():
         print("No metrics files found — running postprocess_metrics.py to compute them...")
@@ -52,8 +56,10 @@ def main():
             if result.returncode != 0:
                 print("ERROR: postprocess_metrics.py failed")
                 sys.exit(1)
-            # Refresh metrics files list
-            metrics_files = sorted(list(results_dir.glob("metrics_downsample_*.npy")))
+            # Refresh metrics files list (check metrics/ subdir first)
+            metrics_files = sorted(list(metrics_subdir.glob("metrics_downsample_*.npy")))
+            if not metrics_files:
+                metrics_files = sorted(list(results_dir.glob("metrics_downsample_*.npy")))
         else:
             print(f"ERROR: {postprocess_script} not found")
             sys.exit(1)
@@ -83,10 +89,12 @@ def main():
         print("⚠️  parameters.json not found. Defaulting to 0.8s.")
 
     # --- 2. Load Metrics ---
-    # Find the metrics file (prefer downsample_1)
-    metrics_files = sorted(list(results_dir.glob("metrics_downsample_*.npy")), key=lambda p: len(p.name))
+    # Find the metrics file (prefer downsample_1); check metrics/ subdir, then root (legacy)
+    metrics_files = sorted(list(metrics_subdir.glob("metrics_downsample_*.npy")), key=lambda p: len(p.name))
     if not metrics_files:
-        print("❌ Error: No metrics_downsample_*.npy files found.")
+        metrics_files = sorted(list(results_dir.glob("metrics_downsample_*.npy")), key=lambda p: len(p.name))
+    if not metrics_files:
+        print("Error: No metrics_downsample_*.npy files found.")
         sys.exit(1)
     
     src_metrics_path = metrics_files[0]
@@ -111,8 +119,10 @@ def main():
     last_beat_start = final_time - cycle_length
     
     # --- 3. Create Analysis Directories ---
-    all_beats_dir = results_dir / "analysis_all_beats"
-    last_beat_dir = results_dir / "analysis_last_beat"
+    analysis_dir = results_dir / "analysis"
+    analysis_dir.mkdir(exist_ok=True)
+    all_beats_dir = analysis_dir / "all_beats"
+    last_beat_dir = analysis_dir / "last_beat"
     
     all_beats_dir.mkdir(exist_ok=True)
     last_beat_dir.mkdir(exist_ok=True)
@@ -224,46 +234,108 @@ def main():
 
 def organize_results(results_dir):
     """
-    Move circulation model outputs into circulation/ subdirectory
-    and clean up redundant files.
+    Organize simulation outputs into a clean directory structure:
+      solver/        — FEM checkpoint data (displacement, Ta, prestress)
+      geometry/      — mesh, fibers, markers
+      circulation/   — 0D model data
+      visualization/ — ParaView-ready files
+      metrics/       — computed offline by postprocess_metrics.py
+      analysis/      — plots and reports
     """
     import shutil
 
+    # --- 1. Circulation files (written to root by circulation model) ---
     circ_dir = results_dir / "circulation"
     circ_dir.mkdir(exist_ok=True)
-
-    # Files written by circulation/base.py:save_state() — move to circulation/
     circ_files = [
-        "history.npy",
-        "state.npy",
-        "initial_conditions.json",
-        "parameters.json",
-        "0D_circulation_pv.png",
+        "history.npy", "state.npy", "initial_conditions.json",
+        "parameters.json", "0D_circulation_pv.png",
     ]
     for fname in circ_files:
         src = results_dir / fname
         dst = circ_dir / fname
         if src.exists() and not dst.exists():
             shutil.move(str(src), str(dst))
-            print(f"  Moved {fname} → circulation/")
+            print(f"  Moved {fname} -> circulation/")
 
-    # Symlink parameters.json back to root (run_postprocessing needs it there)
+    # Symlink parameters.json back to root (needed by this script for HR)
     params_link = results_dir / "parameters.json"
     params_real = circ_dir / "parameters.json"
     if params_real.exists() and not params_link.exists():
         params_link.symlink_to(params_real)
 
-    # Redundant files: output.json duplicates history.npy at lower resolution
+    # --- 2. Visualization files (written to root by geometry_generator) ---
+    viz_dir = results_dir / "visualization"
+    viz_dir.mkdir(exist_ok=True)
+    viz_files = [
+        "markers_scalar.xdmf", "markers_scalar.h5",
+        "debug_surfaces.xdmf", "debug_surfaces.h5",
+        "fiber_directions.bp", "fiber_directions.h5", "fiber_directions.xdmf",
+        "activation.png",
+    ]
+    for fname in viz_files:
+        src = results_dir / fname
+        dst = viz_dir / fname
+        if src.exists() and not dst.exists():
+            if src.is_dir():
+                shutil.move(str(src), str(dst))
+            else:
+                shutil.move(str(src), str(dst))
+            print(f"  Moved {fname} -> visualization/")
+
+    # --- 3. Legacy solver files (from old directory layout) ---
+    solver_dir = results_dir / "solver"
+    solver_dir.mkdir(exist_ok=True)
+    legacy_solver = {
+        "function_checkpoint.bp": "checkpoint.bp",
+        "prestress_biv_backward.bp": "prestress_backward.bp",
+        "prestress_biv_inverse.bp": "prestress_inverse.bp",
+        "Ta_history.npy": "Ta_history.npy",
+        "Ta_solver_history.npy": "Ta_solver_history.npy",
+    }
+    for old_name, new_name in legacy_solver.items():
+        src = results_dir / old_name
+        dst = solver_dir / new_name
+        if src.exists() and not dst.exists():
+            shutil.move(str(src), str(dst))
+            print(f"  Moved {old_name} -> solver/{new_name}")
+
+    # --- 4. Legacy metrics files (move to metrics/) ---
+    metrics_dir = results_dir / "metrics"
+    metrics_dir.mkdir(exist_ok=True)
+    for f in results_dir.glob("metrics_downsample_*.npy"):
+        dst = metrics_dir / f.name
+        if not dst.exists():
+            shutil.move(str(f), str(dst))
+            print(f"  Moved {f.name} -> metrics/")
+
+    # --- 5. Legacy analysis directories ---
+    analysis_dir = results_dir / "analysis"
+    analysis_dir.mkdir(exist_ok=True)
+    legacy_analysis = {
+        "analysis_all_beats": "all_beats",
+        "analysis_last_beat": "last_beat",
+    }
+    for old_name, new_name in legacy_analysis.items():
+        src = results_dir / old_name
+        dst = analysis_dir / new_name
+        if src.exists() and not dst.exists():
+            shutil.move(str(src), str(dst))
+            print(f"  Moved {old_name} -> analysis/{new_name}")
+
+    # --- 6. Legacy VTX visualization (from old layout) ---
+    for vtx_name in ["displacement.bp", "stress_strain.bp", "pressure.bp"]:
+        src = results_dir / vtx_name
+        dst = viz_dir / vtx_name
+        if src.exists() and not dst.exists():
+            shutil.move(str(src), str(dst))
+            print(f"  Moved {vtx_name} -> visualization/")
+
+    # --- 7. Clean up redundant files ---
     redundant = [
-        "output.json",          # subset of history.npy at lower resolution
-        "results_state.txt",    # raw 0D state matrix, redundant with history.npy
-        "results_var.txt",      # raw 0D var matrix, redundant with history.npy
-        "time.txt",             # raw time vector, in history.npy and metrics
-        "state.txt",            # final state text, redundant with state.npy
-        "state_names.txt",      # 12 variable names, in code
-        "var_names.txt",        # 9 variable names, in code
-        "active_mechanics_trace.csv",  # same data as metrics_downsample_1.npy
-        "metrics_downsample_5.npy",    # keep only 1 (full) and 10 (quick)
+        "output.json", "results_state.txt", "results_var.txt",
+        "time.txt", "state.txt", "state_names.txt", "var_names.txt",
+        "active_mechanics_trace.csv", "metrics_downsample_5.npy",
     ]
     for fname in redundant:
         fpath = results_dir / fname

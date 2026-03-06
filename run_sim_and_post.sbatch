@@ -233,7 +233,7 @@ fi
 echo "Running Offline Metrics Computation..."
 cd ${RESULTS_DIR}
 
-if [ -f "simulation_params.json" ] && [ -d "function_checkpoint.bp" ]; then
+if [ -f "simulation_params.json" ] && [ -d "solver/checkpoint.bp" ]; then
     # Compute metrics from checkpoint (replays displacement + Ta)
     $CONDA_PREFIX/bin/mpirun -n ${SLURM_NTASKS} -launcher fork $CONDA_PREFIX/bin/python ${SIM_DIR}/postprocess_metrics.py .
     echo "✓ Metrics computed"

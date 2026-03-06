@@ -6,11 +6,11 @@ Reconstructs the FEM problem from saved checkpoint data and replays the displace
 history to compute all work/stress/strain metrics without re-running the solver.
 
 Required files in results_dir:
-  - function_checkpoint.bp   (displacement at each timestep)
-  - simulation_params.json   (material params, BCs, activation settings)
-  - Ta_solver_history.npy    (active tension per timestep: [N, 3] for [LV, Sep, RV])
-  - geometry/geometry.bp     (mesh, facet tags, region markers)
-  - circulation/history.npy  (pressure/volume from 0D model)
+  - solver/checkpoint.bp         (displacement at each timestep)
+  - solver/Ta_solver_history.npy (active tension per timestep: [N, 3] for [LV, Sep, RV])
+  - simulation_params.json       (material params, BCs, activation settings)
+  - geometry/geometry.bp         (mesh, facet tags, region markers)
+  - circulation/history.npy      (pressure/volume from 0D model)
 
 Usage:
   python3 postprocess_metrics.py <results_directory>
@@ -62,7 +62,8 @@ if rank == 0:
 
 # ─── 2. Load Ta History ──────────────────────────────────────────────────────
 
-ta_path = results_dir / "Ta_solver_history.npy"
+solver_dir = results_dir / "solver"
+ta_path = solver_dir / "Ta_solver_history.npy"
 if not ta_path.exists():
     logger.error(f"Missing {ta_path} — cannot reconstruct active stress")
     sys.exit(1)
@@ -99,7 +100,7 @@ if rank == 0:
 
 # ─── 5. Apply Prestress (Deform to Reference Configuration) ──────────────────
 
-prestress_fname = results_dir / "prestress_biv_backward.bp"
+prestress_fname = solver_dir / "prestress_inverse.bp"
 if not prestress_fname.exists():
     logger.error(f"Missing prestress file: {prestress_fname}")
     sys.exit(1)
@@ -249,7 +250,7 @@ if rank == 0:
 
 # ─── 8. Read Displacement Timestamps ─────────────────────────────────────────
 
-checkpoint_path = results_dir / "function_checkpoint.bp"
+checkpoint_path = solver_dir / "checkpoint.bp"
 if not checkpoint_path.exists():
     logger.error(f"Missing {checkpoint_path}")
     sys.exit(1)
@@ -350,8 +351,10 @@ for i in range(n_steps):
 
 # ─── 11. Save Metrics ────────────────────────────────────────────────────────
 
+metrics_dir = results_dir / "metrics"
 if rank == 0:
+    metrics_dir.mkdir(exist_ok=True)
     logger.info("Saving metrics...")
-    metrics_calc.save_metrics(results_dir, downsample_factors=[1, 10])
-    logger.info(f"Metrics saved to {results_dir}")
+    metrics_calc.save_metrics(metrics_dir, downsample_factors=[1, 10])
+    logger.info(f"Metrics saved to {metrics_dir}")
     logger.info("Done. Run run_postprocessing.py for plots and analysis.")

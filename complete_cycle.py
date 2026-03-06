@@ -137,6 +137,8 @@ comm = MPI.COMM_WORLD
 # Rank 0 handles directory creation
 if comm.rank == 0:
     outdir.mkdir(parents=True, exist_ok=True)
+    (outdir / "solver").mkdir(exist_ok=True)
+    (outdir / "visualization").mkdir(exist_ok=True)
 comm.barrier()
 geodir = Path(args.geometry_dir) if args.geometry_dir else None
 
@@ -430,7 +432,7 @@ if comm.rank == 0:
     ax.grid(True, alpha=0.3)
     ax.set_ylim([0, 110])
 
-    fig.savefig(outdir / "activation.png", dpi=150, bbox_inches='tight')
+    fig.savefig(outdir / "visualization" / "activation.png", dpi=150, bbox_inches='tight')
     plt.close(fig)
 
 
@@ -545,7 +547,10 @@ bcs_prestress = pulse.BoundaryConditions(
     robin=robin, dirichlet=(dirichlet_bc,), neumann=(neumann_lv, neumann_rv),
 )
 
-prestress_fname = outdir / "prestress_biv_inverse.bp"
+solver_dir = outdir / "solver"
+viz_dir = outdir / "visualization"
+
+prestress_fname = solver_dir / "prestress_inverse.bp"
 if not prestress_fname.exists():
     logger.info("Start prestressing (Using Compressible Formulation for Stability)...")
     prestress_problem = pulse.unloading.PrestressProblem(
@@ -562,7 +567,7 @@ if not prestress_fname.exists():
     u_pre = prestress_problem.unload()
     adios4dolfinx.write_function_on_input_mesh(prestress_fname, u_pre, time=0.0, name="u_pre")
     with dolfinx.io.VTXWriter(
-        comm, outdir / "prestress_biv_backward.bp", [u_pre], engine="BP4",
+        comm, solver_dir / "prestress_backward.bp", [u_pre], engine="BP4",
     ) as vtx:
         vtx.write(0.0)
 
@@ -655,13 +660,12 @@ fiber_strain = dolfinx.fem.Function(W, name="fiber_strain")
 fiber_strain_expr = dolfinx.fem.Expression(ufl.inner(E * f0_map, f0_map), W.element.interpolation_points)
 
 # Writers
-vtx_u = dolfinx.io.VTXWriter(geometry.mesh.comm, outdir / "displacement.bp", [u_disp], engine="BP4")
+# Visualization writers (ParaView)
+vtx_u = dolfinx.io.VTXWriter(geometry.mesh.comm, viz_dir / "displacement.bp", [u_disp], engine="BP4")
 vtx_p = None
 if args.incompressible:
-    # problem.p returns pressure subfunction
-    vtx_p = dolfinx.io.VTXWriter(geometry.mesh.comm, outdir / "pressure.bp", [problem.p], engine="BP4")
-# Edited to include Ta
-vtx_stress = dolfinx.io.VTXWriter(geometry.mesh.comm, outdir / "stress_strain.bp", [fiber_stress, fiber_strain, Ta.value], engine="BP4")
+    vtx_p = dolfinx.io.VTXWriter(geometry.mesh.comm, viz_dir / "pressure.bp", [problem.p], engine="BP4")
+vtx_stress = dolfinx.io.VTXWriter(geometry.mesh.comm, viz_dir / "stress_strain.bp", [fiber_stress, fiber_strain, Ta.value], engine="BP4")
 
 # --- Inflation (Reference -> End-Diastole) ---
 
@@ -764,15 +768,14 @@ def p_BiV_func(V_LV, V_RV, t):
 
 # --- Checkpointing and Callback ---
 
-filename = outdir / Path("function_checkpoint.bp")
+checkpoint_file = solver_dir / "checkpoint.bp"
 if comm.rank == 0:
-    shutil.rmtree(filename, ignore_errors=True)
+    shutil.rmtree(checkpoint_file, ignore_errors=True)
 comm.barrier()
 
-adios4dolfinx.write_mesh(filename, geometry.mesh)
-adios4dolfinx.write_meshtags(filename, mesh=geometry.mesh, meshtags=geometry.facet_tags, meshtag_name="ffun")
-# Write the markers_mt from V1 logic as well
-adios4dolfinx.write_meshtags(filename, mesh=geometry.mesh, meshtags=geo.additional_data["markers_mt"], meshtag_name="cfun")
+adios4dolfinx.write_mesh(checkpoint_file, geometry.mesh)
+adios4dolfinx.write_meshtags(checkpoint_file, mesh=geometry.mesh, meshtags=geometry.facet_tags, meshtag_name="ffun")
+adios4dolfinx.write_meshtags(checkpoint_file, mesh=geometry.mesh, meshtags=geo.additional_data["markers_mt"], meshtag_name="cfun")
 
 Ta_history: list = []
 Ta_solver_history: list = []
@@ -802,7 +805,7 @@ def callback(model, i: int, t: float, save=True):
         if vtx_p:
             vtx_p.write(t)
         vtx_stress.write(t)
-        adios4dolfinx.write_function(filename, u=problem.u, name="displacement", time=t)
+        adios4dolfinx.write_function(checkpoint_file, u=problem.u, name="displacement", time=t)
 
 # --- Run Simulation ---
 
@@ -841,8 +844,8 @@ finally:
         logger.info("Saving simulation checkpoint data for offline postprocessing...")
         try:
             # Save Ta history: [N_timesteps, 3] array with [LV, Septum, RV] activation (kPa)
-            np.save(outdir / "Ta_history.npy", np.array(Ta_history))
-            np.save(outdir / "Ta_solver_history.npy", np.array(Ta_solver_history))
+            np.save(solver_dir / "Ta_history.npy", np.array(Ta_history))
+            np.save(solver_dir / "Ta_solver_history.npy", np.array(Ta_solver_history))
             logger.info(f"  Ta history saved: {len(Ta_history)} timesteps")
 
             # Save simulation parameters needed for offline reconstruction
