@@ -179,6 +179,22 @@ def generate_and_load(comm, outdir, args, logger, manual_refinement=False, geodi
             xdmf.write_mesh(geo.mesh)
             xdmf.write_meshtags(geo.ffun, geo.mesh.geometry)
 
+        # Export fiber directions as VTX/BP for ParaView visualization
+        logger.info("Exporting fiber directions (VTX) for ParaView...")
+        fiber_viz_fields = []
+        system_fibers.f0.name = "f0_fiber"
+        fiber_viz_fields.append(system_fibers.f0)
+        system_fibers.s0.name = "s0_sheet"
+        fiber_viz_fields.append(system_fibers.s0)
+        system_fibers.n0.name = "n0_sheet_normal"
+        fiber_viz_fields.append(system_fibers.n0)
+        if system_fibers.apex_gradient is not None:
+            system_fibers.apex_gradient.name = "l0_longitudinal"
+            fiber_viz_fields.append(system_fibers.apex_gradient)
+            logger.info("  Wrote l0_longitudinal (apex_gradient) to fiber_directions.bp")
+        with dolfinx.io.VTXWriter(MPI.COMM_SELF, outdir / "fiber_directions.bp", fiber_viz_fields) as vtx:
+            vtx.write(0.0)
+
     # ========================================================================
     # PHASE 2: SYNCHRONIZATION & LOADING (All Ranks)
     # ========================================================================
