@@ -33,6 +33,8 @@ def main():
 
     # --- 1. Determine Cycle Length ---
     params_file = results_dir / "parameters.json"
+    if not params_file.exists():
+        params_file = results_dir / "circulation" / "parameters.json"
     cycle_length = 0.8 # Default
     
     if params_file.exists():
@@ -183,7 +185,62 @@ def main():
             cmd_plot = [sys.executable, str(plot_loops_script), str(work_dir)]
             subprocess.run(cmd_plot, env=env, check=False)
 
+    # --- 7. Organize Results into Subdirectories ---
+    print("\n--- 📁 Organizing results ---")
+    organize_results(results_dir)
+
     print(f"\n✅ Analysis pipeline finished for: {results_dir.name}")
+
+
+def organize_results(results_dir):
+    """
+    Move circulation model outputs into circulation/ subdirectory
+    and clean up redundant files.
+    """
+    import shutil
+
+    circ_dir = results_dir / "circulation"
+    circ_dir.mkdir(exist_ok=True)
+
+    # Files written by circulation/base.py:save_state() — move to circulation/
+    circ_files = [
+        "history.npy",
+        "state.npy",
+        "initial_conditions.json",
+        "parameters.json",
+        "0D_circulation_pv.png",
+    ]
+    for fname in circ_files:
+        src = results_dir / fname
+        dst = circ_dir / fname
+        if src.exists() and not dst.exists():
+            shutil.move(str(src), str(dst))
+            print(f"  Moved {fname} → circulation/")
+
+    # Symlink parameters.json back to root (run_postprocessing needs it there)
+    params_link = results_dir / "parameters.json"
+    params_real = circ_dir / "parameters.json"
+    if params_real.exists() and not params_link.exists():
+        params_link.symlink_to(params_real)
+
+    # Redundant files: output.json duplicates history.npy at lower resolution
+    redundant = [
+        "output.json",          # subset of history.npy at lower resolution
+        "results_state.txt",    # raw 0D state matrix, redundant with history.npy
+        "results_var.txt",      # raw 0D var matrix, redundant with history.npy
+        "time.txt",             # raw time vector, in history.npy and metrics
+        "state.txt",            # final state text, redundant with state.npy
+        "state_names.txt",      # 12 variable names, in code
+        "var_names.txt",        # 9 variable names, in code
+        "active_mechanics_trace.csv",  # same data as metrics_downsample_1.npy
+        "metrics_downsample_5.npy",    # keep only 1 (full) and 10 (quick)
+    ]
+    for fname in redundant:
+        fpath = results_dir / fname
+        if fpath.exists():
+            fpath.unlink()
+            print(f"  Removed {fname} (redundant)")
+
 
 if __name__ == "__main__":
     main()

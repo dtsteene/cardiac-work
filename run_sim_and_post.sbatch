@@ -2,7 +2,7 @@
 
 # --- Slurm Job Configuration ---
 #SBATCH --job-name=cardiac_sim
-#SBATCH --partition=mi50q    
+#SBATCH --partition=habanaq    
 #SBATCH --nodes=1
 #SBATCH --ntasks=8
 #SBATCH --cpus-per-task=1
@@ -83,7 +83,31 @@ elif [ "$MESH" == "PAH" ]; then
 elif [ "$MESH" == "HEALTHY" ]; then
     ACTUAL_MESH_PATH="${DATA_DIR}/healthy.xdmf"
     GEO_TAG="HEALTHY"
+    HEALTHY_PARAMS_FILE="${DATA_DIR}/healthy_circulation_params.json"
+
     echo "Geometry: Healthy Preset (${ACTUAL_MESH_PATH})"
+
+    # --- HEALTHY Special Logic (mirrors PAH) ---
+    if [ "$CIRCULATION_PARAMS" == "DEFAULT" ]; then
+        echo "  ! Override: User forced DEFAULT circulation params (Ignoring Healthy JSON)."
+        CIRCULATION_PARAMS=""
+
+    elif [ -n "$CIRCULATION_PARAMS" ]; then
+        echo "  ! Override: User provided custom circulation params: $CIRCULATION_PARAMS"
+
+    else
+        if [ -f "$HEALTHY_PARAMS_FILE" ]; then
+            CIRCULATION_PARAMS="$HEALTHY_PARAMS_FILE"
+            echo "  ✓ Auto-loaded Healthy Circulation Params: $HEALTHY_PARAMS_FILE"
+        else
+            echo ""
+            echo "❌ CRITICAL ERROR: Circulation Parameters Missing"
+            echo "   Missing: $HEALTHY_PARAMS_FILE"
+            echo "   To Fix: Ensure file exists OR run with CIRCULATION_PARAMS='DEFAULT'"
+            echo ""
+            exit 1
+        fi
+    fi
 
 else
     ACTUAL_MESH_PATH="$MESH"

@@ -142,12 +142,21 @@ def generate_and_load(comm, outdir, args, logger, manual_refinement=False, geodi
         )
 
         # --- SAVE ---
+        # apex_gradient: gradient of the apex Laplace solution = true longitudinal
+        # (base-to-apex) direction, independent of fiber architecture.
+        # Needed for clinical GLS-analogue strain computation.
         additional_data = {
             "f0_DG_1": system_fibers.f0,
             "s0_DG_1": system_fibers.s0,
             "n0_DG_1": system_fibers.n0,
             "markers_mt": markers_mt,
         }
+        if system_fibers.apex_gradient is not None:
+            additional_data["apex_gradient_DG_1"] = system_fibers.apex_gradient
+            logger.info("Saved apex_gradient_DG_1 (longitudinal direction) to geometry")
+        if system.apex_gradient is not None:
+            additional_data["apex_gradient"] = system.apex_gradient
+            logger.info("Saved apex_gradient (quadrature, longitudinal direction) to geometry")
 
         if (geodir / "geometry.bp").exists():
             shutil.rmtree(geodir / "geometry.bp")

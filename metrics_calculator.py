@@ -138,29 +138,37 @@ class MetricsCalculator:
             if self.rank == 0: print(f"MetricsCalculator Warning: Could not calc regional volumes ({e}). Using defaults.")
             self.region_volumes = defaultdict(lambda: 1.0)
 
-        # --- Marker Diagnostic (verify all cells are tagged) ---
-        if self.region_tags is not None and self.rank == 0:
+        # --- Marker Diagnostic (MPI-global counts) ---
+        if self.region_tags is not None:
             tag_values = self.region_tags.values
-            unique, counts = np.unique(tag_values, return_counts=True)
-            total_cells = self.mesh.topology.index_map(3).size_local
-            tagged_cells = len(tag_values)
-            print(f"\n{'='*60}")
-            print(f"  METRICS CALCULATOR — Region Marker Diagnostic")
-            print(f"{'='*60}")
-            print(f"  Total mesh cells (local): {total_cells}")
-            print(f"  Tagged cells:             {tagged_cells}")
-            for u, c in zip(unique, counts):
-                label = {0: "UNASSIGNED", 1: "LV FreeWall", 2: "RV FreeWall", 3: "Septum", 4: "Other"}.get(int(u), f"Unknown({u})")
-                print(f"    Marker {int(u):2d} ({label:>14s}): {c:6d} cells")
-            unassigned = counts[unique == 0].sum() if 0 in unique else 0
-            if unassigned > 0:
-                print(f"  WARNING: {unassigned} cells have marker 0 (unassigned)!")
-                print(f"           These cells contribute to solver S:dE but NOT to metrics 'Whole' region.")
-            else:
-                print(f"  OK: All cells assigned to regions 1/2/3.")
-            for rname, rvol in self.region_volumes.items():
-                print(f"  Volume {rname:>8s}: {rvol:.4e} m^3")
-            print(f"{'='*60}\n")
+            # Count per marker locally, then allreduce
+            max_marker = 4
+            local_counts = np.zeros(max_marker + 1, dtype=np.int64)
+            for v in tag_values:
+                if 0 <= int(v) <= max_marker:
+                    local_counts[int(v)] += 1
+            global_counts = np.zeros_like(local_counts)
+            self.comm.Allreduce(local_counts, global_counts, op=MPI.SUM)
+            total_global = int(global_counts.sum())
+
+            if self.rank == 0:
+                print(f"\n{'='*60}")
+                print(f"  METRICS CALCULATOR — Region Marker Diagnostic")
+                print(f"{'='*60}")
+                print(f"  Total tagged cells (global): {total_global}")
+                marker_labels = {0: "UNASSIGNED", 1: "LV FreeWall", 2: "RV FreeWall", 3: "Septum", 4: "Other"}
+                for i in range(max_marker + 1):
+                    if global_counts[i] > 0:
+                        label = marker_labels.get(i, f"Unknown({i})")
+                        print(f"    Marker {i:2d} ({label:>14s}): {global_counts[i]:6d} cells")
+                if global_counts[0] > 0:
+                    print(f"  WARNING: {global_counts[0]} cells have marker 0 (unassigned)!")
+                    print(f"           These cells contribute to solver S:dE but NOT to metrics 'Whole' region.")
+                else:
+                    print(f"  OK: All cells assigned to regions 1/2/3.")
+                for rname, rvol in self.region_volumes.items():
+                    print(f"  Volume {rname:>8s}: {rvol:.4e} m^3")
+                print(f"{'='*60}\n")
 
     def _setup_expressions(self):
         u = self.problem.u
@@ -253,6 +261,14 @@ class MetricsCalculator:
         f0 = self.fiber_fields['f0']
         s0 = self.fiber_fields['s0']
         n0 = self.fiber_fields['n0']
+        l0_raw = self.fiber_fields.get('l0', None)
+
+        # Normalize l0 (apex_gradient) — it's a gradient so not unit-length
+        if l0_raw is not None:
+            l0_norm = ufl.sqrt(ufl.inner(l0_raw, l0_raw))
+            l0 = l0_raw / l0_norm
+        else:
+            l0 = None
 
         # Push forward and normalize: v = F*v0 / |F*v0|
         def push_vec(v0):
@@ -262,6 +278,7 @@ class MetricsCalculator:
         f_cur = push_vec(f0)
         s_cur = push_vec(s0)
         n_cur = push_vec(n0)
+        l_cur = push_vec(l0) if l0 is not None else None
 
         # Helper: Project Tensor T onto direction v
         def proj(T, v): return ufl.inner(ufl.dot(T, v), v)
@@ -288,11 +305,18 @@ class MetricsCalculator:
                 data[f"mean_E_ff_{region_name}"] = assemble_region(proj(self.E_cur, f0)) / vol
                 data[f"mean_E_ss_{region_name}"] = assemble_region(proj(self.E_cur, s0)) / vol
                 data[f"mean_E_nn_{region_name}"] = assemble_region(proj(self.E_cur, n0)) / vol
-                
+
+                # Longitudinal strain (true apex-to-base from Laplace gradient)
+                if l0 is not None:
+                    data[f"mean_S_ll_{region_name}"] = assemble_region(proj(self.S_total, l0)) / vol
+                    data[f"mean_E_ll_{region_name}"] = assemble_region(proj(self.E_cur, l0)) / vol
+
                 # Cauchy Stresses (True Stress) - Total
                 data[f"mean_sigma_ff_{region_name}"] = assemble_region(proj(self.sigma_total, f_cur)) / vol
                 data[f"mean_sigma_ss_{region_name}"] = assemble_region(proj(self.sigma_total, s_cur)) / vol
                 data[f"mean_sigma_nn_{region_name}"] = assemble_region(proj(self.sigma_total, n_cur)) / vol
+                if l_cur is not None:
+                    data[f"mean_sigma_ll_{region_name}"] = assemble_region(proj(self.sigma_total, l_cur)) / vol
                 
                 # Cauchy Stresses - Active
                 data[f"mean_sigma_ff_active_{region_name}"] = assemble_region(proj(self.sigma_active, f_cur)) / vol
@@ -666,28 +690,32 @@ class MetricsCalculator:
     
     def _calculate_boundary_work_exact(self, current_state):
         """
-        Calculates EXACT external work via surface integration with Nanson's formula:
-            W = -P_avg * ∫ du · (J F⁻ᵀ N) dS₀
+        Exact external work: W = -P_avg * DeltaV_cavity
 
-        The cavity pressure is a follower load acting on the DEFORMED surface.
-        Nanson's formula transforms the reference normal/area to the current config:
-            n da = J F⁻ᵀ N dA
+        Computes actual cavity volume at u_new and u_old using the same
+        divergence-theorem form as the solver:
+            V(u) = integral (-1/3) * J * dot(X+u, F^{-T} * N) ds
 
-        Without this transform, the boundary work is underestimated at large deformations.
-        TRAPEZOIDAL RULE applied to pressure: P_avg = 0.5 * (P_new + P_old)
+        This avoids the linearization error of du . cofac(F) . N which
+        systematically overestimates DeltaV at finite deformations.
         """
-        # 1. Setup
-        du = self.problem.u - self._u_prev if hasattr(self, '_u_prev') else self.problem.u
-        N = ufl.FacetNormal(self.mesh)  # Reference normal
-
-        # Deformation gradient (current configuration)
+        N = ufl.FacetNormal(self.mesh)
+        X = ufl.SpatialCoordinate(self.mesh)
         I = ufl.Identity(3)
-        F = ufl.grad(self.problem.u) + I
-        J = ufl.det(F)
+        u_cur = self.problem.u
 
-        # Nanson's formula: n da = J F⁻ᵀ N dA
-        # This is the deformed area-weighted normal expressed on the reference surface
-        cofac_F_N = J * ufl.dot(ufl.inv(F).T, N)
+        # Volume form at current configuration: V(u_cur)
+        F_cur = ufl.grad(u_cur) + I
+        J_cur = ufl.det(F_cur)
+        vol_form_cur = (-1.0 / 3.0) * J_cur * ufl.dot(X + u_cur, ufl.dot(ufl.inv(F_cur).T, N))
+
+        # Volume form at previous configuration: V(u_prev)
+        if hasattr(self, '_u_prev'):
+            F_prev = ufl.grad(self._u_prev) + I
+            J_prev = ufl.det(F_prev)
+            vol_form_prev = (-1.0 / 3.0) * J_prev * ufl.dot(X + self._u_prev, ufl.dot(ufl.inv(F_prev).T, N))
+        else:
+            vol_form_prev = vol_form_cur  # First step: dV = 0
 
         # Pressure (Convert mmHg -> Pa)
         p_LV = (current_state.get("p_LV", 0.0) or 0.0) * 133.322
@@ -701,24 +729,25 @@ class MetricsCalculator:
         self.p_LV_prev = p_LV
         self.p_RV_prev = p_RV
 
-        # 2. Define Measures
+        # Surface measures
         lv_marker_name = "LV" if "LV" in self.geometry.markers else "ENDO_LV"
         rv_marker_name = "RV" if "RV" in self.geometry.markers else "ENDO_RV"
-
-        tag_endo_lv = self.geometry.markers[lv_marker_name][0]
-        tag_endo_rv = self.geometry.markers[rv_marker_name][0]
-
+        tag_lv = self.geometry.markers[lv_marker_name][0]
+        tag_rv = self.geometry.markers[rv_marker_name][0]
         ds = ufl.Measure("ds", domain=self.mesh, subdomain_data=self.geometry.facet_tags)
 
-        # 3. Define Forms (with Nanson transform for follower-load pressure)
-        # Force per ref area = -P * J * F⁻ᵀ * N
-        # Work = Force · du integrated over reference surface dS₀
-        form_work_bnd_LV = -p_LV_avg * ufl.inner(du, cofac_F_N) * ds(tag_endo_lv)
-        form_work_bnd_RV = -p_RV_avg * ufl.inner(du, cofac_F_N) * ds(tag_endo_rv)
+        # Compute V_new and V_old for each cavity, then W = -P_avg * (V_new - V_old)
+        def assemble_surf(form, tag):
+            return self.comm.allreduce(
+                dolfinx.fem.assemble_scalar(dolfinx.fem.form(form * ds(tag))), op=MPI.SUM)
 
-        # 4. Assembly
-        w_bnd_LV = self.comm.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(form_work_bnd_LV)), op=MPI.SUM)
-        w_bnd_RV = self.comm.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(form_work_bnd_RV)), op=MPI.SUM)
+        V_LV_cur  = assemble_surf(vol_form_cur,  tag_lv)
+        V_LV_prev = assemble_surf(vol_form_prev, tag_lv)
+        V_RV_cur  = assemble_surf(vol_form_cur,  tag_rv)
+        V_RV_prev = assemble_surf(vol_form_prev, tag_rv)
+
+        w_bnd_LV = p_LV_avg * (V_LV_cur - V_LV_prev)
+        w_bnd_RV = p_RV_avg * (V_RV_cur - V_RV_prev)
 
         return {
             "work_boundary_exact_LV": w_bnd_LV,

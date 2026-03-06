@@ -69,7 +69,27 @@ def plot_clinical_dashboard(metrics, outdir):
     if p_LV is None: return
     N = len(p_LV)
     
-    # Strains (E_ff)
+    # Strains for pressure-strain (prefer longitudinal E_ll, fallback E_nn, then E_ff)
+    if "mean_E_ll_LV" in metrics:
+        ps_e_LV = get_arr(metrics, ["mean_E_ll_LV"], N)
+        ps_e_Sep = get_arr(metrics, ["mean_E_ll_Septum"], N)
+        ps_e_RV = get_arr(metrics, ["mean_E_ll_RV"], N)
+        ps_strain_label = "Longitudinal Strain E_ll (%)"
+        ps_strain_tag = "(E_ll, GLS analogue)"
+    elif "mean_E_nn_LV" in metrics:
+        ps_e_LV = get_arr(metrics, ["mean_E_nn_LV"], N)
+        ps_e_Sep = get_arr(metrics, ["mean_E_nn_Septum"], N)
+        ps_e_RV = get_arr(metrics, ["mean_E_nn_RV"], N)
+        ps_strain_label = "Sheet-Normal Strain E_nn (%)"
+        ps_strain_tag = "(E_nn, NOT true longitudinal)"
+    else:
+        ps_e_LV = get_arr(metrics, ["mean_E_ff_LV"], N)
+        ps_e_Sep = get_arr(metrics, ["mean_E_ff_Septum"], N)
+        ps_e_RV = get_arr(metrics, ["mean_E_ff_RV"], N)
+        ps_strain_label = "Fiber Strain E_ff (%)"
+        ps_strain_tag = "(E_ff, fiber)"
+
+    # Strains for stress-strain (always fiber E_ff)
     e_LV = get_arr(metrics, ["mean_E_ff_LV"], N)
     e_Sep = get_arr(metrics, ["mean_E_ff_Septum"], N)
     e_RV = get_arr(metrics, ["mean_E_ff_RV"], N)
@@ -127,9 +147,9 @@ def plot_clinical_dashboard(metrics, outdir):
 
     # --- PLOTTING ROW 2 (Pressure-Strain) ---
     # Note: Septum usually plotted against LV Pressure in clinical echo
-    plot_cycle(ax_ps_lv, e_LV, p_LV, 'tab:blue', "LV Pressure-Strain", "Strain (%)", "P_LV (mmHg)")
-    plot_cycle(ax_ps_sep, e_Sep, p_LV, 'tab:green', "Septal Pressure-Strain (vs LVP)", "Strain (%)", "P_LV (mmHg)")
-    plot_cycle(ax_ps_rv, e_RV, p_RV, 'tab:red', "RV Pressure-Strain", "Strain (%)", "P_RV (mmHg)")
+    plot_cycle(ax_ps_lv, ps_e_LV, p_LV, 'tab:blue', f"LV Pressure-Strain {ps_strain_tag}", ps_strain_label, "P_LV (mmHg)")
+    plot_cycle(ax_ps_sep, ps_e_Sep, p_LV, 'tab:green', f"Septal P-S {ps_strain_tag} (vs LVP)", ps_strain_label, "P_LV (mmHg)")
+    plot_cycle(ax_ps_rv, ps_e_RV, p_RV, 'tab:red', f"RV Pressure-Strain {ps_strain_tag}", ps_strain_label, "P_RV (mmHg)")
 
     # --- PLOTTING ROW 3 (Stress-Strain) ---
     # Convert Pa to kPa for readability
@@ -280,33 +300,33 @@ def plot_engineering_debug(metrics, outdir):
     ax4.text(0.95, 0.05, f"Net Passive: {passive_residual:.2e} J\n(Target: 0.0)", 
              transform=ax4.transAxes, ha='right', bbox=dict(facecolor='white', alpha=0.8))
 
-    # PLOT 5: The "Active vs PV" Correlation
-    # This is the plot for your new equation: W_PV ~ W_Active - W_Robin
+    # PLOT 5: Full Physics Balance
+    # W_active + W_passive + W_comp = W_PV + W_robin  (exact identity)
     ax5 = fig.add_subplot(gs[1, 1:]) # Spans 2 cols
-    
+
     E_active = np.cumsum(w_active)
+    E_passive = np.cumsum(w_passive)
+    E_comp = np.cumsum(w_comp)
     E_PV = np.cumsum(w_pv_proxy)
     E_Robin = np.cumsum(w_robin)
-    
-    # The Equation: Active = PV + Robin (Signs depend on convention, usually magnitudes sum)
-    # Let's verify the balance: W_Active (source) should match W_Sinks (PV + Robin)
-    
-    ax5.plot(time, E_active, 'r-', lw=3, label='Source: Active Work')
-    ax5.plot(time, E_PV + E_Robin, 'k--', lw=2, label='Sinks: PV Loop + Robin Springs')
-    
-    # Also show just the PV loop to show how much Robin "helps"
-    ax5.plot(time, E_PV, 'b:', lw=1, label='PV Loop Only')
-    
-    ax5.set_title("5. Physics Balance: W_Active ≈ W_PV + W_Robin", fontsize=12, fontweight='bold')
-    ax5.legend()
+
+    # LHS: Active + Passive + Compressible (= Total Internal)
+    E_LHS = E_active + E_passive + E_comp
+    # RHS: PV + Robin (= Total External)
+    E_RHS = E_PV + E_Robin
+
+    ax5.plot(time, E_LHS, 'r-', lw=3, label='Internal: Active + Passive + Comp')
+    ax5.plot(time, E_RHS, 'k--', lw=2, label='External: PV Loop + Robin Springs')
+    ax5.plot(time, E_active, 'r:', lw=1, alpha=0.5, label='Active Only')
+    ax5.plot(time, E_PV, 'b:', lw=1, alpha=0.5, label='PV Loop Only')
+
+    ax5.set_title("5. Physics Balance: W_Act + W_Pas + W_Comp = W_PV + W_Robin", fontsize=12, fontweight='bold')
+    ax5.legend(fontsize=8)
     ax5.grid(True, alpha=0.3)
-    
-    # Final Text
-    balance_err = E_active[-1] - (E_PV[-1] + E_Robin[-1]) # Assuming signs are aligned (both neg or both pos)
-    # If signs are opposite in your code, change to E_active[-1] + ...
-    
-    ax5.text(0.5, 0.5, "The Red solid line should match the Black dashed line.\nThe Blue dotted line is what goes to the blood.", 
-             transform=ax5.transAxes, ha='center', fontsize=10, bbox=dict(facecolor='white'))
+
+    balance_err = E_LHS[-1] - E_RHS[-1]
+    ax5.text(0.95, 0.05, f"Balance error: {balance_err:.2e} J",
+             transform=ax5.transAxes, ha='right', fontsize=9, bbox=dict(facecolor='white', alpha=0.8))
 
     plt.tight_layout()
     plt.savefig(outdir / "engineering_debug.png")
@@ -609,7 +629,7 @@ def save_detailed_stats(metrics, outdir):
         "Geometric_Consistency_Error_J": E_pv - E_boundary,
         "Incompressibility_Error_J": E_comp,
         "Net_Passive_Work_J": E_passive,
-        "Physics_Balance_Error_J": E_active - (E_pv + E_robin) # Source - Sinks
+        "Physics_Balance_Error_J": (E_active + E_passive + E_comp) - (E_pv + E_robin) # Internal - External
     }
 
     # --- 2. STRESS ANALYSIS STATS ---

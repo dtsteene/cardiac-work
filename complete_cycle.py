@@ -328,14 +328,56 @@ if comm.rank == 0:
 
 # Plotting 0D results (Rank 0 only)
 if comm.rank == 0:
-    fig, ax = plt.subplots(2, 2, sharex=True, sharey="row", figsize=(10, 5))
-    ax[0, 0].plot(history["V_LV"], history["p_LV"])
-    ax[0, 0].set_title("All beats")
-    ax[0, 1].plot(history["V_LV"][-1000:], history["p_LV"][-1000:])
-    ax[0, 1].set_title("Last beat")
-    ax[1, 0].plot(history["V_RV"], history["p_RV"])
-    ax[1, 1].plot(history["V_RV"][-1000:], history["p_RV"][-1000:])
-    fig.savefig(outdir / "0D_circulation_pv.png")
+    fig, ax = plt.subplots(2, 3, figsize=(16, 7), gridspec_kw={"width_ratios": [1, 1, 0.6]})
+    fig.suptitle(f"0D Circulation Model — {BPM} BPM", fontsize=14, fontweight="bold")
+
+    # PV loops
+    ax[0, 0].plot(history["V_LV"], history["p_LV"], "tab:blue")
+    ax[0, 0].set_title("LV — All beats"); ax[0, 0].set_ylabel("Pressure (mmHg)")
+    ax[0, 1].plot(history["V_LV"][-1000:], history["p_LV"][-1000:], "tab:blue")
+    ax[0, 1].set_title("LV — Last beat")
+    ax[1, 0].plot(history["V_RV"], history["p_RV"], "tab:red")
+    ax[1, 0].set_title("RV — All beats"); ax[1, 0].set_ylabel("Pressure (mmHg)")
+    ax[1, 0].set_xlabel("Volume (mL)")
+    ax[1, 1].plot(history["V_RV"][-1000:], history["p_RV"][-1000:], "tab:red")
+    ax[1, 1].set_title("RV — Last beat"); ax[1, 1].set_xlabel("Volume (mL)")
+    for a in ax[:, :2].flat:
+        a.grid(True, alpha=0.3)
+
+    # Summary stats table (last beat)
+    def _stats(v, p):
+        v_lb, p_lb = np.array(v[-1000:]), np.array(p[-1000:])
+        edv, esv = float(np.max(v_lb)), float(np.min(v_lb))
+        sv = edv - esv
+        ef = sv / edv * 100 if edv > 0 else 0
+        esp = float(np.max(p_lb))
+        edp = float(p_lb[np.argmax(v_lb)])
+        return edv, esv, sv, ef, esp, edp
+
+    lv = _stats(history["V_LV"], history["p_LV"])
+    rv = _stats(history["V_RV"], history["p_RV"])
+    co = lv[2] * BPM / 1000  # SV * HR in L/min
+
+    rows = [
+        ["", "LV", "RV"],
+        ["EDV (mL)", f"{lv[0]:.1f}", f"{rv[0]:.1f}"],
+        ["ESV (mL)", f"{lv[1]:.1f}", f"{rv[1]:.1f}"],
+        ["SV (mL)",  f"{lv[2]:.1f}", f"{rv[2]:.1f}"],
+        ["EF (%)",   f"{lv[3]:.1f}", f"{rv[3]:.1f}"],
+        ["ESP (mmHg)", f"{lv[4]:.1f}", f"{rv[4]:.1f}"],
+        ["EDP (mmHg)", f"{lv[5]:.1f}", f"{rv[5]:.1f}"],
+        ["CO (L/min)", f"{co:.2f}", ""],
+        ["HR (bpm)", f"{BPM}", ""],
+    ]
+    for a in ax[:, 2]:
+        a.axis("off")
+    tbl = ax[0, 2].table(cellText=rows[1:], colLabels=rows[0],
+                          loc="center", cellLoc="center")
+    tbl.auto_set_font_size(False); tbl.set_fontsize(9); tbl.scale(1.0, 1.4)
+    ax[0, 2].set_title("Hemodynamic Summary", fontweight="bold", fontsize=11)
+
+    fig.tight_layout()
+    fig.savefig(outdir / "0D_circulation_pv.png", dpi=150)
     plt.close(fig)
 
 # --- Activation Model (From V1: Vectorized for Scifem) ---
@@ -739,17 +781,23 @@ adios4dolfinx.write_meshtags(filename, mesh=geometry.mesh, meshtags=geo.addition
 # Log path definition moved to where metrics calculator is initialized
 trace_log_path = outdir / "active_mechanics_trace.csv"
 
-# output_file definition
-output_file = outdir / "output.json"
 Ta_history: list[float] = []
 
 # --- Initialize Metrics Calculator ---
 # Prepare fiber field dictionary in current configuration
+
+# Load apex_gradient (true longitudinal direction) if available
+l0_field = geo.additional_data.get("apex_gradient", None)
+if l0_field is not None:
+    logger.info("Loaded apex_gradient from geometry — true longitudinal direction available")
+else:
+    logger.warning("apex_gradient not found in geometry — longitudinal strain (E_ll) will not be computed")
+
 fiber_fields_map = {
     'f0': f0_quad,
     's0': s0_quad,
-    'n0': geo.n0,  # Normal (sheet normal)
-    'l0': None,    # Longitudinal (will be computed if needed)
+    'n0': geo.n0,  # Normal (sheet normal / transmural from LDRB)
+    'l0': l0_field,  # Longitudinal (apex_gradient from Laplace solution, base-to-apex)
     'c0': None,    # Circumferential (will be computed if needed)
 }
 
@@ -903,16 +951,8 @@ def callback(model, i: int, t: float, save=True):
         adios4dolfinx.write_function(filename, u=fiber_stress, name="fiber_stress", time=t)
         adios4dolfinx.write_function(filename, u=fiber_strain, name="fiber_strain", time=t)
         
-        # Save JSON history only every 10 steps to reduce I/O (redundant with CSV)
-        if comm.rank == 0 and i % 10 == 0:
-            out = {k: v[: i + 1] for k, v in model.history.items()}
-            out["Ta"] = Ta_history
-            # Ratio Coupling: Scale history volumes for output
-            V_LV = model.history["V_LV"][: i + 1] * ratio_LV
-            V_RV = model.history["V_RV"][: i + 1] * ratio_RV
-            out["V_LV"] = V_LV
-            out["V_RV"] = V_RV
-            output_file.write_text(json.dumps(out, indent=4, default=custom_json))
+        # Note: output.json removed — history.npy has same data at higher resolution.
+        # Full circulation history is saved by circulation model's save_state().
 
 # --- Run Simulation ---
 

@@ -99,7 +99,7 @@ sbatch --export=BPM=75,CHAR_LENGTH=5.0,METRICS_SPACE="DG0",COMMENT="UKB Gold Sta
 
 ### 2. Patient-Specific Healthy
 ```bash
-sbatch --export=BPM=75,MESH_PATH="data/healthy.xdmf",CIRCULATION_PARAMS="data/healthy_circulaiton_params.json",METRICS_SPACE="DG0",COMMENT="Patient Healthy SI-Fix" run_sim_and_post.sbatch
+sbatch --export=BPM=75,MESH=HEALTHY,METRICS_SPACE="DG0",COMMENT="Patient Healthy baseline_v15" run_sim_and_post.sbatch
 ```
 
 ### 3. Patient-Specific PAH (Validating Disease)
