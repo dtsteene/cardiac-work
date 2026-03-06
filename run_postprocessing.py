@@ -29,7 +29,37 @@ def main():
         print(f"Error: Directory {results_dir} does not exist.")
         sys.exit(1)
 
-    print(f"🚀 Starting Analysis on: {results_dir}")
+    print(f"Starting Analysis on: {results_dir}")
+
+    # --- 0. Run Metrics Computation if Needed ---
+    metrics_files = sorted(list(results_dir.glob("metrics_downsample_*.npy")))
+    sim_params_file = results_dir / "simulation_params.json"
+    checkpoint_file = results_dir / "function_checkpoint.bp"
+
+    if not metrics_files and sim_params_file.exists() and checkpoint_file.exists():
+        print("No metrics files found — running postprocess_metrics.py to compute them...")
+        script_dir = Path(__file__).resolve().parent
+        postprocess_script = script_dir / "postprocess_metrics.py"
+        if postprocess_script.exists():
+            # Use mpirun if available, otherwise single process
+            import shutil
+            mpirun = shutil.which("mpirun")
+            if mpirun:
+                cmd = [mpirun, "-n", "1", sys.executable, str(postprocess_script), str(results_dir)]
+            else:
+                cmd = [sys.executable, str(postprocess_script), str(results_dir)]
+            result = subprocess.run(cmd, check=False)
+            if result.returncode != 0:
+                print("ERROR: postprocess_metrics.py failed")
+                sys.exit(1)
+            # Refresh metrics files list
+            metrics_files = sorted(list(results_dir.glob("metrics_downsample_*.npy")))
+        else:
+            print(f"ERROR: {postprocess_script} not found")
+            sys.exit(1)
+    elif not metrics_files:
+        print("ERROR: No metrics files and no checkpoint data for recomputation")
+        sys.exit(1)
 
     # --- 1. Determine Cycle Length ---
     params_file = results_dir / "parameters.json"

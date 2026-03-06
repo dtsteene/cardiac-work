@@ -762,9 +762,6 @@ def p_BiV_func(V_LV, V_RV, t):
 
     return circulation.units.kPa_to_mmHg(lv_p_kPa), circulation.units.kPa_to_mmHg(rv_p_kPa)
 
-# --- Import Metrics Calculator ---
-from metrics_calculator import MetricsCalculator
-
 # --- Checkpointing and Callback ---
 
 filename = outdir / Path("function_checkpoint.bp")
@@ -777,182 +774,35 @@ adios4dolfinx.write_meshtags(filename, mesh=geometry.mesh, meshtags=geometry.fac
 # Write the markers_mt from V1 logic as well
 adios4dolfinx.write_meshtags(filename, mesh=geometry.mesh, meshtags=geo.additional_data["markers_mt"], meshtag_name="cfun")
 
-# --- Setup "Sublime" Logging ---
-# Log path definition moved to where metrics calculator is initialized
-trace_log_path = outdir / "active_mechanics_trace.csv"
-
-Ta_history: list[float] = []
-
-# --- Initialize Metrics Calculator ---
-# Prepare fiber field dictionary in current configuration
-
-# Load apex_gradient (true longitudinal direction) if available
-l0_field = geo.additional_data.get("apex_gradient", None)
-if l0_field is not None:
-    logger.info("Loaded apex_gradient from geometry — true longitudinal direction available")
-else:
-    logger.warning("apex_gradient not found in geometry — longitudinal strain (E_ll) will not be computed")
-
-fiber_fields_map = {
-    'f0': f0_quad,
-    's0': s0_quad,
-    'n0': geo.n0,  # Normal (sheet normal / transmural from LDRB)
-    'l0': l0_field,  # Longitudinal (apex_gradient from Laplace solution, base-to-apex)
-    'c0': None,    # Circumferential (will be computed if needed)
-}
-
-# [FIX 1] Use the High-Fidelity Quadrature Fibers for the metrics model
-# We must use 'f0_quad' (Integration Point values), not 'f0_map' (Nodal projection).
-# This ensures the active stress tensor (Ta * f x f) is identical to the solver's.
-active_metrics_high_res = pulse.ActiveStress(f0_quad, activation=Ta)
-
-# [FIX 2] Reuse the Solver's exact physics objects
-# This prevents "Zombie" parameters where the metrics use different bulk moduli or material constants.
-metrics_model = pulse.CardiacModel(
-    material=model.material,             # Reuse Solver's Material Instance
-    active=active_metrics_high_res,      # Use High-Res Fibers
-    compressibility=model.compressibility # Reuse Solver's Compressibility Instance
-)
-
-# [FIX 3] Force Metrics Space to Match Solver Resolution
-# We override the command line argument to avoid "Resolution Mismatch" errors.
-# The solver uses Quadrature-6, so the metrics must too to prevent interpolation crashes.
-metrics_type_arg = ("Quadrature", 6)
-if comm.rank == 0:
-    logger.info(f"Forcing metrics space to {metrics_type_arg} to match solver fidelity.")
-
-# if args.metrics_space.lower().startswith("quadrature"):
-#     try:
-#         deg = int(args.metrics_space.lower().replace("quadrature", ""))
-#         metrics_type_arg = ("Quadrature", deg)
-#     except ValueError:
-#         metrics_type_arg = ("Quadrature", 4) # Default fallback
-# elif args.metrics_space.startswith("DG"):
-#     try:
-#         deg = int(args.metrics_space.replace("DG", ""))
-#         metrics_type_arg = ("DG", deg)
-#     except ValueError:
-#         metrics_type_arg = ("DG", 1)
-# else:
-#     # Default fallback for unknown strings
-#     metrics_type_arg = ("DG", 1)
-
-metrics_calc = MetricsCalculator(
-    geometry=geometry,
-    geo=geo,
-    fiber_field_map=fiber_fields_map,
-    problem=problem,
-    comm=comm,
-    cardiac_model=metrics_model,  # <--- PASS THE CORRECTED MODEL
-    metrics_space_type=metrics_type_arg,
-    alpha_epi=args.alpha_epi,
-    alpha_base=args.alpha_base,
-    hydro_pressure=problem.p if args.incompressible else None
-)
-
-# Streamlined logging: Setup CSV trace inside metrics calculator
-metrics_calc.setup_csv_logging(trace_log_path)
-
-if comm.rank == 0:
-    logger.info("Metrics calculator initialized for True Work vs Clinical Proxies")
+Ta_history: list = []
+Ta_solver_history: list = []
 
 def callback(model, i: int, t: float, save=True):
-    # 1. Update Inputs
-    # Note: get_activation is called here primarily to ensure Ta_history is updated and for input logging.
-    # The actual update of the solver's Ta should generally be handled by the circulation model logic (p_BiV_func)
-    # or if this simulation is just feed-forward, then here.
-    # Assuming standard flow where p_BiV_func also calls get_activation, there's no harm calling it here for reading.
+    # 1. Record activation for postprocessing
     raw_activation_vec = get_activation(t)
-    # Just grab the max for logging purposes (since it's an array [LV, Sept, RV])
-    ta_input_val = np.max(raw_activation_vec)
     Ta_history.append(raw_activation_vec)
-    
-    fiber_stress.interpolate(fiber_stress_expr)
-    fiber_strain.interpolate(fiber_strain_expr)
-    
-    # 2. FORCE SYNC
+
+    # Also record the actual solver Ta (may differ slightly due to substep convergence)
     solver_ta_array = Ta.value.x.array[:]
-    metrics_calc.cardiac_model.active.activation.value.x.array[:] = solver_ta_array  
+    Ta_solver_history.append(solver_ta_array.copy())
+
     max_ta_solver = np.max(solver_ta_array)
 
-    # 3. METRICS CALCULATION
-    if i == 0:
-        metrics_calc.update_state()
-        metrics_calc_skip_work = True
-    else:
-        metrics_calc_skip_work = False
-
-    # Get current state
-    lv_p_kPa = problem.cavity_pressures[0].x.array[0] * 1e-3
-    rv_p_kPa = problem.cavity_pressures[1].x.array[0] * 1e-3
-    current_state = {
-        "p_LV": circulation.units.kPa_to_mmHg(lv_p_kPa),
-        "p_RV": circulation.units.kPa_to_mmHg(rv_p_kPa),
-        "V_LV": float(lv_volume.value * volume2ml),
-        "V_RV": float(rv_volume.value * volume2ml)
-    }
-
-    # Clinical Volume Reconstruction (Un-scaling)
-    # V_Clinical = V_Mesh / Ratio
-    current_state["V_LV_Clinical"] = current_state["V_LV"] / ratio_LV
-    current_state["V_RV_Clinical"] = current_state["V_RV"] / ratio_RV
-    
-    if hasattr(model, "V_LV"):
-        current_state.setdefault("V_LV_0D", model.V_LV)
-    if hasattr(model, "V_RV"):
-        current_state.setdefault("V_RV_0D", model.V_RV)
-
-    region_metrics = metrics_calc.compute_regional_metrics(
-        timestep_idx=i, t=t,
-        model_history=model.history,
-        skip_work_calc=metrics_calc_skip_work,
-        current_state=current_state
-    )
-
-    # 4. Streamlined Logging
-    # Enrich metrics with local inputs/states for the trace CSV
-    region_metrics.update(current_state)
-    region_metrics["Ta_Input_Func"] = ta_input_val
-    region_metrics["Ta_Solver"] = max_ta_solver
-    
-    ta_internal = region_metrics.get("debug_Ta_internal_max", 0.0)
-    region_metrics["Sync_Error"] = abs(max_ta_solver - ta_internal)
-
-    # Console Feedback
+    # 2. Console Feedback (lightweight — no metrics computation)
     if comm.rank == 0 and (i % 10 == 0 or CI_MODE):
-        w_total = region_metrics.get("work_true_LV", 0.0)
-        e_ff_lv = region_metrics.get("mean_E_ff_LV", 0.0)
-        v_lv_ml = current_state.get("V_LV", 0.0)
-        print(f"STEP {i:04d} | t={t:.3f} | Ta={max_ta_solver:.1f} | E_ff={e_ff_lv:.3f} | V_LV={v_lv_ml:.1f}mL | W_Tot={w_total:.1e}")
+        lv_p_kPa = problem.cavity_pressures[0].x.array[0] * 1e-3
+        v_lv_ml = float(lv_volume.value * volume2ml)
+        print(f"STEP {i:04d} | t={t:.3f} | Ta={max_ta_solver:.1f} | V_LV={v_lv_ml:.1f}mL")
 
-        # Detailed print for interactive inspection
-        if CI_MODE or i % 50 == 0:
-             print(f"\n   --- Work Metrics Breakout (Step {i}) ---")
-             # Group by region for clarity
-             for region in ["LV", "RV", "Septum"]:
-                 print(f"   [{region}]")
-                 keys = [k for k in region_metrics.keys() if region in k and "work" in k]
-                 for k in sorted(keys):
-                     val = region_metrics[k]
-                     print(f"     {k:<30}: {val:.4e}")
-             print("   ---------------------------------------\n")
-
-    # Store metrics (handles CSV writing via metrics_calc.trace_path)
-    metrics_calc.store_metrics(region_metrics, i, t, downsample_factor=1)
-    metrics_calc.update_state()
-
-    # 5. Save Files
+    # 3. Save checkpoint data (displacement only — all metrics computed offline)
     if save:
+        fiber_stress.interpolate(fiber_stress_expr)
+        fiber_strain.interpolate(fiber_strain_expr)
         vtx_u.write(t)
         if vtx_p:
             vtx_p.write(t)
         vtx_stress.write(t)
         adios4dolfinx.write_function(filename, u=problem.u, name="displacement", time=t)
-        adios4dolfinx.write_function(filename, u=fiber_stress, name="fiber_stress", time=t)
-        adios4dolfinx.write_function(filename, u=fiber_strain, name="fiber_strain", time=t)
-        
-        # Note: output.json removed — history.npy has same data at higher resolution.
-        # Full circulation history is saved by circulation model's save_state().
 
 # --- Run Simulation ---
 
@@ -986,12 +836,43 @@ try:
     circulation_model.solve(num_beats=num_beats, initial_state=circ_state, dt=dt, T=end_time)
     logger.info("Simulation complete.")
 finally:
-    # --- Save Metrics (ALWAYS, even if simulation crashes) ---
+    # --- Save Checkpoint Data (ALWAYS, even if simulation crashes) ---
     if comm.rank == 0:
-        logger.info("Saving mechanics metrics (true work vs clinical proxies)...")
+        logger.info("Saving simulation checkpoint data for offline postprocessing...")
         try:
-            # Save with downsampling options: full resolution, every 5th step, every 10th step
-            metrics_calc.save_metrics(outdir, downsample_factors=[1, 5, 10])
-            logger.info("✓ Metrics saved to results directory")
+            # Save Ta history: [N_timesteps, 3] array with [LV, Septum, RV] activation (kPa)
+            np.save(outdir / "Ta_history.npy", np.array(Ta_history))
+            np.save(outdir / "Ta_solver_history.npy", np.array(Ta_solver_history))
+            logger.info(f"  Ta history saved: {len(Ta_history)} timesteps")
+
+            # Save simulation parameters needed for offline reconstruction
+            sim_params = {
+                "BPM": BPM,
+                "HR_HZ": HR_HZ,
+                "RR_INTERVAL": RR_INTERVAL,
+                "dt": dt,
+                "mesh_unit": mesh_unit,
+                "volume2ml": volume2ml,
+                "incompressible": args.incompressible,
+                "alpha_epi": args.alpha_epi,
+                "alpha_base": args.alpha_base,
+                "material_params": {k: {"value": float(v.value), "unit": str(v.unit)} for k, v in material_params.items()},
+                "activation": {
+                    "TC": TC_ACTIVATION,
+                    "TR": TR_ACTIVATION,
+                    "tC": tC_ACTIVATION,
+                    "peak_kPa": 100.0,
+                },
+                "ratio_LV": ratio_LV,
+                "ratio_RV": ratio_RV,
+                "lvv_unloaded_m3": float(lvv_unloaded),
+                "rvv_unloaded_m3": float(rvv_unloaded),
+                "lvv_target_m3": float(lvv_target),
+                "rvv_target_m3": float(rvv_target),
+            }
+            with open(outdir / "simulation_params.json", "w") as f:
+                json.dump(sim_params, f, indent=2, default=custom_json)
+            logger.info("  Simulation parameters saved")
+            logger.info("  Run postprocess_metrics.py on this directory to compute all metrics")
         except Exception as e:
-            logger.error(f"Failed to save metrics: {e}")
+            logger.error(f"Failed to save checkpoint data: {e}")

@@ -230,14 +230,19 @@ else
 fi
 
 # --- 9. Post-Processing ---
-echo "Running Post-Processing..."
+echo "Running Offline Metrics Computation..."
 cd ${RESULTS_DIR}
 
-if [ -f "metrics_downsample_1.npy" ]; then
+if [ -f "simulation_params.json" ] && [ -d "function_checkpoint.bp" ]; then
+    # Compute metrics from checkpoint (replays displacement + Ta)
+    $CONDA_PREFIX/bin/mpirun -n ${SLURM_NTASKS} -launcher fork $CONDA_PREFIX/bin/python ${SIM_DIR}/postprocess_metrics.py .
+    echo "✓ Metrics computed"
+
+    # Run plotting/analysis pipeline
     python3 ${SIM_DIR}/run_postprocessing.py .
     echo "✓ Analysis complete"
 else
-    echo "Skipping analysis (missing metrics file)."
+    echo "Skipping post-processing (missing checkpoint data)."
 fi
 
 # Copy logs inside the results folder for easy access
