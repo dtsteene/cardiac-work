@@ -91,10 +91,14 @@ class MetricsCalculator:
         self.V_LV_prev = None
         self.V_RV_prev = None
         
-        # Strain History for PS Loops
+        # Strain History for PS Loops (fiber/circumferential)
         self.eps_LV_prev = 0.0
         self.eps_RV_prev = 0.0
         self.eps_Septum_prev = 0.0
+        # Strain History for PS Loops (longitudinal)
+        self.eps_ll_LV_prev = 0.0
+        self.eps_ll_RV_prev = 0.0
+        self.eps_ll_Septum_prev = 0.0
 
         # Pressure History for Trapezoidal Boundary Work
         self.p_LV_prev = 0.0
@@ -400,11 +404,11 @@ class MetricsCalculator:
             data[f"work_passive_{region_name}"] = assemble_region(wd_passive)
             data[f"work_comp_{region_name}"] = assemble_region(wd_comp)
             
-            data[f"work_fiber_{region_name}"] = assemble_region(wd_fiber)
-            data[f"work_sheet_{region_name}"] = assemble_region(wd_sheet)   
-            data[f"work_normal_{region_name}"] = assemble_region(wd_normal) 
-            data[f"work_shear_{region_name}"] = assemble_region(wd_shear)   
-            data[f"work_passive_fiber_{region_name}"] = assemble_region(wd_passive_fiber)
+            data[f"work_ff_{region_name}"] = assemble_region(wd_fiber)      # fiber (circumferential)
+            data[f"work_ss_{region_name}"] = assemble_region(wd_sheet)      # sheet (apicobasal)
+            data[f"work_nn_{region_name}"] = assemble_region(wd_normal)     # sheet-normal (transmural)
+            data[f"work_cross_{region_name}"] = assemble_region(wd_shear)   # cross-terms (off-diagonal)
+            data[f"work_passive_ff_{region_name}"] = assemble_region(wd_passive_fiber)
             
         return data
     
@@ -480,37 +484,47 @@ class MetricsCalculator:
 
         # --- Apply Regional Volume Scaling ---
         
-        # 1. LV Free Wall Proxy (Standard)
-        data["work_ps_index_LV"] = (p_LV_avg * dE_LV) * self.region_volumes["LV"]
-        
-        # 2. RV Free Wall Proxy (Standard)
-        data["work_ps_index_RV"] = (p_RV_avg * dE_RV) * self.region_volumes["RV"]
-        
-        # 3. Septum Proxies (The Investigation)
+        # 1. LV Free Wall: P_LV × dE_ff (fiber strain = circumferential)
+        data["work_ps_ff_LV"] = (p_LV_avg * dE_LV) * self.region_volumes["LV"]
+
+        # 2. RV Free Wall: P_RV × dE_ff
+        data["work_ps_ff_RV"] = (p_RV_avg * dE_RV) * self.region_volumes["RV"]
+
+        # 3. Septum Proxies: different pressure choices × dE_ff
         vol_S = self.region_volumes["Septum"]
+
+        # Transmural pressure (P_LV - P_RV) — best physics for septum
+        data["work_ps_ff_Septum_Trans"] = ((p_LV_avg - p_RV_avg) * dE_Septum) * vol_S
+
+        # LV pressure only — tests "septum as part of LV" hypothesis
+        data["work_ps_ff_Septum_PLV"] = (p_LV_avg * dE_Septum) * vol_S
+
+        # RV pressure only — baseline comparison
+        data["work_ps_ff_Septum_PRV"] = (p_RV_avg * dE_Septum) * vol_S
         
-        # Variant A: Net Trans-septal Pressure (The Standard Physics Assumption)
-        # Represents the septum working against the pressure gradient.
-        data["work_ps_index_Septum_Trans"] = ((p_LV_avg - p_RV_avg) * dE_Septum) * vol_S
-        
-        # Variant B: LV Pressure Only
-        # Tests the hypothesis that the Septum is essentially "part of the LV".
-        data["work_ps_index_Septum_PLV"] = (p_LV_avg * dE_Septum) * vol_S
-        
-        # Variant C: RV Pressure Only
-        # Tests the hypothesis that the Septum is dominated by RV mechanics (unlikely, but a good baseline).
-        data["work_ps_index_Septum_PRV"] = (p_RV_avg * dE_Septum) * vol_S
-        
-        # Variant D: Mean Pressure
-        # Represents the septum working against the average hydrostatic load of the heart.
-        p_mean = 0.5 * (p_LV_avg + p_RV_avg)
-        data["work_ps_index_Septum_Mean"] = (p_mean * dE_Septum) * vol_S
-        
+        # --- Longitudinal PS Proxy (P × dE_ll) — GLS analogue ---
+        eps_ll_LV = mechanics_data.get("mean_E_ll_LV", 0.0)
+        eps_ll_RV = mechanics_data.get("mean_E_ll_RV", 0.0)
+        eps_ll_Septum = mechanics_data.get("mean_E_ll_Septum", 0.0)
+
+        dE_ll_LV = eps_ll_LV - self.eps_ll_LV_prev
+        dE_ll_RV = eps_ll_RV - self.eps_ll_RV_prev
+        dE_ll_Septum = eps_ll_Septum - self.eps_ll_Septum_prev
+
+        data["work_ps_ll_LV"] = (p_LV_avg * dE_ll_LV) * self.region_volumes["LV"]
+        data["work_ps_ll_RV"] = (p_RV_avg * dE_ll_RV) * self.region_volumes["RV"]
+        data["work_ps_ll_Septum_Trans"] = ((p_LV_avg - p_RV_avg) * dE_ll_Septum) * vol_S
+        data["work_ps_ll_Septum_PLV"] = (p_LV_avg * dE_ll_Septum) * vol_S
+        data["work_ps_ll_Septum_PRV"] = (p_RV_avg * dE_ll_Septum) * vol_S
+
         # Update History
         self.eps_LV_prev = eps_LV
         self.eps_RV_prev = eps_RV
         self.eps_Septum_prev = eps_Septum
-        
+        self.eps_ll_LV_prev = eps_ll_LV
+        self.eps_ll_RV_prev = eps_ll_RV
+        self.eps_ll_Septum_prev = eps_ll_Septum
+
         return data
     
     def _calculate_robin_work(self):
@@ -652,7 +666,7 @@ class MetricsCalculator:
             
             if self.rank == 0:
                 w_tot = metrics.get("work_true_LV", 0.0)
-                ps_idx = metrics.get("work_ps_index_LV", 0.0)
+                ps_idx = metrics.get("work_ps_ff_LV", 0.0)
                 print(f"STATS | t={t:.3f} | W_Tot={w_tot:.4e} | PS_Idx={ps_idx:.4e}")
 
         elif not self.has_previous_state:
@@ -663,8 +677,8 @@ class MetricsCalculator:
             region_suffixes = [r[0] for r in self._get_regions_to_integrate()]
 
             # Mechanics keys
-            prefixes = ["work_true", "work_active", "work_passive", "work_comp", 
-                        "work_fiber", "work_sheet", "work_normal", "work_shear", "work_passive_fiber"]
+            prefixes = ["work_true", "work_active", "work_passive", "work_comp",
+                        "work_ff", "work_ss", "work_nn", "work_cross", "work_passive_ff"]
             for r in region_suffixes:
                 for p in prefixes:
                     metrics[f"{p}_{r}"] = 0.0
@@ -676,9 +690,12 @@ class MetricsCalculator:
             # PV/PS keys
             metrics["work_proxy_pv_LV"] = 0.0
             metrics["work_proxy_pv_RV"] = 0.0
-            metrics["work_ps_index_LV"] = 0.0
-            metrics["work_ps_index_RV"] = 0.0
-            metrics["work_ps_index_Septum"] = 0.0
+            metrics["work_ps_ff_LV"] = 0.0
+            metrics["work_ps_ff_RV"] = 0.0
+            metrics["work_ps_ff_Septum_PLV"] = 0.0
+            metrics["work_ps_ll_LV"] = 0.0
+            metrics["work_ps_ll_RV"] = 0.0
+            metrics["work_ps_ll_Septum_PLV"] = 0.0
             
             #exact work keys
             metrics["work_boundary_exact_LV"] = 0.0

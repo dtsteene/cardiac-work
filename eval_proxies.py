@@ -69,9 +69,9 @@ def analyze_proxies(metrics, outdir, truth_type="total"):
     # --- PROXY CONFIGURATION (Total vs Fiber) ---
     if truth_type == "fiber":
         print("🔍 ANALYSIS MODE: Fiber Work (Projected)")
-        key_lv = "work_fiber_LV"
-        key_rv = "work_fiber_RV"
-        key_sep = "work_fiber_Septum" 
+        key_lv = "work_ff_LV"
+        key_rv = "work_ff_RV"
+        key_sep = "work_ff_Septum" 
         title_suffix = "(Fiber Work)"
     else:
         print("🔍 ANALYSIS MODE: Total Work (Tensor S:dE)")
@@ -90,17 +90,17 @@ def analyze_proxies(metrics, outdir, truth_type="total"):
     # 1. PV Loop Proxy (P*dV)
     prx_pv_lv = get_data(metrics, "work_proxy_pv_LV")
     # 2. PS Loop Proxy (P*dE*V)
-    prx_ps_lv = get_data(metrics, "work_ps_index_LV")
+    prx_ps_lv = get_data(metrics, "work_ps_ff_LV")
 
     # Proxies - Septum (The Investigation)
-    prx_sep_trans = get_data(metrics, "work_ps_index_Septum_Trans") # P_LV - P_RV
-    prx_sep_plv   = get_data(metrics, "work_ps_index_Septum_PLV")   # P_LV
-    prx_sep_prv   = get_data(metrics, "work_ps_index_Septum_PRV")   # P_RV
-    prx_sep_mean  = get_data(metrics, "work_ps_index_Septum_Mean")  # Mean P
+    prx_sep_trans = get_data(metrics, "work_ps_ff_Septum_Trans") # P_LV - P_RV
+    prx_sep_plv   = get_data(metrics, "work_ps_ff_Septum_PLV")   # P_LV
+    prx_sep_prv   = get_data(metrics, "work_ps_ff_Septum_PRV")   # P_RV
+    prx_sep_mean  = get_data(metrics, "work_ps_ff_Septum_Mean")  # Mean P
 
     # Proxies - RV
     prx_pv_rv = get_data(metrics, "work_proxy_pv_RV")
-    prx_ps_rv = get_data(metrics, "work_ps_index_RV")
+    prx_ps_rv = get_data(metrics, "work_ps_ff_RV")
 
     # --- FIGURE SETUP ---
     fig = plt.figure(figsize=(18, 10))
