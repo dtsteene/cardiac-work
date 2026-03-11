@@ -9,7 +9,7 @@ import basix.ufl
 import pulse
 
 class MetricsCalculator:
-    def __init__(self, geometry, geo, fiber_field_map, problem, comm, cardiac_model, metrics_space_type=("DG", 1), alpha_epi=1e5, alpha_base=1e6, hydro_pressure=None):
+    def __init__(self, geometry, geo, fiber_field_map, problem, comm, cardiac_model, metrics_space_type=("DG", 1), alpha_epi=1e5, alpha_base=1e6, hydro_pressure=None, one_sided_robin=False):
         self.geometry = geometry
         self.geo = geo
         self.fiber_fields = fiber_field_map
@@ -26,6 +26,7 @@ class MetricsCalculator:
         self.rank = comm.rank
         self.alpha_epi = alpha_epi
         self.alpha_base = alpha_base
+        self.one_sided_robin = one_sided_robin
         self.mesh = geometry.mesh
         
         # --- 1. Define Function Spaces ---
@@ -84,6 +85,9 @@ class MetricsCalculator:
 
         # --- 3. Setup UFL Expressions ---
         self._setup_expressions()
+
+        # Will be populated after region_tags is set (in __init__ after marker diagnostic)
+        self._compiled_forms = None
 
         # History and State flags
         self.metrics_history = defaultdict(list)
@@ -174,6 +178,207 @@ class MetricsCalculator:
                     print(f"  Volume {rname:>8s}: {rvol:.4e} m^3")
                 print(f"{'='*60}\n")
 
+        # --- 5. Pre-compile all integration forms (one-time JIT cost) ---
+        self._precompile_forms()
+        if self.rank == 0:
+            print("MetricsCalculator: All forms pre-compiled.")
+
+    def _precompile_forms(self):
+        """Pre-compile all dolfinx.fem.form objects used in the hot loop.
+
+        Since all UFL expressions reference dolfinx.fem.Function objects,
+        updating .x.array on those functions automatically updates form values.
+        We only need to call assemble_scalar(form) each step — no re-compilation.
+        """
+        self._compiled_forms = {}
+        regions = self._get_regions_to_integrate()
+
+        # --- Fiber directions and push-forward vectors ---
+        u = self.problem.u
+        F = ufl.variable(ufl.grad(u) + ufl.Identity(3))
+
+        f0 = self.fiber_fields['f0']
+        s0 = self.fiber_fields['s0']
+        n0 = self.fiber_fields['n0']
+        l0_raw = self.fiber_fields.get('l0', None)
+
+        if l0_raw is not None:
+            l0_norm = ufl.sqrt(ufl.inner(l0_raw, l0_raw))
+            l0 = l0_raw / l0_norm
+        else:
+            l0 = None
+
+        def push_vec(v0):
+            v_cur = F * v0
+            return v_cur / ufl.sqrt(ufl.inner(v_cur, v_cur))
+
+        f_cur = push_vec(f0)
+        s_cur = push_vec(s0)
+        n_cur = push_vec(n0)
+        l_cur = push_vec(l0) if l0 is not None else None
+
+        def proj(T, v): return ufl.inner(ufl.dot(T, v), v)
+        mag = lambda T: ufl.sqrt(ufl.inner(T, T))
+
+        # --- State variable forms (per region) ---
+        one = dolfinx.fem.Constant(self.mesh, 1.0)
+
+        for region_name, cell_tags, region_markers in regions:
+            dx_sub = ufl.Measure("dx", domain=self.mesh, subdomain_data=cell_tags,
+                                 metadata={"quadrature_degree": self.quadrature_degree})
+
+            def compile_regional(expr, name):
+                """Compile form for each marker in the region, store as list."""
+                forms = []
+                for m in region_markers:
+                    forms.append(dolfinx.fem.form(expr * dx_sub(int(m))))
+                self._compiled_forms[f"{name}_{region_name}"] = forms
+
+            # Volume
+            compile_regional(one, "vol")
+
+            # Reference stresses/strains (2nd PK / Green-Lagrange)
+            compile_regional(proj(self.S_total, f0), "S_ff")
+            compile_regional(proj(self.S_total, s0), "S_ss")
+            compile_regional(proj(self.S_total, n0), "S_nn")
+            compile_regional(proj(self.E_cur, f0), "E_ff")
+            compile_regional(proj(self.E_cur, s0), "E_ss")
+            compile_regional(proj(self.E_cur, n0), "E_nn")
+
+            # Longitudinal
+            if l0 is not None:
+                compile_regional(proj(self.S_total, l0), "S_ll")
+                compile_regional(proj(self.E_cur, l0), "E_ll")
+
+            # Cauchy stresses - total
+            compile_regional(proj(self.sigma_total, f_cur), "sigma_ff")
+            compile_regional(proj(self.sigma_total, s_cur), "sigma_ss")
+            compile_regional(proj(self.sigma_total, n_cur), "sigma_nn")
+            if l_cur is not None:
+                compile_regional(proj(self.sigma_total, l_cur), "sigma_ll")
+
+            # Cauchy - active
+            compile_regional(proj(self.sigma_active, f_cur), "sigma_ff_active")
+            compile_regional(proj(self.sigma_active, s_cur), "sigma_ss_active")
+            compile_regional(proj(self.sigma_active, n_cur), "sigma_nn_active")
+
+            # Cauchy - passive
+            compile_regional(proj(self.sigma_passive, f_cur), "sigma_ff_passive")
+            compile_regional(proj(self.sigma_passive, s_cur), "sigma_ss_passive")
+            compile_regional(proj(self.sigma_passive, n_cur), "sigma_nn_passive")
+
+            # Cauchy - comp
+            compile_regional(proj(self.sigma_comp, f_cur), "sigma_ff_comp")
+            compile_regional(proj(self.sigma_comp, s_cur), "sigma_ss_comp")
+            compile_regional(proj(self.sigma_comp, n_cur), "sigma_nn_comp")
+
+            # Cauchy magnitudes
+            compile_regional(mag(self.sigma_total), "sigma_mag")
+            compile_regional(mag(self.sigma_active), "sigma_mag_active")
+            compile_regional(mag(self.sigma_passive), "sigma_mag_passive")
+            compile_regional(mag(self.sigma_comp), "sigma_mag_comp")
+
+        # --- Work forms (per region) ---
+        dE = self.E_cur - self.E_prev
+        wd_total = 0.5 * ufl.inner(self.S_tot_ufl + self.S_prev, dE)
+        wd_active = 0.5 * ufl.inner(self.S_act_ufl + self.S_active_prev, dE)
+        wd_passive = 0.5 * ufl.inner(self.S_pas_ufl + self.S_passive_prev, dE)
+        wd_comp = 0.5 * ufl.inner(self.S_cmp_ufl + self.S_comp_prev, dE)
+
+        wd_fiber = 0.5 * (proj(self.S_tot_ufl, f0) + proj(self.S_prev, f0)) * proj(dE, f0)
+        wd_sheet = 0.5 * (proj(self.S_tot_ufl, s0) + proj(self.S_prev, s0)) * proj(dE, s0)
+        wd_normal = 0.5 * (proj(self.S_tot_ufl, n0) + proj(self.S_prev, n0)) * proj(dE, n0)
+        wd_shear = wd_total - (wd_fiber + wd_sheet + wd_normal)
+        wd_passive_fiber = 0.5 * (proj(self.S_pas_ufl, f0) + proj(self.S_passive_prev, f0)) * proj(dE, f0)
+
+        for region_name, cell_tags, region_markers in regions:
+            dx_sub = ufl.Measure("dx", domain=self.mesh, subdomain_data=cell_tags,
+                                 metadata={"quadrature_degree": self.quadrature_degree})
+
+            def compile_regional_work(expr, name):
+                forms = []
+                for m in region_markers:
+                    forms.append(dolfinx.fem.form(expr * dx_sub(int(m))))
+                self._compiled_forms[f"{name}_{region_name}"] = forms
+
+            compile_regional_work(wd_total, "wd_total")
+            compile_regional_work(wd_active, "wd_active")
+            compile_regional_work(wd_passive, "wd_passive")
+            compile_regional_work(wd_comp, "wd_comp")
+            compile_regional_work(wd_fiber, "wd_fiber")
+            compile_regional_work(wd_sheet, "wd_sheet")
+            compile_regional_work(wd_normal, "wd_normal")
+            compile_regional_work(wd_shear, "wd_shear")
+            compile_regional_work(wd_passive_fiber, "wd_passive_fiber")
+
+        # --- Robin work forms ---
+        N = ufl.FacetNormal(self.mesh)
+        I = ufl.Identity(3)
+        F_robin = ufl.grad(u) + I
+        J_robin = ufl.det(F_robin)
+        cof = J_robin * ufl.inv(F_robin).T
+        cofN = ufl.dot(cof, N)
+        cofnorm = ufl.sqrt(ufl.inner(cofN, cofN))
+        NN = cofN / cofnorm
+
+        # _u_prev needed for robin — create it now
+        if not hasattr(self, '_u_prev'):
+            self._u_prev = dolfinx.fem.Function(self.problem.u.function_space)
+
+        u_avg = 0.5 * (u + self._u_prev)
+        du = u - self._u_prev
+        u_n = ufl.dot(u_avg, NN)
+        du_n = ufl.dot(du, NN)
+
+        # One-sided Robin: only resists outward displacement (u·NN > 0)
+        if self.one_sided_robin:
+            u_n_cur = ufl.dot(u, NN)
+            u_n_prev = ufl.dot(self._u_prev, NN)
+            # Use conditional on current normal displacement to match solver
+            u_n = ufl.conditional(ufl.gt(u_n_cur, 0), u_n, ufl.as_ufl(0.0))
+            du_n = ufl.conditional(ufl.gt(u_n_cur, 0), du_n, ufl.as_ufl(0.0))
+
+        tag_epi = self.geometry.markers["EPI"][0]
+        tag_base = self.geometry.markers["BASE"][0]
+        ds_robin = ufl.Measure("ds", domain=self.mesh, subdomain_data=self.geometry.facet_tags)
+
+        self._compiled_forms["robin_epi"] = dolfinx.fem.form(
+            -self.alpha_epi * u_n * du_n * cofnorm * ds_robin(tag_epi))
+        self._compiled_forms["robin_base"] = dolfinx.fem.form(
+            -self.alpha_base * u_n * du_n * cofnorm * ds_robin(tag_base))
+
+        # --- Boundary work exact forms ---
+        X = ufl.SpatialCoordinate(self.mesh)
+        F_cur_bnd = ufl.grad(u) + I
+        J_cur_bnd = ufl.det(F_cur_bnd)
+        vol_form_cur = (-1.0 / 3.0) * J_cur_bnd * ufl.dot(X + u, ufl.dot(ufl.inv(F_cur_bnd).T, N))
+
+        F_prev_bnd = ufl.grad(self._u_prev) + I
+        J_prev_bnd = ufl.det(F_prev_bnd)
+        vol_form_prev = (-1.0 / 3.0) * J_prev_bnd * ufl.dot(X + self._u_prev, ufl.dot(ufl.inv(F_prev_bnd).T, N))
+
+        lv_marker_name = "LV" if "LV" in self.geometry.markers else "ENDO_LV"
+        rv_marker_name = "RV" if "RV" in self.geometry.markers else "ENDO_RV"
+        tag_lv = self.geometry.markers[lv_marker_name][0]
+        tag_rv = self.geometry.markers[rv_marker_name][0]
+        ds_bnd = ufl.Measure("ds", domain=self.mesh, subdomain_data=self.geometry.facet_tags)
+
+        self._compiled_forms["vol_cur_LV"] = dolfinx.fem.form(vol_form_cur * ds_bnd(tag_lv))
+        self._compiled_forms["vol_prev_LV"] = dolfinx.fem.form(vol_form_prev * ds_bnd(tag_lv))
+        self._compiled_forms["vol_cur_RV"] = dolfinx.fem.form(vol_form_cur * ds_bnd(tag_rv))
+        self._compiled_forms["vol_prev_RV"] = dolfinx.fem.form(vol_form_prev * ds_bnd(tag_rv))
+
+    def _assemble_compiled(self, key):
+        """Assemble a pre-compiled form (or list of forms for multi-marker regions)."""
+        forms = self._compiled_forms[key]
+        if isinstance(forms, list):
+            val = 0.0
+            for f in forms:
+                val += dolfinx.fem.assemble_scalar(f)
+            return self.comm.allreduce(val, op=MPI.SUM)
+        else:
+            return self.comm.allreduce(dolfinx.fem.assemble_scalar(forms), op=MPI.SUM)
+
     def _setup_expressions(self):
         u = self.problem.u
         I = ufl.Identity(3)
@@ -230,7 +435,7 @@ class MetricsCalculator:
     def _calculate_state_variables(self):
         """
         Calculates absolute state variables (Stress, Strain) at the current time.
-        Run this EVERY step (including t=0).
+        Uses pre-compiled forms for fast assembly.
         """
         # --- A. Interpolate Physics ---
         self.E_cur.interpolate(self.expr_E)
@@ -239,111 +444,60 @@ class MetricsCalculator:
         self.S_passive.interpolate(self.expr_S_passive)
         self.S_comp.interpolate(self.expr_S_comp)
 
-        # Interpolate Cauchy Components
         self.sigma_total.interpolate(self.expr_sigma_total)
         self.sigma_active.interpolate(self.expr_sigma_active)
         self.sigma_passive.interpolate(self.expr_sigma_passive)
         self.sigma_comp.interpolate(self.expr_sigma_comp)
 
-        # --- B. Integration ---
+        # --- B. Integration using pre-compiled forms ---
         data = {}
 
-        # Probe internal active tension
         try:
             data["debug_Ta_internal_max"] = np.max(self.cardiac_model.active.activation.value.x.array)
         except Exception:
             data["debug_Ta_internal_max"] = 0.0
-            
         data["debug_S_active_max"] = np.max(self.S_active.x.array)
 
+        l0_available = self.fiber_fields.get('l0', None) is not None
         regions = self._get_regions_to_integrate()
-        
-        # --- Current Configuration Vectors from F ---
-        u = self.problem.u
-        F = ufl.variable(ufl.grad(u) + ufl.Identity(3))
-        
-        f0 = self.fiber_fields['f0']
-        s0 = self.fiber_fields['s0']
-        n0 = self.fiber_fields['n0']
-        l0_raw = self.fiber_fields.get('l0', None)
 
-        # Normalize l0 (apex_gradient) — it's a gradient so not unit-length
-        if l0_raw is not None:
-            l0_norm = ufl.sqrt(ufl.inner(l0_raw, l0_raw))
-            l0 = l0_raw / l0_norm
-        else:
-            l0 = None
+        for region_name, _, _ in regions:
+            vol = self._assemble_compiled(f"vol_{region_name}")
 
-        # Push forward and normalize: v = F*v0 / |F*v0|
-        def push_vec(v0):
-            v_cur = F * v0
-            return v_cur / ufl.sqrt(ufl.inner(v_cur, v_cur))
-
-        f_cur = push_vec(f0)
-        s_cur = push_vec(s0)
-        n_cur = push_vec(n0)
-        l_cur = push_vec(l0) if l0 is not None else None
-
-        # Helper: Project Tensor T onto direction v
-        def proj(T, v): return ufl.inner(ufl.dot(T, v), v)
-
-        for region_name, cell_tags, region_markers in regions:
-            # Setup Measure
-            dx_sub = ufl.Measure("dx", domain=self.mesh, subdomain_data=cell_tags, metadata={"quadrature_degree": self.quadrature_degree})
-            
-            def assemble_region(expr):
-                val = 0.0
-                for m in region_markers:
-                    form = dolfinx.fem.form(expr * dx_sub(int(m)))
-                    val += dolfinx.fem.assemble_scalar(form)
-                return self.comm.allreduce(val, op=MPI.SUM)
-
-            # Volume and Averages
-            vol = assemble_region(dolfinx.fem.Constant(self.mesh, 1.0))
-            
             if vol > 1e-12:
-                # Reference Stresses and Strains (2nd PK / Green-Lagrange)
-                data[f"mean_S_ff_{region_name}"] = assemble_region(proj(self.S_total, f0)) / vol
-                data[f"mean_S_ss_{region_name}"] = assemble_region(proj(self.S_total, s0)) / vol
-                data[f"mean_S_nn_{region_name}"] = assemble_region(proj(self.S_total, n0)) / vol
-                data[f"mean_E_ff_{region_name}"] = assemble_region(proj(self.E_cur, f0)) / vol
-                data[f"mean_E_ss_{region_name}"] = assemble_region(proj(self.E_cur, s0)) / vol
-                data[f"mean_E_nn_{region_name}"] = assemble_region(proj(self.E_cur, n0)) / vol
+                data[f"mean_S_ff_{region_name}"] = self._assemble_compiled(f"S_ff_{region_name}") / vol
+                data[f"mean_S_ss_{region_name}"] = self._assemble_compiled(f"S_ss_{region_name}") / vol
+                data[f"mean_S_nn_{region_name}"] = self._assemble_compiled(f"S_nn_{region_name}") / vol
+                data[f"mean_E_ff_{region_name}"] = self._assemble_compiled(f"E_ff_{region_name}") / vol
+                data[f"mean_E_ss_{region_name}"] = self._assemble_compiled(f"E_ss_{region_name}") / vol
+                data[f"mean_E_nn_{region_name}"] = self._assemble_compiled(f"E_nn_{region_name}") / vol
 
-                # Longitudinal strain (true apex-to-base from Laplace gradient)
-                if l0 is not None:
-                    data[f"mean_S_ll_{region_name}"] = assemble_region(proj(self.S_total, l0)) / vol
-                    data[f"mean_E_ll_{region_name}"] = assemble_region(proj(self.E_cur, l0)) / vol
+                if l0_available:
+                    data[f"mean_S_ll_{region_name}"] = self._assemble_compiled(f"S_ll_{region_name}") / vol
+                    data[f"mean_E_ll_{region_name}"] = self._assemble_compiled(f"E_ll_{region_name}") / vol
 
-                # Cauchy Stresses (True Stress) - Total
-                data[f"mean_sigma_ff_{region_name}"] = assemble_region(proj(self.sigma_total, f_cur)) / vol
-                data[f"mean_sigma_ss_{region_name}"] = assemble_region(proj(self.sigma_total, s_cur)) / vol
-                data[f"mean_sigma_nn_{region_name}"] = assemble_region(proj(self.sigma_total, n_cur)) / vol
-                if l_cur is not None:
-                    data[f"mean_sigma_ll_{region_name}"] = assemble_region(proj(self.sigma_total, l_cur)) / vol
-                
-                # Cauchy Stresses - Active
-                data[f"mean_sigma_ff_active_{region_name}"] = assemble_region(proj(self.sigma_active, f_cur)) / vol
-                data[f"mean_sigma_ss_active_{region_name}"] = assemble_region(proj(self.sigma_active, s_cur)) / vol
-                data[f"mean_sigma_nn_active_{region_name}"] = assemble_region(proj(self.sigma_active, n_cur)) / vol
+                data[f"mean_sigma_ff_{region_name}"] = self._assemble_compiled(f"sigma_ff_{region_name}") / vol
+                data[f"mean_sigma_ss_{region_name}"] = self._assemble_compiled(f"sigma_ss_{region_name}") / vol
+                data[f"mean_sigma_nn_{region_name}"] = self._assemble_compiled(f"sigma_nn_{region_name}") / vol
+                if l0_available:
+                    data[f"mean_sigma_ll_{region_name}"] = self._assemble_compiled(f"sigma_ll_{region_name}") / vol
 
-                # Cauchy Stresses - Passive
-                data[f"mean_sigma_ff_passive_{region_name}"] = assemble_region(proj(self.sigma_passive, f_cur)) / vol
-                data[f"mean_sigma_ss_passive_{region_name}"] = assemble_region(proj(self.sigma_passive, s_cur)) / vol
-                data[f"mean_sigma_nn_passive_{region_name}"] = assemble_region(proj(self.sigma_passive, n_cur)) / vol
+                data[f"mean_sigma_ff_active_{region_name}"] = self._assemble_compiled(f"sigma_ff_active_{region_name}") / vol
+                data[f"mean_sigma_ss_active_{region_name}"] = self._assemble_compiled(f"sigma_ss_active_{region_name}") / vol
+                data[f"mean_sigma_nn_active_{region_name}"] = self._assemble_compiled(f"sigma_nn_active_{region_name}") / vol
 
-                # Cauchy Stresses - Compressibility
-                data[f"mean_sigma_ff_comp_{region_name}"] = assemble_region(proj(self.sigma_comp, f_cur)) / vol
-                data[f"mean_sigma_ss_comp_{region_name}"] = assemble_region(proj(self.sigma_comp, s_cur)) / vol
-                data[f"mean_sigma_nn_comp_{region_name}"] = assemble_region(proj(self.sigma_comp, n_cur)) / vol
+                data[f"mean_sigma_ff_passive_{region_name}"] = self._assemble_compiled(f"sigma_ff_passive_{region_name}") / vol
+                data[f"mean_sigma_ss_passive_{region_name}"] = self._assemble_compiled(f"sigma_ss_passive_{region_name}") / vol
+                data[f"mean_sigma_nn_passive_{region_name}"] = self._assemble_compiled(f"sigma_nn_passive_{region_name}") / vol
 
-                # Cauchy Stresses - Magnitudes (Frobenius Norm)
-                mag = lambda T: ufl.sqrt(ufl.inner(T, T))
-                data[f"mean_sigma_mag_{region_name}"] = assemble_region(mag(self.sigma_total)) / vol
-                data[f"mean_sigma_mag_active_{region_name}"] = assemble_region(mag(self.sigma_active)) / vol
-                data[f"mean_sigma_mag_passive_{region_name}"] = assemble_region(mag(self.sigma_passive)) / vol
-                data[f"mean_sigma_mag_comp_{region_name}"] = assemble_region(mag(self.sigma_comp)) / vol
+                data[f"mean_sigma_ff_comp_{region_name}"] = self._assemble_compiled(f"sigma_ff_comp_{region_name}") / vol
+                data[f"mean_sigma_ss_comp_{region_name}"] = self._assemble_compiled(f"sigma_ss_comp_{region_name}") / vol
+                data[f"mean_sigma_nn_comp_{region_name}"] = self._assemble_compiled(f"sigma_nn_comp_{region_name}") / vol
 
+                data[f"mean_sigma_mag_{region_name}"] = self._assemble_compiled(f"sigma_mag_{region_name}") / vol
+                data[f"mean_sigma_mag_active_{region_name}"] = self._assemble_compiled(f"sigma_mag_active_{region_name}") / vol
+                data[f"mean_sigma_mag_passive_{region_name}"] = self._assemble_compiled(f"sigma_mag_passive_{region_name}") / vol
+                data[f"mean_sigma_mag_comp_{region_name}"] = self._assemble_compiled(f"sigma_mag_comp_{region_name}") / vol
             else:
                 data[f"mean_S_ff_{region_name}"] = 0.0
                 data[f"mean_S_ss_{region_name}"] = 0.0
@@ -351,7 +505,7 @@ class MetricsCalculator:
                 data[f"mean_E_ff_{region_name}"] = 0.0
                 data[f"mean_E_ss_{region_name}"] = 0.0
                 data[f"mean_E_nn_{region_name}"] = 0.0
-                
+
         return data
 
     def _calculate_incremental_work(self):
@@ -385,31 +539,22 @@ class MetricsCalculator:
         wd_shear = wd_total - (wd_fiber + wd_sheet + wd_normal)
         wd_passive_fiber = 0.5 * (proj(self.S_pas_ufl, f0) + proj(self.S_passive_prev, f0)) * proj(dE, f0)
 
-        # 3. Integration
+        # 3. Integration (using pre-compiled forms)
         data = {}
         regions = self._get_regions_to_integrate()
-        
-        for region_name, cell_tags, region_markers in regions:
-            dx_sub = ufl.Measure("dx", domain=self.mesh, subdomain_data=cell_tags, metadata={"quadrature_degree": self.quadrature_degree})
-            
-            def assemble_region(expr):
-                val = 0.0
-                for m in region_markers:
-                    form = dolfinx.fem.form(expr * dx_sub(int(m)))
-                    val += dolfinx.fem.assemble_scalar(form)
-                return self.comm.allreduce(val, op=MPI.SUM)
 
-            data[f"work_true_{region_name}"] = assemble_region(wd_total)
-            data[f"work_active_{region_name}"] = assemble_region(wd_active)
-            data[f"work_passive_{region_name}"] = assemble_region(wd_passive)
-            data[f"work_comp_{region_name}"] = assemble_region(wd_comp)
-            
-            data[f"work_ff_{region_name}"] = assemble_region(wd_fiber)      # fiber (circumferential)
-            data[f"work_ss_{region_name}"] = assemble_region(wd_sheet)      # sheet (apicobasal)
-            data[f"work_nn_{region_name}"] = assemble_region(wd_normal)     # sheet-normal (transmural)
-            data[f"work_cross_{region_name}"] = assemble_region(wd_shear)   # cross-terms (off-diagonal)
-            data[f"work_passive_ff_{region_name}"] = assemble_region(wd_passive_fiber)
-            
+        for region_name, cell_tags, region_markers in regions:
+            data[f"work_true_{region_name}"] = self._assemble_compiled(f"wd_total_{region_name}")
+            data[f"work_active_{region_name}"] = self._assemble_compiled(f"wd_active_{region_name}")
+            data[f"work_passive_{region_name}"] = self._assemble_compiled(f"wd_passive_{region_name}")
+            data[f"work_comp_{region_name}"] = self._assemble_compiled(f"wd_comp_{region_name}")
+
+            data[f"work_ff_{region_name}"] = self._assemble_compiled(f"wd_fiber_{region_name}")
+            data[f"work_ss_{region_name}"] = self._assemble_compiled(f"wd_sheet_{region_name}")
+            data[f"work_nn_{region_name}"] = self._assemble_compiled(f"wd_normal_{region_name}")
+            data[f"work_cross_{region_name}"] = self._assemble_compiled(f"wd_shear_{region_name}")
+            data[f"work_passive_ff_{region_name}"] = self._assemble_compiled(f"wd_passive_fiber_{region_name}")
+
         return data
     
     def _calculate_pressure_proxies(self, model_history, current_state=None):
@@ -530,43 +675,10 @@ class MetricsCalculator:
     def _calculate_robin_work(self):
         """
         Work done BY boundary springs ON the mesh.
-        Matches solver _robin_form (perpendicular=False):
-          R = k*(u.NN)*(NN.u_test)*cofnorm*ds
-        with Nanson: NN = cofN/|cofN|, cofN = J*F^{-T}*N
+        Uses pre-compiled forms from _precompile_forms().
         """
-        du = self.problem.u - self._u_prev if hasattr(self, '_u_prev') else self.problem.u
-        u_cur = self.problem.u
-        
-        u_avg = 0.5 * (u_cur + self._u_prev) if hasattr(self, '_u_prev') else u_cur
-
-        # Deformed normal via Nanson (must match solver _robin_form exactly)
-        # Solver: nn = outer(NN,NN) [perpendicular=False], cofnorm * ds
-        # R = k * (u.NN) * (NN.u_test) * cofnorm * ds
-        N = ufl.FacetNormal(self.mesh)
-        I = ufl.Identity(3)
-        F = ufl.grad(u_cur) + I
-        J = ufl.det(F)
-        cof = J * ufl.inv(F).T
-        cofN = ufl.dot(cof, N)
-        cofnorm = ufl.sqrt(ufl.inner(cofN, cofN))
-        NN = cofN / cofnorm
-
-        # Normal projections only (Robin resists normal displacement)
-        u_n = ufl.dot(u_avg, NN)
-        du_n = ufl.dot(du, NN)
-
-        tag_epi = self.geometry.markers["EPI"][0]
-        tag_base = self.geometry.markers["BASE"][0]
-        ds_epi = self.geometry.ds(tag_epi)
-        ds_base = self.geometry.ds(tag_base)
-
-        # dW = -k * (u_avg.NN) * (NN.du) * cofnorm * ds
-        term_epi = -self.alpha_epi * u_n * du_n * cofnorm * ds_epi
-        term_base = -self.alpha_base * u_n * du_n * cofnorm * ds_base
-
-        wd_epi = self.comm.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(term_epi)), op=MPI.SUM)
-        wd_base = self.comm.allreduce(dolfinx.fem.assemble_scalar(dolfinx.fem.form(term_base)), op=MPI.SUM)
-
+        wd_epi = self._assemble_compiled("robin_epi")
+        wd_base = self._assemble_compiled("robin_base")
         return {"work_robin_epi": wd_epi, "work_robin_base": wd_base}
 
     def _get_regions_to_integrate(self):
@@ -626,6 +738,9 @@ class MetricsCalculator:
         output_dir.mkdir(parents=True, exist_ok=True)
         for factor in downsample_factors:
             downsampled = {k: v[::factor] for k, v in self.metrics_history.items()}
+            # Store region volumes as scalar metadata (m^3)
+            for rname, rvol in self.region_volumes.items():
+                downsampled[f"region_volume_{rname}"] = float(rvol)
             np.save(output_dir / f"metrics_downsample_{factor}.npy", downsampled, allow_pickle=True)
 
     def compute_regional_metrics(self, timestep_idx, t, model_history, skip_work_calc=False, current_state=None):
@@ -700,6 +815,11 @@ class MetricsCalculator:
             #exact work keys
             metrics["work_boundary_exact_LV"] = 0.0
             metrics["work_boundary_exact_RV"] = 0.0
+            # Compute initial FEM cavity volumes (m³ -> mL)
+            V_LV_init = self._assemble_compiled("vol_cur_LV") if "vol_cur_LV" in self._compiled_forms else 0.0
+            V_RV_init = self._assemble_compiled("vol_cur_RV") if "vol_cur_RV" in self._compiled_forms else 0.0
+            metrics["V_LV_FEM"] = V_LV_init * 1e6
+            metrics["V_RV_FEM"] = V_RV_init * 1e6
         
         #print(metrics)
         
@@ -708,32 +828,8 @@ class MetricsCalculator:
     def _calculate_boundary_work_exact(self, current_state):
         """
         Exact external work: W = -P_avg * DeltaV_cavity
-
-        Computes actual cavity volume at u_new and u_old using the same
-        divergence-theorem form as the solver:
-            V(u) = integral (-1/3) * J * dot(X+u, F^{-T} * N) ds
-
-        This avoids the linearization error of du . cofac(F) . N which
-        systematically overestimates DeltaV at finite deformations.
+        Uses pre-compiled volume forms from _precompile_forms().
         """
-        N = ufl.FacetNormal(self.mesh)
-        X = ufl.SpatialCoordinate(self.mesh)
-        I = ufl.Identity(3)
-        u_cur = self.problem.u
-
-        # Volume form at current configuration: V(u_cur)
-        F_cur = ufl.grad(u_cur) + I
-        J_cur = ufl.det(F_cur)
-        vol_form_cur = (-1.0 / 3.0) * J_cur * ufl.dot(X + u_cur, ufl.dot(ufl.inv(F_cur).T, N))
-
-        # Volume form at previous configuration: V(u_prev)
-        if hasattr(self, '_u_prev'):
-            F_prev = ufl.grad(self._u_prev) + I
-            J_prev = ufl.det(F_prev)
-            vol_form_prev = (-1.0 / 3.0) * J_prev * ufl.dot(X + self._u_prev, ufl.dot(ufl.inv(F_prev).T, N))
-        else:
-            vol_form_prev = vol_form_cur  # First step: dV = 0
-
         # Pressure (Convert mmHg -> Pa)
         p_LV = (current_state.get("p_LV", 0.0) or 0.0) * 133.322
         p_RV = (current_state.get("p_RV", 0.0) or 0.0) * 133.322
@@ -746,27 +842,21 @@ class MetricsCalculator:
         self.p_LV_prev = p_LV
         self.p_RV_prev = p_RV
 
-        # Surface measures
-        lv_marker_name = "LV" if "LV" in self.geometry.markers else "ENDO_LV"
-        rv_marker_name = "RV" if "RV" in self.geometry.markers else "ENDO_RV"
-        tag_lv = self.geometry.markers[lv_marker_name][0]
-        tag_rv = self.geometry.markers[rv_marker_name][0]
-        ds = ufl.Measure("ds", domain=self.mesh, subdomain_data=self.geometry.facet_tags)
-
-        # Compute V_new and V_old for each cavity, then W = -P_avg * (V_new - V_old)
-        def assemble_surf(form, tag):
-            return self.comm.allreduce(
-                dolfinx.fem.assemble_scalar(dolfinx.fem.form(form * ds(tag))), op=MPI.SUM)
-
-        V_LV_cur  = assemble_surf(vol_form_cur,  tag_lv)
-        V_LV_prev = assemble_surf(vol_form_prev, tag_lv)
-        V_RV_cur  = assemble_surf(vol_form_cur,  tag_rv)
-        V_RV_prev = assemble_surf(vol_form_prev, tag_rv)
+        # Compute V_new and V_old for each cavity using pre-compiled forms
+        V_LV_cur  = self._assemble_compiled("vol_cur_LV")
+        V_LV_prev = self._assemble_compiled("vol_prev_LV")
+        V_RV_cur  = self._assemble_compiled("vol_cur_RV")
+        V_RV_prev = self._assemble_compiled("vol_prev_RV")
 
         w_bnd_LV = p_LV_avg * (V_LV_cur - V_LV_prev)
         w_bnd_RV = p_RV_avg * (V_RV_cur - V_RV_prev)
 
+        # Convert cavity volumes from m³ to mL for storage
+        volume_m3_to_ml = 1e6
+
         return {
             "work_boundary_exact_LV": w_bnd_LV,
             "work_boundary_exact_RV": w_bnd_RV,
+            "V_LV_FEM": V_LV_cur * volume_m3_to_ml,
+            "V_RV_FEM": V_RV_cur * volume_m3_to_ml,
         }

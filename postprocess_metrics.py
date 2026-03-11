@@ -28,6 +28,7 @@ import dolfinx
 import ufl
 import scifem
 import adios4dolfinx
+import basix.ufl
 import pulse
 import cardiac_geometries
 import cardiac_geometries.geometry
@@ -85,40 +86,57 @@ circ_history = np.load(circ_path, allow_pickle=True).item()
 if rank == 0:
     logger.info(f"Loaded circulation history: {len(circ_history['time'])} points")
 
-# ─── 4. Load Geometry ────────────────────────────────────────────────────────
+# ─── 4. Load Geometry from Checkpoint ─────────────────────────────────────────
+#
+# CRITICAL: Load the mesh from checkpoint.bp — the SAME file where displacement
+# functions are stored. adios4dolfinx DOF ordering is tied to the specific file
+# where the mesh was written. Loading from a different file (geometry.bp, or even
+# a separate reference_mesh.bp) creates different DOF numbering, corrupting data.
 
-geo_dir = results_dir / "geometry"
-if not geo_dir.exists():
-    logger.error(f"Missing geometry directory: {geo_dir}")
+checkpoint_path = solver_dir / "checkpoint.bp"
+if not checkpoint_path.exists():
+    logger.error(f"Missing checkpoint: {checkpoint_path}")
     sys.exit(1)
 
-geo = cardiac_geometries.geometry.Geometry.from_folder(geo_dir, comm=comm)
-geometry = pulse.HeartGeometry.from_cardiac_geometries(geo, metadata={"quadrature_degree": 6})
+# Load mesh (already in reference configuration, in meters)
+mesh = adios4dolfinx.read_mesh(checkpoint_path, comm)
+if rank == 0:
+    logger.info(f"Reference mesh loaded (ndofs={mesh.geometry.x.shape[0]}, "
+                f"coords range=[{mesh.geometry.x.min():.6f}, {mesh.geometry.x.max():.6f}])")
+
+# Load markers from checkpoint (same file = same DOF ordering)
+ffun = adios4dolfinx.read_meshtags(checkpoint_path, mesh, meshtag_name="ffun")
+markers_mt = adios4dolfinx.read_meshtags(checkpoint_path, mesh, meshtag_name="cfun")
+
+# Load geometry folder for marker name mapping only
+geo_dir = results_dir / "geometry"
+geo = cardiac_geometries.geometry.Geometry.from_folder(comm, geo_dir)
+
+# Build HeartGeometry (mesh is already in reference config — NO prestress needed)
+geometry = pulse.HeartGeometry(
+    mesh=mesh,
+    facet_tags=ffun,
+    markers=geo.markers,
+    metadata={"quadrature_degree": 6},
+)
 
 if rank == 0:
     logger.info("Geometry loaded successfully")
 
-# ─── 5. Apply Prestress (Deform to Reference Configuration) ──────────────────
+# ─── 5. Load Fiber Fields ────────────────────────────────────────────────────
+# Fibers were saved into checkpoint.bp by complete_cycle.py (same file = correct DOFs)
 
-prestress_fname = solver_dir / "prestress_inverse.bp"
-if not prestress_fname.exists():
-    logger.error(f"Missing prestress file: {prestress_fname}")
-    sys.exit(1)
+V = dolfinx.fem.functionspace(mesh, ("Lagrange", 2, (3,)))
 
-V = dolfinx.fem.functionspace(geometry.mesh, ("Lagrange", 2, (3,)))
-u_pre = dolfinx.fem.Function(V)
-adios4dolfinx.read_function(prestress_fname, u_pre, time=0.0, name="u_pre")
-
-if rank == 0:
-    logger.info("Deforming mesh to Reference Configuration...")
-geometry.deform(u_pre)
-
-# Map fibers to reference configuration
-f0_quad = pulse.utils.map_vector_field(f=geo.f0, u=u_pre, normalize=True, name="f0_unloaded")
-s0_quad = pulse.utils.map_vector_field(f=geo.s0, u=u_pre, normalize=True, name="s0_unloaded")
+q_el = basix.ufl.quadrature_element(mesh.topology.cell_name(), value_shape=(3,), degree=6)
+Q_vec = dolfinx.fem.functionspace(mesh, q_el)
+f0_quad = dolfinx.fem.Function(Q_vec)
+s0_quad = dolfinx.fem.Function(Q_vec)
+adios4dolfinx.read_function(checkpoint_path, f0_quad, time=0.0, name="f0")
+adios4dolfinx.read_function(checkpoint_path, s0_quad, time=0.0, name="s0")
 
 if rank == 0:
-    logger.info("Fibers mapped to Reference Configuration")
+    logger.info("Fiber fields loaded from checkpoint")
 
 # ─── 6. Reconstruct Problem (Material + BCs + Cavities) ─────────────────────
 
@@ -130,10 +148,9 @@ for k, entry in mat_params_raw.items():
 
 material = pulse.HolzapfelOgden(f0=f0_quad, s0=s0_quad, **material_params)
 
-# Active stress model
-markers_mt = geo.additional_data["markers_mt"]
+# Active stress model (markers_mt loaded from checkpoint.bp above)
 V_Ta = scifem.create_space_of_simple_functions(
-    mesh=geo.mesh,
+    mesh=mesh,
     cell_tag=markers_mt,
     tags=[1, 2, 3]
 )
@@ -211,15 +228,32 @@ if rank == 0:
 
 from metrics_calculator import MetricsCalculator
 
-# Fiber field map
-l0_field = geo.additional_data.get("apex_gradient", None)
-if l0_field is not None and rank == 0:
-    logger.info("Loaded apex_gradient — longitudinal strain (E_ll) available")
+# Load n0 and l0 from checkpoint.bp (if available)
+# Q_vec already defined above
+n0_quad = None
+try:
+    n0_quad = dolfinx.fem.Function(Q_vec)
+    adios4dolfinx.read_function(checkpoint_path, n0_quad, time=0.0, name="n0")
+    if rank == 0:
+        logger.info("Loaded n0 from checkpoint")
+except Exception:
+    if rank == 0:
+        logger.warning("n0 not in checkpoint — sheet-normal strain unavailable")
+
+l0_field = None
+try:
+    l0_field = dolfinx.fem.Function(Q_vec)
+    adios4dolfinx.read_function(checkpoint_path, l0_field, time=0.0, name="l0")
+    if rank == 0:
+        logger.info("Loaded apex_gradient (l0) — longitudinal strain (E_ll) available")
+except Exception:
+    if rank == 0:
+        logger.warning("l0 not in checkpoint — longitudinal strain unavailable")
 
 fiber_fields_map = {
     'f0': f0_quad,
     's0': s0_quad,
-    'n0': geo.n0,
+    'n0': n0_quad,
     'l0': l0_field,
     'c0': None,
 }
@@ -232,9 +266,17 @@ metrics_model = pulse.CardiacModel(
     compressibility=cardiac_model.compressibility,
 )
 
+# Create a geo-like object with markers_mt on the checkpoint mesh
+class GeoProxy:
+    def __init__(self, mesh, additional_data):
+        self.mesh = mesh
+        self.additional_data = additional_data
+
+geo_proxy = GeoProxy(mesh, {"markers_mt": markers_mt})
+
 metrics_calc = MetricsCalculator(
     geometry=geometry,
-    geo=geo,
+    geo=geo_proxy,
     fiber_field_map=fiber_fields_map,
     problem=problem,
     comm=comm,
@@ -243,17 +285,13 @@ metrics_calc = MetricsCalculator(
     alpha_epi=alpha_epi,
     alpha_base=alpha_base,
     hydro_pressure=problem.p if sim_params["incompressible"] else None,
+    one_sided_robin=sim_params.get("one_sided_robin", False),
 )
 
 if rank == 0:
     logger.info("MetricsCalculator initialized")
 
 # ─── 8. Read Displacement Timestamps ─────────────────────────────────────────
-
-checkpoint_path = solver_dir / "checkpoint.bp"
-if not checkpoint_path.exists():
-    logger.error(f"Missing {checkpoint_path}")
-    sys.exit(1)
 
 timestamps = adios4dolfinx.read_timestamps(checkpoint_path, comm, "displacement")
 if rank == 0:
@@ -273,18 +311,45 @@ circ_V_RV = np.array(circ_history["V_RV"])
 ratio_LV = sim_params["ratio_LV"]
 ratio_RV = sim_params["ratio_RV"]
 
-def get_state_at_time(t_fem):
-    """Interpolate circulation state at FEM checkpoint time."""
-    p_lv = float(np.interp(t_fem, circ_time, circ_p_LV))
-    p_rv = float(np.interp(t_fem, circ_time, circ_p_RV))
+# Load solver cavity pressures if available (exact Lagrange multiplier — much more
+# accurate than 0D model pressures for boundary work computation)
+solver_pressure_path = solver_dir / "pressure_history.npy"
+solver_pressures = None
+if solver_pressure_path.exists():
+    solver_pressures = np.load(solver_pressure_path)  # [N, 2] = [p_LV_mmHg, p_RV_mmHg]
+    if rank == 0:
+        logger.info(f"Loaded solver cavity pressures: {solver_pressures.shape}")
+
+def get_state_at_time(t_fem, step_idx=None):
+    """Interpolate circulation state at FEM checkpoint time.
+
+    Uses solver cavity pressures (Lagrange multiplier) for p_LV/p_RV when available,
+    falling back to 0D model pressures otherwise. The solver pressures are the exact
+    surface traction and give perfect energy conservation.
+    """
+    # Pressures: prefer solver cavity pressures over 0D model
+    if solver_pressures is not None and step_idx is not None and step_idx < len(solver_pressures):
+        p_lv = float(solver_pressures[step_idx, 0])
+        p_rv = float(solver_pressures[step_idx, 1])
+    else:
+        p_lv = float(np.interp(t_fem, circ_time, circ_p_LV))
+        p_rv = float(np.interp(t_fem, circ_time, circ_p_RV))
+
+    # 0D model pressures (always available, for comparison)
+    p_lv_0d = float(np.interp(t_fem, circ_time, circ_p_LV))
+    p_rv_0d = float(np.interp(t_fem, circ_time, circ_p_RV))
+
+    # Volumes: always from 0D model (scaled to mesh)
     v_lv = float(np.interp(t_fem, circ_time, circ_V_LV))
     v_rv = float(np.interp(t_fem, circ_time, circ_V_RV))
     return {
-        "p_LV": p_lv,
+        "p_LV": p_lv,                   # Solver (Lagrange multiplier) pressure
         "p_RV": p_rv,
-        "V_LV": v_lv * ratio_LV,     # Scale to mesh volume
+        "p_LV_0D": p_lv_0d,             # 0D model (elastance) pressure
+        "p_RV_0D": p_rv_0d,
+        "V_LV": v_lv * ratio_LV,        # 0D volume scaled to mesh frame
         "V_RV": v_rv * ratio_RV,
-        "V_LV_Clinical": v_lv,
+        "V_LV_Clinical": v_lv,          # Unscaled 0D volume
         "V_RV_Clinical": v_rv,
     }
 
@@ -308,7 +373,13 @@ for i in range(n_steps):
     t = timestamps[i]
 
     # 1. Load displacement from checkpoint into problem.u
+    if rank == 0:
+        logger.debug(f"  [{i}] Reading displacement at t={t:.4f}...")
+        sys.stderr.flush()
     adios4dolfinx.read_function(checkpoint_path, problem.u, time=t, name="displacement")
+    if rank == 0:
+        logger.debug(f"  [{i}] Displacement loaded. Setting Ta...")
+        sys.stderr.flush()
 
     # 2. Set active tension from saved history
     Ta.assign(Ta_history[i])
@@ -316,14 +387,17 @@ for i in range(n_steps):
     metrics_model.active.activation.value.x.array[:] = Ta.value.x.array[:]
 
     # 3. Get circulation state at this time
-    current_state = get_state_at_time(t)
+    current_state = get_state_at_time(t, step_idx=i)
+
+    if rank == 0:
+        logger.debug(f"  [{i}] Computing metrics (skip_work={i==0})...")
+        sys.stderr.flush()
 
     # 4. Compute metrics
-    if i == 0:
-        metrics_calc.update_state()
-        skip_work = True
-    else:
-        skip_work = False
+    # Note: do NOT call update_state() before compute_regional_metrics at step 0.
+    # That would set has_previous_state=True, causing V_LV_FEM (and other init keys)
+    # to be skipped — resulting in 799 vs 800 length mismatch.
+    skip_work = (i == 0)
 
     region_metrics = metrics_calc.compute_regional_metrics(
         timestep_idx=i, t=t,
@@ -341,7 +415,7 @@ for i in range(n_steps):
     metrics_calc.update_state()
 
     # Progress
-    if rank == 0 and (i % 50 == 0 or i == n_steps - 1):
+    if rank == 0 and (i % 10 == 0 or i == n_steps - 1):
         w_lv = region_metrics.get("work_true_LV", 0.0)
         e_ff = region_metrics.get("mean_E_ff_LV", 0.0)
         p_lv = current_state["p_LV"]

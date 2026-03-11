@@ -2,7 +2,7 @@
 
 # --- Slurm Job Configuration ---
 #SBATCH --job-name=cardiac_sim
-#SBATCH --partition=habanaq    
+#SBATCH --partition=mi50q
 #SBATCH --nodes=1
 #SBATCH --ntasks=8
 #SBATCH --cpus-per-task=1
@@ -33,6 +33,7 @@ CIRCULATION_PARAMS=${CIRCULATION_PARAMS:-""}
 ALPHA_EPI=${ALPHA_EPI:-""}
 ALPHA_BASE=${ALPHA_BASE:-""}
 INCOMPRESSIBLE=${INCOMPRESSIBLE:-0}
+ONE_SIDED_ROBIN=${ONE_SIDED_ROBIN:-0}
 COMMENT=${COMMENT:-"No description provided"}
 # Path to a pre-built, manually tagged geometry directory (skips generation entirely).
 # Prep locally with: python geometry_generator.py --manual-refinement --single ukb -o ./tagged_geos
@@ -154,6 +155,10 @@ fi
 
 if [ "$INCOMPRESSIBLE" = "1" ]; then
     ARGS_STR="$ARGS_STR --incompressible"
+fi
+
+if [ "$ONE_SIDED_ROBIN" = "1" ]; then
+    ARGS_STR="$ARGS_STR --one-sided-robin"
 fi
 
 if [ -n "$GEOMETRY_DIR" ]; then

@@ -2,50 +2,86 @@
 """
 compare_cases.py
 
-Sensitivity analysis for LV Freewall, RV Freewall, and Septum mechanical work proxies.
-
-Compares pressure-strain (PS) proxies against FEM ground truths:
-  1. Total Work  (work_true  = full tensor S:dE)
-  2. Fiber Work  (work_ff = S_ff * dE_ff)
-
-For the Septum, multiple PS proxy variants are compared:
-  - PLV:   P_LV × dε
-  - PRV:   P_RV × dε
-  - Trans: (P_LV − P_RV) × dε   (transmural pressure)
-
-Produces:
-  simplification_cascade.png         — S_ff×E_ff → P×E_ff → P×E_ll cascade
-  pressure_vs_transmural_stress.png  — P ≈ -2σ̄_nn validation
-  work_redistribution.png            — regional work shares
-  work_decomposition.png             — ff/ss/nn/cross work breakdown
-  stress_loops.png                   — fiber stress-strain loops
-  pressure_strain.png                — pressure-strain loops
-  sensitivity_longitudinal.png       — proxy tracking accuracy
+Compare two cardiac simulation cases (e.g. Healthy vs PAH).
+Generates publication-quality figures for the thesis.
 
 Usage:
-  python3 compare_cases.py <HEALTHY_RESULT_DIR> <PAH_RESULT_DIR>
+  python3 compare_cases.py <CASE_A_DIR> <CASE_B_DIR> [--labels A B]
+  python3 compare_cases.py healthy_dir/ pah_dir/
+  python3 compare_cases.py healthy/ pah/ --labels "Healthy" "PAH" --outdir figures/
 """
 
 import sys
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib as mpl
 from pathlib import Path
+
+
+# ─── Thesis Figure Style ─────────────────────────────────────────────────────
+
+def setup_style():
+    """Configure matplotlib for clean, publication-quality figures."""
+    mpl.rcParams.update({
+        # Font
+        "font.family": "serif",
+        "font.serif": ["CMU Serif", "DejaVu Serif", "Times New Roman", "serif"],
+        "mathtext.fontset": "cm",
+        "font.size": 10,
+        "axes.titlesize": 11,
+        "axes.labelsize": 10,
+        "xtick.labelsize": 9,
+        "ytick.labelsize": 9,
+        "legend.fontsize": 8,
+        # Lines
+        "lines.linewidth": 1.5,
+        "lines.markersize": 5,
+        # Axes
+        "axes.linewidth": 0.6,
+        "axes.grid": False,
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        # Grid (when enabled explicitly)
+        "grid.linewidth": 0.4,
+        "grid.alpha": 0.3,
+        # Ticks
+        "xtick.direction": "in",
+        "ytick.direction": "in",
+        "xtick.major.width": 0.6,
+        "ytick.major.width": 0.6,
+        "xtick.major.size": 3,
+        "ytick.major.size": 3,
+        # Figure
+        "figure.dpi": 150,
+        "savefig.dpi": 300,
+        "savefig.bbox": "tight",
+        "savefig.pad_inches": 0.1,
+        # Legend
+        "legend.frameon": True,
+        "legend.framealpha": 0.85,
+        "legend.edgecolor": "0.8",
+        "legend.fancybox": False,
+    })
+
+
+# Two-case color palette: Healthy = steel blue, PAH = muted red
+COLORS = ["#4878A8", "#C25454"]
+REGION_COLORS = {"LV": "#4878A8", "RV": "#C25454", "Septum": "#5EA55E"}
+
+
+def _save(fig, outdir, name):
+    out = Path(outdir) / name
+    fig.savefig(out)
+    print(f"  Saved: {out}")
+    plt.close(fig)
 
 
 # ─── Data Loading ────────────────────────────────────────────────────────────
 
 def load_metrics(folder):
-    """
-    Load metrics from folder. Search order:
-      1. analysis/last_beat/  (new layout)
-      2. analysis_last_beat/  (legacy layout)
-      3. metrics/             (new layout, full data)
-      4. root folder          (legacy layout)
-    """
+    """Load metrics dict from folder, searching multiple layout conventions."""
     path = Path(folder)
-
-    # Try new layout first, then legacy
     search_dirs = [
         path / "analysis" / "last_beat",
         path / "analysis_last_beat",
@@ -58,14 +94,36 @@ def load_metrics(folder):
         files = sorted(d.glob("metrics_downsample_*.npy"), key=lambda p: len(str(p)))
         if files:
             print(f"  Loading: {files[0]}")
-            return np.load(files[0], allow_pickle=True).item()
-
+            m = np.load(files[0], allow_pickle=True).item()
+            return _normalize_keys(m)
     print(f"  No metrics found in {folder}")
     return None
 
 
+def _normalize_keys(m):
+    """Map legacy metric key names to current convention so all code works uniformly."""
+    # Old name -> new name (only copy if new name doesn't already exist)
+    renames = {}
+    regions = ["LV", "RV", "Septum", "Whole"]
+    for reg in regions:
+        renames[f"work_fiber_{reg}"]  = f"work_ff_{reg}"
+        renames[f"work_sheet_{reg}"]  = f"work_ss_{reg}"
+        renames[f"work_normal_{reg}"] = f"work_nn_{reg}"
+        renames[f"work_shear_{reg}"]  = f"work_cross_{reg}"
+    # PS proxy keys: work_ps_index_* -> work_ps_ff_*
+    for old_k in list(m.keys()):
+        if old_k.startswith("work_ps_index_"):
+            new_k = old_k.replace("work_ps_index_", "work_ps_ff_")
+            renames[old_k] = new_k
+
+    for old, new in renames.items():
+        if old in m and new not in m:
+            m[new] = m[old]
+
+    return m
+
+
 def total_work(m, key):
-    """Sum incremental work array → total cycle work (Joules)."""
     if key not in m:
         return 0.0
     return float(np.sum(m[key]))
@@ -75,15 +133,10 @@ def get_array(m, key):
     return np.array(m[key]) if key in m else np.array([])
 
 
-
 def compute_ps_work(m, strain_key, p_key):
-    """
-    Compute pressure-strain work index from timeseries with any strain component.
-    Returns total work in Joules (with region volume scaling derived from the
-    precomputed fiber-strain PS proxy).
-    """
+    """Pressure-strain work index (unscaled) in Joules."""
     strain = get_array(m, strain_key)
-    pressure = get_array(m, p_key) * 133.322  # mmHg → Pa
+    pressure = get_array(m, p_key) * 133.322  # mmHg -> Pa
     if len(strain) < 2 or len(pressure) < 2:
         return 0.0
     dE = np.diff(strain)
@@ -92,12 +145,7 @@ def compute_ps_work(m, strain_key, p_key):
 
 
 def compute_ps_work_scaled(m, strain_key, p_key, region):
-    """
-    Compute PS work with volume scaling, consistent with the precomputed proxy.
-    Uses the precomputed fiber-strain PS proxy to derive the region volume factor,
-    then applies it to the new strain direction.
-    """
-    # Get volume scale factor from precomputed fiber PS proxy
+    """PS work with volume scaling derived from precomputed fiber-strain proxy."""
     if region == "Septum":
         precomputed_key = "work_ps_ff_Septum_PLV"
         ff_strain_key = "mean_E_ff_Septum"
@@ -112,171 +160,163 @@ def compute_ps_work_scaled(m, strain_key, p_key, region):
     if abs(raw_ff) < 1e-20:
         return 0.0
     vol_factor = precomputed_total / raw_ff
-
     raw = compute_ps_work(m, strain_key, p_key)
     return raw * vol_factor
 
 
-# ─── Figure 1: Sensitivity Comparison ────────────────────────────────────────
+# ─── Figure 1: Simplification Cascade ────────────────────────────────────────
 
-def _plot_sensitivity_one(results, labels, outdir, strain_comp, strain_label, suffix):
+def plot_simplification_cascade(results, labels, outdir):
     """
-    2×3 grid: [Total truth, Fiber truth] × [LV, RV, Septum].
-    Healthy = (1, 1). Ideal tracking → points on y = x.
-
-    strain_comp: 'ff', 'nn', or 'ss'
-    strain_label: e.g. "Fiber Strain E_ff" or "Longitudinal Strain E_nn"
-    suffix: filename suffix, e.g. "fiber" or "longitudinal"
+    3x3 grid: the cascade from FEM ground truth to clinical measurement.
+      Row 0: S_ff vs E_ff  (FEM stress-strain)
+      Row 1: P   vs E_ff   (replace stress with pressure)
+      Row 2: P   vs E_ll   (replace fiber strain with longitudinal ~ GLS)
+    Columns: LV, RV, Septum.
     """
-    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-    fig.suptitle(
-        f"Pressure-Strain Proxy Sensitivity — PS proxy uses {strain_label}\n"
-        "(Healthy = 1.0  |  Ideal tracking: points lie on y = x)",
-        fontsize=13, fontweight='bold'
-    )
-
-    def get_proxy_total(r, region):
-        """Read precomputed PS work for this strain direction."""
-        if region == "Septum":
-            key = f"work_ps_{strain_comp}_Septum_PLV"
-        else:
-            key = f"work_ps_{strain_comp}_{region}"
-        if key not in r:
-            raise KeyError(f"Missing precomputed key '{key}' — rerun simulation with updated metrics_calculator")
-        return total_work(r, key)
-
-    # Freewall configs
-    fw_configs = [
-        (0, 0, "LV", "work_true_LV",  "Total Work (S:dE)",       "tab:blue"),
-        (0, 1, "RV", "work_true_RV",  "Total Work (S:dE)",       "tab:red"),
-        (1, 0, "LV", "work_ff_LV", "Fiber Work (S_ff·dE_ff, circ.)", "tab:blue"),
-        (1, 1, "RV", "work_ff_RV", "Fiber Work (S_ff·dE_ff, circ.)", "tab:red"),
+    regions = [
+        ("LV",     "mean_E_ff_LV",     "mean_S_ff_LV",     "mean_E_ll_LV",     "p_LV"),
+        ("RV",     "mean_E_ff_RV",     "mean_S_ff_RV",     "mean_E_ll_RV",     "p_RV"),
+        ("Septum", "mean_E_ff_Septum", "mean_S_ff_Septum", "mean_E_ll_Septum", "p_LV"),
     ]
 
-    for row, col, region, truth_key, truth_label, color in fw_configs:
-        ax = axes[row, col]
-        truth_vals = [total_work(r, truth_key) for r in results]
-        proxy_vals = [get_proxy_total(r, region) for r in results]
+    fig, axes = plt.subplots(3, 3, figsize=(7.0, 7.5))
 
-        bt, bp = truth_vals[0], proxy_vals[0]
-        if abs(bt) < 1e-12 or abs(bp) < 1e-12:
-            ax.set_title(f"{region} Freewall — no data")
-            continue
-
-        tn = [v / bt for v in truth_vals]
-        pn = [v / bp for v in proxy_vals]
-
-        all_v = tn + pn
-        lo, hi = min(all_v) - 0.15, max(all_v) + 0.15
-        lo, hi = min(lo, 0.5), max(hi, 1.1)
-
-        ax.plot([lo, hi], [lo, hi], 'k--', alpha=0.3, lw=1.5, label="Ideal (y = x)")
-        ax.plot(pn, tn, 'o-', color=color, lw=2, ms=10, label=f"PS({strain_label.split()[0]})")
-        for i, lbl in enumerate(labels):
-            ax.annotate(lbl, (pn[i], tn[i]), xytext=(8, 8),
-                        textcoords='offset points', fontsize=9, color=color)
-        if len(results) > 1:
-            dx = pn[1] - tn[1]
-            ax.annotate(f"Δ(proxy-truth) = {dx:+.2f}",
-                        xy=(pn[1], tn[1]), xytext=(-10, -25),
-                        textcoords='offset points', fontsize=8, color='dimgray',
-                        arrowprops=dict(arrowstyle='->', color='dimgray', lw=0.8))
-
-        ax.set_xlim(lo, hi); ax.set_ylim(lo, hi)
-        ax.set_aspect('equal')
-        ax.set_xlabel(f"PS Proxy Work [{strain_label}] (Normalized)", fontsize=10)
-        ax.set_ylabel(f"{truth_label}\n(Normalized)", fontsize=10)
-        ax.set_title(f"{region} Freewall  |  {truth_label}", fontweight='bold')
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-
-    # Septum: multiple pressure variants (P_LV, Trans, P_RV)
-    septum_pressure_variants = [
-        ("p_LV",  "PS (P_LV)",    "tab:blue",  "o"),
-        ("trans",  "PS (Trans)",    "tab:green", "s"),
-        ("p_RV",  "PS (P_RV)",    "tab:red",   "^"),
+    row_info = [
+        (r"$S_{ff}$ vs $E_{ff}$  (FEM ground truth)",
+         "Fiber strain $E_{ff}$ (%)", r"Fiber stress $S_{ff}$ (kPa)"),
+        (r"$P$ vs $E_{ff}$  (pressure substitution)",
+         "Fiber strain $E_{ff}$ (%)", "Pressure (mmHg)"),
+        (r"$P$ vs $E_{ll}$  (clinical measurement)",
+         "Longitudinal strain $E_{ll}$ (%)", "Pressure (mmHg)"),
     ]
 
-    def get_septum_proxy(r, p_variant):
-        """Read precomputed septum PS work for given pressure variant."""
-        variant_map = {"p_LV": "PLV", "trans": "Trans", "p_RV": "PRV"}
-        suffix = variant_map.get(p_variant)
-        if suffix is None:
-            raise ValueError(f"Unknown p_variant: {p_variant}")
-        key = f"work_ps_{strain_comp}_Septum_{suffix}"
-        if key not in r:
-            raise KeyError(f"Missing precomputed key '{key}' — rerun simulation with updated metrics_calculator")
-        return total_work(r, key)
+    for col, (region, eff_key, sff_key, ell_key, p_key) in enumerate(regions):
+        for row in range(3):
+            ax = axes[row, col]
 
-    for row, truth_key, truth_label in [
-        (0, "work_true_Septum",  "Total Work (S:dE)"),
-        (1, "work_ff_Septum", "Fiber Work (S_ff·dE_ff, circ.)"),
-    ]:
+            for i, (r, lbl, c) in enumerate(zip(results, labels, COLORS)):
+                if row == 0:
+                    x = get_array(r, eff_key) * 100
+                    y = get_array(r, sff_key) / 1e3
+                elif row == 1:
+                    x = get_array(r, eff_key) * 100
+                    y = get_array(r, p_key)
+                else:
+                    x = get_array(r, ell_key) * 100
+                    y = get_array(r, p_key)
+
+                if len(x) == 0:
+                    continue
+                ax.plot(x, y, color=c, lw=1.5, label=lbl)
+                ax.plot(x[0], y[0], 'o', color=c, ms=4, zorder=5)
+
+                # Septum: add transmural pressure as dashed
+                if region == "Septum" and row >= 1:
+                    p_rv = get_array(r, 'p_RV')
+                    p_trans = get_array(r, p_key) - p_rv
+                    ax.plot(x, p_trans, color=c, lw=1.2, ls='--', alpha=0.7,
+                            label=f"{lbl} (trans.)" if row == 1 else None)
+
+            ax.axhline(0, color='0.5', lw=0.4)
+            ax.axvline(0, color='0.5', lw=0.4)
+
+            if row == 0:
+                ax.set_title(region, fontweight="bold")
+            if col == 0:
+                ax.set_ylabel(row_info[row][2])
+            if row == 2:
+                ax.set_xlabel(row_info[row][1])
+
+            if row == 0 and col == 0:
+                ax.legend(fontsize=6, loc='lower left', handlelength=1.0)
+            if row == 1 and col == 2:
+                ax.legend(fontsize=5, loc='lower left', handlelength=1.0)
+
+    # Row labels on the left margin
+    for row, (rlabel, _, _) in enumerate(row_info):
+        axes[row, 0].annotate(
+            rlabel, xy=(-0.45, 0.5), xycoords='axes fraction',
+            fontsize=8, ha='right', va='center', rotation=90, style='italic')
+
+    fig.tight_layout(rect=[0.06, 0, 1, 1], h_pad=1.0, w_pad=0.8)
+    _save(fig, outdir, "simplification_cascade.png")
+
+
+# ─── Figure 2: Pressure-Strain Loops ─────────────────────────────────────────
+
+def plot_pressure_strain(results, labels, outdir):
+    """
+    2x3 panel: pressure-strain loops.
+    Row 0: fiber strain (E_ff). Row 1: longitudinal strain (E_ll).
+    """
+    strain_rows = [
+        ("mean_E_ff", r"Fiber strain $E_{ff}$ (%)", "circumferential"),
+        ("mean_E_ll", r"Longitudinal strain $E_{ll}$ (%)", "longitudinal"),
+    ]
+
+    fig, axes = plt.subplots(2, 3, figsize=(7.0, 5.0), squeeze=False)
+
+    for row, (strain_prefix, xlabel, _) in enumerate(strain_rows):
+        for col, (region, p_key) in enumerate([("LV", "p_LV"), ("RV", "p_RV")]):
+            ax = axes[row, col]
+            strain_key = f"{strain_prefix}_{region}"
+            for r, lbl, c in zip(results, labels, COLORS):
+                strain = get_array(r, strain_key) * 100
+                pressure = get_array(r, p_key)
+                if len(strain) == 0:
+                    continue
+                ax.plot(strain, pressure, color=c, lw=1.5, label=lbl)
+                ax.plot(strain[0], pressure[0], 'o', color=c, ms=3)
+
+            ax.axhline(0, color='0.5', lw=0.4)
+            ax.axvline(0, color='0.5', lw=0.4)
+            if row == 0:
+                ax.set_title(f"{region} free wall", fontweight="bold")
+            if row == 1:
+                ax.set_xlabel(xlabel)
+            if col == 0:
+                ax.set_ylabel("Pressure (mmHg)")
+            if row == 0 and col == 0:
+                ax.legend(fontsize=6)
+
+        # Septum: P_LV solid, transmural dashed
         ax = axes[row, 2]
-        truth_vals = [total_work(r, truth_key) for r in results]
-        bt = truth_vals[0]
-        if abs(bt) < 1e-12:
-            ax.set_title("Septum — no data")
-            continue
-        tn = [v / bt for v in truth_vals]
-
-        all_v = list(tn)
-        first_proxy_pn = None
-        for p_variant, plbl, pcol, pmk in septum_pressure_variants:
-            pvals = [get_septum_proxy(r, p_variant) for r in results]
-            bp = pvals[0]
-            if abs(bp) < 1e-12:
+        strain_key = f"{strain_prefix}_Septum"
+        for r, lbl, c in zip(results, labels, COLORS):
+            strain = get_array(r, strain_key) * 100
+            p_lv = get_array(r, 'p_LV')
+            p_rv = get_array(r, 'p_RV')
+            if len(strain) == 0:
                 continue
-            pn = [v / bp for v in pvals]
-            all_v.extend(pn)
-            ax.plot(pn, tn, f'{pmk}-', color=pcol, lw=2, ms=9, label=plbl)
-            if first_proxy_pn is None:
-                first_proxy_pn = pn
+            ax.plot(strain, p_lv, color=c, lw=1.5, label=f"{lbl} ($P_{{LV}}$)")
+            ax.plot(strain[0], p_lv[0], 'o', color=c, ms=3)
+            p_trans = p_lv - p_rv
+            ax.plot(strain, p_trans, color=c, lw=1.2, ls='--',
+                    label=f"{lbl} (trans.)")
 
-        lo, hi = min(all_v) - 0.15, max(all_v) + 0.15
-        lo, hi = min(lo, 0.5), max(hi, 1.1)
-        ax.plot([lo, hi], [lo, hi], 'k--', alpha=0.3, lw=1.5, label="Ideal (y = x)")
+        ax.axhline(0, color='0.5', lw=0.4)
+        ax.axvline(0, color='0.5', lw=0.4)
+        if row == 0:
+            ax.set_title("Septum", fontweight="bold")
+        if row == 1:
+            ax.set_xlabel(xlabel)
+        if row == 0:
+            ax.legend(fontsize=5, loc='upper right', ncol=1, handlelength=1.2)
 
-        if first_proxy_pn is not None:
-            for i, lbl in enumerate(labels):
-                ax.annotate(lbl, (first_proxy_pn[i], tn[i]), xytext=(8, 8),
-                            textcoords='offset points', fontsize=9, color='dimgray')
-
-        ax.set_xlim(lo, hi); ax.set_ylim(lo, hi)
-        ax.set_aspect('equal')
-        ax.set_xlabel(f"PS Proxy Work [{strain_label}] (Normalized)", fontsize=10)
-        ax.set_ylabel(f"{truth_label}\n(Normalized)", fontsize=10)
-        ax.set_title(f"Septum  |  {truth_label}", fontweight='bold')
-        ax.legend(fontsize=7, loc='upper left')
-        ax.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    out = Path(outdir) / f"sensitivity_{suffix}.png"
-    plt.savefig(out, dpi=150)
-    print(f"  Saved: {out}")
-    plt.close()
+    fig.tight_layout(h_pad=0.8, w_pad=0.5)
+    _save(fig, outdir, "pressure_strain.png")
 
 
-def plot_sensitivity(results, labels, outdir):
-    """Generate sensitivity plot for longitudinal strain PS proxy (clinically relevant)."""
-    # Require longitudinal strain — no fallback
-    _plot_sensitivity_one(results, labels, outdir,
-                          "ll", "Longitudinal Strain E_ll (apex-to-base)", "longitudinal")
-
-
-# ─── Figure 2: Fiber Stress-Strain Loops ─────────────────────────────────────
+# ─── Figure 3: Fiber Stress-Strain Loops ─────────────────────────────────────
 
 def plot_stress_loops(results, labels, outdir):
     """
-    2×3 grid:
-      Row 0: fiber stress-strain loops (S_ff vs E_ff) for LV, RV, Septum
-      Row 1: fiber strain + pressure vs time         for LV, RV, Septum
+    2x3 grid:
+      Row 0: fiber stress-strain loops (S_ff vs E_ff)
+      Row 1: fiber strain and pressure vs time
     """
-    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    fig.suptitle("Fiber Stress-Strain Loops (S_ff vs E_ff, circumferential): LV & RV + Septum  (Healthy vs PAH)",
-                 fontsize=13, fontweight='bold')
-
-    colors = ['tab:blue', 'tab:red']
+    fig, axes = plt.subplots(2, 3, figsize=(7.0, 4.5))
 
     regions = [
         ("LV",     "mean_E_ff_LV",     "mean_S_ff_LV",     "p_LV"),
@@ -287,78 +327,62 @@ def plot_stress_loops(results, labels, outdir):
     for col, (region, strain_key, stress_key, p_key) in enumerate(regions):
         ax_loop = axes[0, col]
         ax_time = axes[1, col]
-        ax2 = ax_time.twinx()
-        ax2.set_ylabel("Pressure (mmHg)", fontsize=8, color='dimgray')
-        ax2.tick_params(axis='y', labelcolor='dimgray')
 
-        for i, (r, lbl, c) in enumerate(zip(results, labels, colors)):
+        for r, lbl, c in zip(results, labels, COLORS):
             t    = get_array(r, 'time')
             Eff  = get_array(r, strain_key) * 100
-            Sff  = get_array(r, stress_key) / 1e3     # Pa → kPa
+            Sff  = get_array(r, stress_key) / 1e3
             pres = get_array(r, p_key)
+            if len(Eff) == 0:
+                continue
 
-            # Stress-strain loop
-            ax_loop.plot(Eff, Sff, color=c, lw=1.8, label=lbl)
-            if len(Eff) > 0:
-                ax_loop.plot(Eff[0], Sff[0], 'o', color=c, ms=6)
+            # Row 0: stress-strain loop
+            ax_loop.plot(Eff, Sff, color=c, lw=1.5, label=lbl)
+            ax_loop.plot(Eff[0], Sff[0], 'o', color=c, ms=3)
 
-            # Time traces
-            ax_time.plot(t, Eff, color=c, lw=1.5, label=lbl)
-            ax2.plot(t, pres, color=c, lw=1, ls='--', alpha=0.6)
+            # Row 1: strain vs time
+            ax_time.plot(t * 1000, Eff, color=c, lw=1.5, label=lbl)
+            # pressure on twin axis
+            ax2 = ax_time.twinx() if col == 2 else ax_time.twinx()
+            ax2.plot(t * 1000, pres, color=c, lw=0.8, ls=':', alpha=0.5)
+            ax2.tick_params(axis='y', labelsize=7, colors='0.5')
+            if col == 2:
+                ax2.set_ylabel("$P$ (mmHg)", fontsize=8, color='0.5')
+            else:
+                ax2.set_yticklabels([])
+            ax2.spines['right'].set_visible(True)
+            ax2.spines['right'].set_color('0.8')
 
-        # Format
-        ax_loop.set_xlabel(f"Fiber Strain E_ff (%)", fontsize=10)
-        ax_loop.set_ylabel(f"2nd-PK Fiber Stress S_ff (kPa)", fontsize=10)
-        ax_loop.set_title(f"{region} — Fiber Stress-Strain Loop\n"
-                          "(area ∝ net mechanical work)", fontweight='bold')
-        ax_loop.legend(fontsize=9)
-        ax_loop.grid(True, alpha=0.3)
-        ax_loop.axhline(0, color='k', lw=0.5, alpha=0.4)
-        ax_loop.axvline(0, color='k', lw=0.5, alpha=0.4)
+        ax_loop.axhline(0, color='0.5', lw=0.4)
+        ax_loop.axvline(0, color='0.5', lw=0.4)
+        ax_loop.set_title(region, fontweight="bold")
+        if col == 0:
+            ax_loop.set_ylabel(r"$S_{ff}$ (kPa)")
+            ax_loop.legend()
+        ax_time.set_xlabel("Time (ms)")
+        if col == 0:
+            ax_time.set_ylabel(r"$E_{ff}$ (%)")
 
-        ax_time.set_xlabel("Time (s)", fontsize=10)
-        ax_time.set_ylabel(f"Fiber Strain E_ff (%)", fontsize=10)
-        ax_time.set_title(f"{region} — Fiber Strain vs Time\n"
-                          "(dashed = pressure)", fontweight='bold')
-        ax_time.legend(fontsize=9)
-        ax_time.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-    out = Path(outdir) / "stress_loops.png"
-    plt.savefig(out, dpi=150)
-    print(f"  Saved: {out}")
-    plt.close()
+    fig.tight_layout(h_pad=0.8, w_pad=1.2)
+    _save(fig, outdir, "stress_loops.png")
 
 
-# ─── Figure 3: Work Decomposition ────────────────────────────────────────────
+# ─── Figure 4: Work Decomposition ────────────────────────────────────────────
 
 def plot_work_decomposition(results, labels, outdir):
     """
-    1×3 grouped bar chart: fiber/sheet/normal/shear for LV, RV, Septum.
+    1x3 grouped bar chart: fiber/sheet/normal/cross work for LV, RV, Septum.
     PS proxy shown as horizontal reference lines.
     """
     components = [
-        ("work_ff",    "Fiber\n(S_ff·dE_ff)\ncircumferential"),
-        ("work_ss",    "Sheet\n(S_ss·dE_ss)\napicobasal"),
-        ("work_nn",    "Transmural\n(S_nn·dE_nn)\nsheet-normal"),
-        ("work_cross", "Cross\n(off-diagonal)"),
+        ("work_ff",    "Fiber"),
+        ("work_ss",    "Sheet"),
+        ("work_nn",    "Normal"),
+        ("work_cross", "Cross"),
     ]
 
-    case_colors = ['tab:blue', 'tab:red']
-
-    # PS proxy uses precomputed longitudinal strain (E_ll)
-    # Fail hard if not available — requires new simulation with work_ps_ll_* keys
-    ps_strain_tag = "E_ll"
-
-    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
-    fig.suptitle(
-        "Work Decomposition: Fiber (circ.) / Sheet (apico.) / Transmural / Cross\n"
-        f"(negative = work done BY myocardium | PS proxy uses P × {ps_strain_tag}, shown as dashed lines)",
-        fontsize=13, fontweight='bold'
-    )
-
     def _ps_ll(r, region, p_variant="default"):
-        """Read precomputed PS work using longitudinal strain (work_ps_ll_*)."""
+        """Get precomputed PS proxy work (mJ) using longitudinal strain."""
         if region in ("LV", "RV"):
             key = f"work_ps_ll_{region}"
         elif p_variant == "default":
@@ -368,8 +392,10 @@ def plot_work_decomposition(results, labels, outdir):
         else:
             raise ValueError(f"Unknown p_variant: {p_variant}")
         if key not in r:
-            raise KeyError(f"Missing precomputed key '{key}' — rerun simulation with updated metrics_calculator")
+            raise KeyError(f"Missing '{key}' — rerun postprocessing")
         return total_work(r, key) * 1e3
+
+    fig, axes = plt.subplots(1, 3, figsize=(7.0, 3.0))
 
     for ax, region in zip(axes, ["LV", "RV", "Septum"]):
         x = np.arange(len(components))
@@ -380,499 +406,125 @@ def plot_work_decomposition(results, labels, outdir):
             vals = [total_work(r, f"{ckey}_{region}") * 1e3 for ckey, _ in components]
             offset = (j - (n - 1) / 2) * width
             ax.bar(x + offset, vals, width,
-                   label=lbl, color=case_colors[j],
-                   alpha=0.75 if j == 0 else 0.55,
-                   edgecolor='k', linewidth=0.5)
+                   label=lbl, color=COLORS[j],
+                   alpha=0.85 if j == 0 else 0.65,
+                   edgecolor='none')
 
-        # PS proxy reference lines (using longitudinal strain)
+        # PS proxy reference lines
         if region in ("LV", "RV"):
             for j, (r, lbl) in enumerate(zip(results, labels)):
                 ps_val = _ps_ll(r, region)
-                ax.axhline(ps_val, ls=':', lw=1.5, color=case_colors[j],
-                           label=f"PS({ps_strain_tag}) ({lbl})")
-        else:  # Septum: P_LV and Trans only
-            for p_variant, plbl, ls_style in [
-                ("default", f"PS(P_LV, {ps_strain_tag})", ':'),
-                ("trans",   f"PS(Trans, {ps_strain_tag})", '-.'),
-            ]:
+                ax.axhline(ps_val, ls=':', lw=1.0, color=COLORS[j], alpha=0.7)
+        else:
+            for p_variant, ls_style in [("default", ':'), ("trans", '-.')]:
                 for j, (r, lbl) in enumerate(zip(results, labels)):
                     ps_val = _ps_ll(r, region, p_variant)
-                    ax.axhline(ps_val, ls=ls_style, lw=1.5, color=case_colors[j],
-                               alpha=0.7, label=f"{plbl} ({lbl})")
+                    lbl_str = r"$P_{LV}$" if p_variant == "default" else "Trans."
+                    ax.axhline(ps_val, ls=ls_style, lw=1.0, color=COLORS[j],
+                               alpha=0.6, label=f"PS {lbl_str} ({lbl})" if j == 0 else None)
 
         ax.set_xticks(x)
-        ax.set_xticklabels([clbl for _, clbl in components], fontsize=9)
-        ax.set_ylabel("Work (mJ)", fontsize=11)
-        ax.set_title(f"{region}", fontweight='bold', fontsize=12)
-        ax.legend(fontsize=7, loc='best')
-        ax.grid(True, alpha=0.3, axis='y')
-        ax.axhline(0, color='k', lw=0.8)
-
-    plt.tight_layout()
-    out = Path(outdir) / "work_decomposition.png"
-    plt.savefig(out, dpi=150)
-    print(f"  Saved: {out}")
-    plt.close()
-
-
-# ─── Figure 4: Pressure-Strain Loops ─────────────────────────────────────────
-
-def plot_pressure_strain(results, labels, outdir):
-    """
-    2×3 panel: pressure-strain loops for LV, RV, Septum.
-    Row 0: Fiber strain (E_ff — circumferential direction)
-    Row 1: Longitudinal strain (E_ll preferred, E_nn fallback)
-    For Septum, both P_LV and transmural (P_LV-P_RV) loops are shown.
-    """
-    strain_rows = [
-        ("mean_E_ff", "Fiber Strain E_ff (circumferential)"),
-        ("mean_E_ll", "Longitudinal Strain E_ll (apex-to-base)"),
-    ]
-
-    n_rows = len(strain_rows)
-    fig, axes = plt.subplots(n_rows, 3, figsize=(20, 6 * n_rows), squeeze=False)
-    fig.suptitle(
-        "Pressure-Strain Loops: LV & RV Freewalls + Septum  (Healthy vs PAH)\n"
-        "(loop area ~ pressure-strain work index)",
-        fontsize=13, fontweight='bold'
-    )
-
-    colors = ['tab:blue', 'tab:red']
-
-    for row, (strain_prefix, strain_label) in enumerate(strain_rows):
-        # Freewalls
-        for col, (region, p_key) in enumerate([("LV", "p_LV"), ("RV", "p_RV")]):
-            ax = axes[row, col]
-            strain_key = f"{strain_prefix}_{region}"
-            for r, lbl, c in zip(results, labels, colors):
-                strain = get_array(r, strain_key) * 100
-                pressure = get_array(r, p_key)
-                if len(strain) == 0 or len(pressure) == 0:
-                    continue
-                ax.plot(strain, pressure, color=c, lw=1.8, label=lbl)
-                ax.plot(strain[0], pressure[0], 'o', color=c, ms=6)
-
-            short_label = strain_label.split("(")[0].strip()
-            ax.set_xlabel(f"{region} {strain_label} (%)", fontsize=10)
-            ax.set_ylabel(f"{region} Cavity Pressure (mmHg)", fontsize=10)
-            ax.set_title(f"{region} Freewall — {short_label}", fontweight='bold')
-            ax.legend(fontsize=10)
-            ax.grid(True, alpha=0.3)
-            ax.axhline(0, color='k', lw=0.5, alpha=0.4)
-            ax.axvline(0, color='k', lw=0.5, alpha=0.4)
-
-        # Septum: show P_LV and transmural loops
-        ax = axes[row, 2]
-        strain_key = f"{strain_prefix}_Septum"
-        for r, lbl, c in zip(results, labels, colors):
-            strain = get_array(r, strain_key) * 100
-            p_lv = get_array(r, 'p_LV')
-            p_rv = get_array(r, 'p_RV')
-            if len(strain) == 0:
-                continue
-
-            ax.plot(strain, p_lv, color=c, lw=1.8, label=f"{lbl} (P_LV)")
-            ax.plot(strain[0], p_lv[0], 'o', color=c, ms=6)
-
-            p_trans = p_lv - p_rv
-            ax.plot(strain, p_trans, color=c, lw=1.8, ls='--',
-                    label=f"{lbl} (P_LV-P_RV)")
-            ax.plot(strain[0], p_trans[0], 's', color=c, ms=5)
-
-        short_label = strain_label.split("(")[0].strip()
-        ax.set_xlabel(f"Septum {strain_label} (%)", fontsize=10)
-        ax.set_ylabel("Pressure (mmHg)", fontsize=10)
-        ax.set_title(f"Septum — {short_label}\n"
-                     "(solid = P_LV, dashed = transmural)", fontweight='bold')
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-        ax.axhline(0, color='k', lw=0.5, alpha=0.4)
-        ax.axvline(0, color='k', lw=0.5, alpha=0.4)
-
-    plt.tight_layout()
-    out = Path(outdir) / "pressure_strain.png"
-    plt.savefig(out, dpi=150)
-    print(f"  Saved: {out}")
-    plt.close()
-
-
-# ─── Figure 5: Longitudinal Strain Pressure-Strain Loops ─────────────────────
-
-def plot_pressure_strain_longitudinal(results, labels, outdir):
-    """
-    1×3 panel: pressure vs longitudinal (sheet-normal) strain for LV, RV, Septum.
-    Longitudinal direction (n0 from LDRB) is the clinical echo/CMR GLS analogue.
-    Falls back to fiber strain if longitudinal keys are unavailable.
-    """
-    # Check available keys and report
-    sample = results[0]
-    print("  [pressure_strain_longitudinal] Available strain keys:")
-    for k in sorted(sample.keys()):
-        if k.startswith("mean_E_"):
-            print(f"    {k}")
-
-    # Determine which strain key to use (prefer nn = longitudinal)
-    if "mean_E_nn_LV" in sample:
-        strain_suffix = "mean_E_nn"
-        strain_label = "Longitudinal Strain E_nn"
-    else:
-        print("  WARNING: mean_E_nn_* not found, falling back to fiber strain E_ff")
-        strain_suffix = "mean_E_ff"
-        strain_label = "Fiber Strain E_ff (longitudinal proxy)"
-
-    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
-    fig.suptitle(
-        f"Pressure-Strain Loops — Clinical Perspective ({strain_label})\n"
-        "(longitudinal strain is what echo/CMR measures; loop area ~ myocardial work index)",
-        fontsize=13, fontweight='bold'
-    )
-
-    colors = ['tab:blue', 'tab:red']
-
-    # Freewalls
-    for ax, region, p_key in [
-        (axes[0], "LV", "p_LV"),
-        (axes[1], "RV", "p_RV"),
-    ]:
-        strain_key = f"{strain_suffix}_{region}"
-        for i, (r, lbl, c) in enumerate(zip(results, labels, colors)):
-            strain = get_array(r, strain_key) * 100
-            pressure = get_array(r, p_key)
-            if len(strain) == 0 or len(pressure) == 0:
-                continue
-            ax.plot(strain, pressure, color=c, lw=1.8, label=lbl)
-            ax.plot(strain[0], pressure[0], 'o', color=c, ms=6)
-
-        ax.set_xlabel(f"{region} {strain_label} (%)", fontsize=10)
-        ax.set_ylabel(f"{region} Cavity Pressure (mmHg)", fontsize=10)
-        ax.set_title(f"{region} Freewall — Pressure-Strain Loop", fontweight='bold')
-        ax.legend(fontsize=10)
-        ax.grid(True, alpha=0.3)
-        ax.axhline(0, color='k', lw=0.5, alpha=0.4)
-        ax.axvline(0, color='k', lw=0.5, alpha=0.4)
-
-    # Septum: P_LV and transmural loops
-    ax = axes[2]
-    strain_key = f"{strain_suffix}_Septum"
-    for i, (r, lbl, c) in enumerate(zip(results, labels, colors)):
-        strain = get_array(r, strain_key) * 100
-        p_lv = get_array(r, 'p_LV')
-        p_rv = get_array(r, 'p_RV')
-        if len(strain) == 0:
-            continue
-
-        ax.plot(strain, p_lv, color=c, lw=1.8, label=f"{lbl} (P_LV)")
-        ax.plot(strain[0], p_lv[0], 'o', color=c, ms=6)
-
-        p_trans = p_lv - p_rv
-        ax.plot(strain, p_trans, color=c, lw=1.8, ls='--',
-                label=f"{lbl} (P_LV-P_RV)")
-        ax.plot(strain[0], p_trans[0], 's', color=c, ms=5)
-
-    ax.set_xlabel(f"Septum {strain_label} (%)", fontsize=10)
-    ax.set_ylabel("Pressure (mmHg)", fontsize=10)
-    ax.set_title("Septum — Pressure-Strain Loops\n"
-                 "(solid = P_LV, dashed = transmural)", fontweight='bold')
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
-    ax.axhline(0, color='k', lw=0.5, alpha=0.4)
-    ax.axvline(0, color='k', lw=0.5, alpha=0.4)
-
-    plt.tight_layout()
-    out = Path(outdir) / "pressure_strain_longitudinal.png"
-    plt.savefig(out, dpi=150)
-    print(f"  Saved: {out}")
-    plt.close()
-
-
-# ─── Figure 6: Multi-Component Stress-Strain Loops ──────────────────────────
-
-def plot_stress_loops_components(results, labels, outdir):
-    """
-    2×3 grid (rows: cases, columns: LV/RV/Septum).
-    Each subplot overlays fiber, sheet, and normal stress-strain loops.
-    """
-    # Check available keys and report
-    sample = results[0]
-    print("  [stress_loops_components] Available stress/strain keys:")
-    for k in sorted(sample.keys()):
-        if k.startswith("mean_S_") or k.startswith("mean_E_"):
-            print(f"    {k}")
-
-    components = [
-        ("ff", "Fiber",  "tab:blue"),
-        ("ss", "Sheet",  "tab:orange"),
-        ("nn", "Normal", "tab:green"),
-    ]
-    regions = ["LV", "RV", "Septum"]
-
-    n_rows = len(results)
-    fig, axes = plt.subplots(n_rows, 3, figsize=(18, 5 * n_rows), squeeze=False)
-    fig.suptitle(
-        "Multi-Component Stress-Strain Loops: Fiber / Sheet / Normal\n"
-        "(enclosed area proportional to work contribution in each direction)",
-        fontsize=13, fontweight='bold'
-    )
-
-    for row, (r, lbl) in enumerate(zip(results, labels)):
-        for col, region in enumerate(regions):
-            ax = axes[row, col]
-            has_data = False
-
-            for comp, comp_label, color in components:
-                strain_key = f"mean_E_{comp}_{region}"
-                stress_key = f"mean_S_{comp}_{region}"
-
-                strain = get_array(r, strain_key)
-                stress = get_array(r, stress_key)
-
-                if len(strain) == 0 or len(stress) == 0:
-                    ax.text(0.5, 0.5 - 0.1 * components.index((comp, comp_label, color)),
-                            f"{comp_label}: no data ({strain_key})",
-                            transform=ax.transAxes, ha='center', fontsize=8,
-                            color='gray')
-                    continue
-
-                has_data = True
-                strain_pct = strain * 100
-                stress_kpa = stress / 1e3
-
-                ax.plot(strain_pct, stress_kpa, color=color, lw=1.8, label=comp_label)
-                ax.plot(strain_pct[0], stress_kpa[0], 'o', color=color, ms=5)
-
-            ax.set_xlabel("Strain (%)", fontsize=10)
-            ax.set_ylabel("2nd-PK Stress (kPa)", fontsize=10)
-            ax.set_title(f"{lbl} — {region}", fontweight='bold')
-            ax.legend(fontsize=9)
-            ax.grid(True, alpha=0.3)
-            ax.axhline(0, color='k', lw=0.5, alpha=0.4)
-            ax.axvline(0, color='k', lw=0.5, alpha=0.4)
-
-    plt.tight_layout()
-    out = Path(outdir) / "stress_loops_components.png"
-    plt.savefig(out, dpi=150)
-    print(f"  Saved: {out}")
-    plt.close()
-
-
-# ─── Figure 7: Fiber Work Efficiency Ratio ───────────────────────────────────
-
-def plot_fiber_efficiency(results, labels, outdir):
-    """
-    1×2 grouped bar chart: fiber efficiency and normal fraction per region.
-    efficiency = work_ff / work_true
-    normal_fraction = work_nn / work_true
-    """
-    regions = ["LV", "RV", "Septum"]
-    case_colors = ['tab:blue', 'tab:red']
-
-    # Compute ratios and print table
-    W = 90
-    print("\n" + "=" * W)
-    print(f"{'FIBER EFFICIENCY & TRANSMURAL FRACTION':^{W}}")
-    print("=" * W)
-    print(f"  {'Region':<10} {'Case':<10} {'W_true (mJ)':>12} {'W_ff (mJ)':>13} "
-          f"{'W_nn (mJ)':>14} {'Fiber Eff':>10} {'Trans Frac':>12}")
-    print("-" * W)
-
-    table = {}  # (region, case_idx) -> (fiber_eff, normal_frac)
-    for j, (r, lbl) in enumerate(zip(results, labels)):
-        for region in regions:
-            wt = total_work(r, f"work_true_{region}")
-            wf = total_work(r, f"work_ff_{region}")
-            wn = total_work(r, f"work_nn_{region}")
-            fe = wf / wt if abs(wt) > 1e-15 else float('nan')
-            nf = wn / wt if abs(wt) > 1e-15 else float('nan')
-            table[(region, j)] = (fe, nf)
-            print(f"  {region:<10} {lbl:<10} {wt*1e3:>12.3f} {wf*1e3:>13.3f} "
-                  f"{wn*1e3:>14.3f} {fe:>10.3f} {nf:>12.3f}")
-
-    if len(results) >= 2:
-        print("-" * W)
-        print("  Change Healthy → PAH:")
-        for region in regions:
-            fe_h, nf_h = table[(region, 0)]
-            fe_p, nf_p = table[(region, 1)]
-            print(f"    {region:<10} Fiber Eff: {fe_h:.3f} → {fe_p:.3f} (Δ{fe_p-fe_h:+.3f})   "
-                  f"Trans Frac: {nf_h:.3f} → {nf_p:.3f} (Δ{nf_p-nf_h:+.3f})")
-    print("=" * W)
-
-    # Plot (Septum excluded — work_true near zero in PAH makes ratios undefined)
-    plot_regions = ["LV", "RV"]
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    fig.suptitle(
-        "Fiber Work Efficiency & Transmural Work Fraction by Region\n"
-        "(efficiency = W_component / W_true;  key question: does RV fiber efficiency collapse in PAH?)",
-        fontsize=12, fontweight='bold'
-    )
-
-    x = np.arange(len(plot_regions))
-    n = len(results)
-    width = 0.35
-
-    for panel, (ax, metric_label, metric_idx) in enumerate(zip(
-        axes,
-        ["Fiber Efficiency\n(W_ff / W_true)", "Transmural Fraction\n(W_nn / W_true)"],
-        [0, 1],
-    )):
-        for j, (r, lbl) in enumerate(zip(results, labels)):
-            vals = [table[(reg, j)][metric_idx] for reg in plot_regions]
-            offset = (j - (n - 1) / 2) * width
-            bars = ax.bar(x + offset, vals, width,
-                          label=lbl, color=case_colors[j],
-                          alpha=0.75 if j == 0 else 0.55,
-                          edgecolor='k', linewidth=0.5)
-            for bar, v in zip(bars, vals):
-                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                        f"{v:.2f}", ha='center', va='bottom', fontsize=8)
-
-        ax.set_xticks(x)
-        ax.set_xticklabels(plot_regions, fontsize=11)
-        ax.set_ylabel("Fraction of Total Work", fontsize=11)
-        ax.set_ylim(-0.1, 1.0)
-        ax.set_title(metric_label, fontweight='bold')
-        ax.legend(fontsize=9)
-        ax.grid(True, alpha=0.3, axis='y')
-        ax.axhline(0, color='k', lw=0.8)
-        ax.axhline(1, color='k', lw=0.5, ls=':', alpha=0.3)
-
-    fig.text(0.5, -0.02,
-             "Septum excluded: work_true near zero in PAH makes efficiency ratios undefined.",
-             ha='center', fontsize=9, style='italic', color='dimgray')
-
-    plt.tight_layout(rect=[0, 0.03, 1, 1])
-    out = Path(outdir) / "fiber_efficiency.png"
-    plt.savefig(out, dpi=150, bbox_inches='tight')
-    print(f"  Saved: {out}")
-    plt.close()
-
-
-# ─── Figure 8: PS Proxy Directional Correlation ─────────────────────────────
-
-def plot_proxy_directional_match(results, labels, outdir):
-    """
-    1×3 grouped bar chart: PS proxy (with 3 strain directions) vs true work components.
-    Shows PS(E_ff), PS(E_nn), PS(E_ss) alongside fiber/sheet/normal/shear true work.
-    """
-    regions = ["LV", "RV", "Septum"]
-    case_colors = ['tab:blue', 'tab:red']
-
-    def p_key_for(region):
-        return "p_LV" if region in ("LV", "Septum") else "p_RV"
-
-    long_short = "E_ll"
-
-    # Bar categories: 3 PS proxy variants + 4 true work components
-    components = [
-        (f"PS({long_short})\nlongitud.", "ps_long"),
-        ("PS(E_ff)\nfiber",   "ps_ff"),
-        ("PS(E_ss)\nsheet",   "ps_ss"),
-        ("W_ff\n(circ.)",     "work_ff"),
-        ("W_ss\n(apico.)",    "work_ss"),
-        ("W_nn\n(transm.)",   "work_nn"),
-        ("W_cross\n(off-diag)", "work_cross"),
-    ]
-
-    # Print table
-    W = 120
-    print("\n" + "=" * W)
-    print(f"{'PS PROXY (3 strain dirs) vs DIRECTIONAL WORK COMPONENTS (mJ)':^{W}}")
-    print("=" * W)
-    print(f"  Longitudinal strain: E_ll (apex-to-base)")
-
-    def _ps_precomputed(r, strain_comp, region):
-        """Read precomputed PS proxy for given strain component and region."""
+        ax.set_xticklabels([clbl for _, clbl in components], fontsize=8)
+        ax.set_title(region, fontweight='bold')
+        ax.axhline(0, color='k', lw=0.5)
+        if region == "LV":
+            ax.set_ylabel("Work (mJ)")
+            ax.legend(fontsize=6.5, loc='best')
         if region == "Septum":
-            key = f"work_ps_{strain_comp}_Septum_PLV"
-        else:
-            key = f"work_ps_{strain_comp}_{region}"
-        if key not in r:
-            raise KeyError(f"Missing precomputed key '{key}' — rerun simulation with updated metrics_calculator")
-        return total_work(r, key)
+            ax.legend(fontsize=6, loc='best')
 
-    for region in regions:
-        print(f"\n  ── {region} (pressure: {'P_LV' if region != 'RV' else 'P_RV'}) ──")
-        print(f"  {'Case':<10} {'PS('+long_short+')':>10} {'PS(E_ff)':>10} {'PS(E_ss)':>10} "
-              f"{'W_ff':>10} {'W_ss':>10} {'W_nn':>10} {'W_cross':>10}")
-        print("  " + "-" * 100)
-        for r, lbl in zip(results, labels):
-            ps_long = _ps_precomputed(r, "ll", region) * 1e3
-            ps_ff = _ps_precomputed(r, "ff", region) * 1e3
-            ps_ss = compute_ps_work_scaled(r, f"mean_E_ss_{region}", p_key_for(region), region) * 1e3
-            wf  = total_work(r, f"work_ff_{region}") * 1e3
-            ws  = total_work(r, f"work_ss_{region}") * 1e3
-            wn  = total_work(r, f"work_nn_{region}") * 1e3
-            wsh = total_work(r, f"work_cross_{region}") * 1e3
-            print(f"  {lbl:<10} {ps_long:>10.3f} {ps_ff:>10.3f} {ps_ss:>10.3f} "
-                  f"{wf:>10.3f} {ws:>10.3f} {wn:>10.3f} {wsh:>10.3f}")
-
-    print("=" * W)
-
-    # Plot
-    fig, axes = plt.subplots(1, 3, figsize=(22, 7))
-    fig.suptitle(
-        f"PS Proxy (3 strain directions) vs True Work Components\n"
-        f"PS({long_short}) = longitudinal (clinical GLS analogue)  |  "
-        f"PS(E_ff) = fiber (circumferential)",
-        fontsize=12, fontweight='bold'
-    )
-
-    for ax, region in zip(axes, regions):
-        x = np.arange(len(components))
-        n = len(results)
-        width = 0.35
-
-        for j, (r, lbl) in enumerate(zip(results, labels)):
-            vals = []
-            for _, comp_id in components:
-                if comp_id == "ps_long":
-                    vals.append(_ps_precomputed(r, "ll", region) * 1e3)
-                elif comp_id == "ps_ff":
-                    vals.append(_ps_precomputed(r, "ff", region) * 1e3)
-                elif comp_id == "ps_ss":
-                    vals.append(compute_ps_work_scaled(r, f"mean_E_ss_{region}", p_key_for(region), region) * 1e3)
-                else:
-                    vals.append(total_work(r, f"{comp_id}_{region}") * 1e3)
-            offset = (j - (n - 1) / 2) * width
-            ax.bar(x + offset, vals, width,
-                   label=lbl, color=case_colors[j],
-                   alpha=0.75 if j == 0 else 0.55,
-                   edgecolor='k', linewidth=0.5)
-
-        ax.set_xticks(x)
-        ax.set_xticklabels([c[0] for c in components], fontsize=8)
-        ax.set_ylabel("Work (mJ)", fontsize=11)
-        p_label = "P_LV" if region != "RV" else "P_RV"
-        ax.set_title(f"{region}  (pressure = {p_label})", fontweight='bold', fontsize=12)
-        ax.legend(fontsize=9)
-        ax.grid(True, alpha=0.3, axis='y')
-        ax.axhline(0, color='k', lw=0.8)
-
-    plt.tight_layout()
-    out = Path(outdir) / "proxy_directional_match.png"
-    plt.savefig(out, dpi=150)
-    print(f"  Saved: {out}")
-    plt.close()
+    fig.tight_layout(w_pad=0.8)
+    _save(fig, outdir, "work_decomposition.png")
 
 
-# ─── Figure 9: Biventricular Work Redistribution ────────────────────────────
+# ─── Figure 5: Pressure vs Transmural Stress ─────────────────────────────────
+
+def plot_pressure_vs_radial_stress(results, labels, outdir):
+    """
+    2x3 panel: why cavity pressure tracks wall stress.
+      Row 0: P(t) and -sigma_nn(t) overlaid
+      Row 1: scatter of -sigma_nn vs P with regression
+    """
+    regions = [
+        ("LV",     "mean_sigma_nn_LV",     "p_LV",  None),
+        ("RV",     "mean_sigma_nn_RV",     "p_RV",  None),
+        ("Septum", "mean_sigma_nn_Septum", "p_LV",  "p_RV"),
+    ]
+
+    fig, axes = plt.subplots(2, 3, figsize=(7.0, 4.5))
+
+    for col, (region, sigma_key, p_key, _) in enumerate(regions):
+        ax_time = axes[0, col]
+        ax_scatter = axes[1, col]
+
+        for i, (r, lbl, c) in enumerate(zip(results, labels, COLORS)):
+            t = get_array(r, 'time')
+            sigma_nn = get_array(r, sigma_key)
+            pres_Pa = get_array(r, p_key) * 133.322
+
+            if len(t) == 0 or len(sigma_nn) == 0:
+                continue
+
+            neg_sigma = -sigma_nn
+
+            # Row 0: time traces
+            ax_time.plot(t * 1000, pres_Pa / 1e3, color=c, lw=1.5,
+                         label=f"{lbl} $P$")
+            ax_time.plot(t * 1000, neg_sigma / 1e3, color=c, lw=1.2, ls='--',
+                         label=r"{} $-\bar{{\sigma}}_{{nn}}$".format(lbl))
+
+            # Row 1: scatter
+            ax_scatter.scatter(pres_Pa / 1e3, neg_sigma / 1e3, color=c, s=8,
+                               alpha=0.4, label=lbl, rasterized=True)
+
+            # Regression through origin
+            if len(pres_Pa) > 2:
+                slope = np.sum(neg_sigma * pres_Pa) / np.sum(pres_Pa**2)
+                p_fit = np.linspace(0, pres_Pa.max(), 50)
+                ax_scatter.plot(p_fit / 1e3, slope * p_fit / 1e3, color=c, lw=1.0,
+                                ls=':', alpha=0.8)
+                # Annotate slope
+                ax_scatter.text(0.95, 0.15 - i * 0.12,
+                                f"slope = {slope:.2f}",
+                                transform=ax_scatter.transAxes,
+                                fontsize=7, color=c, ha='right')
+
+        # Reference: y = 0.5x
+        xlim = ax_scatter.get_xlim()
+        x_ref = np.linspace(0, max(xlim[1], 1) * 1.1, 50)
+        ax_scatter.plot(x_ref, 0.5 * x_ref, 'k--', lw=0.8, alpha=0.3,
+                        label=r"$\sigma_{nn} = P/2$")
+
+        ax_time.set_title(region, fontweight='bold')
+        if col == 0:
+            ax_time.set_ylabel("Stress / Pressure (kPa)")
+            ax_time.legend(fontsize=5, loc='upper right', ncol=1, handlelength=1.0)
+            ax_scatter.set_ylabel(r"$-\bar{\sigma}_{nn}$ (kPa)")
+        ax_scatter.set_xlabel("$P$ (kPa)")
+        if col == 0:
+            ax_scatter.legend(fontsize=5, loc='upper left', handlelength=1.0)
+
+    fig.tight_layout(h_pad=0.8, w_pad=0.8)
+    _save(fig, outdir, "pressure_vs_transmural_stress.png")
+
+
+# ─── Figure 6: Work Redistribution ───────────────────────────────────────────
 
 def plot_work_redistribution(results, labels, outdir):
     """
-    1×2 stacked bar chart: regional share of total biventricular work.
-    Panel 1: total work (work_true). Panel 2: fiber work only.
+    Bar chart: absolute regional work (LV, RV, Septum) with percentage annotations.
+    2 panels: total work, fiber work.  Optional 3rd: work density if volumes available.
     """
     regions = ["LV", "RV", "Septum"]
-    region_colors = ['tab:blue', 'tab:red', 'tab:green']
 
     W = 90
     print("\n" + "=" * W)
     print(f"{'BIVENTRICULAR WORK REDISTRIBUTION':^{W}}")
     print("=" * W)
 
-    shares = {}  # (work_type, case_idx) -> [lv%, rv%, septum%]
+    shares = {}
     for wtype, wkey in [("Total", "work_true"), ("Fiber", "work_ff")]:
-        print(f"\n  ── {wtype} Work ──")
+        print(f"\n  -- {wtype} Work --")
         print(f"  {'Case':<10} {'LV (mJ)':>10} {'RV (mJ)':>10} {'Sep (mJ)':>10} "
               f"{'Total (mJ)':>11} {'LV%':>6} {'RV%':>6} {'Sep%':>6}")
         print("  " + "-" * 73)
@@ -881,30 +533,22 @@ def plot_work_redistribution(results, labels, outdir):
             tot = sum(vals)
             pcts = [v / tot * 100 if abs(tot) > 1e-15 else 0.0 for v in vals]
             shares[(wtype, j)] = pcts
-            print(f"  {lbl:<10} {vals[0]*1e3:>10.3f} {vals[1]*1e3:>10.3f} {vals[2]*1e3:>10.3f} "
-                  f"{tot*1e3:>11.3f} {pcts[0]:>5.1f}% {pcts[1]:>5.1f}% {pcts[2]:>5.1f}%")
-
-        if len(results) >= 2:
-            pct_h = shares[(wtype, 0)]
-            pct_p = shares[(wtype, 1)]
-            print(f"  {'Δ(PAH-H)':<10} "
-                  f"{'':>10} {'':>10} {'':>10} {'':>11} "
-                  f"{pct_p[0]-pct_h[0]:>+5.1f}% {pct_p[1]-pct_h[1]:>+5.1f}% {pct_p[2]-pct_h[2]:>+5.1f}%")
+            print(f"  {lbl:<10} {vals[0]*1e3:>10.2f} {vals[1]*1e3:>10.2f} {vals[2]*1e3:>10.2f} "
+                  f"{tot*1e3:>11.2f} {pcts[0]:>5.1f}% {pcts[1]:>5.1f}% {pcts[2]:>5.1f}%")
     print("=" * W)
 
-    # Plot: grouped bars showing absolute work (mJ) with percentage annotations
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    fig.suptitle(
-        "Biventricular Work Redistribution: Absolute Work by Region\n"
-        "(key question: does RV share of total work rise while fiber work share falls in PAH?)",
-        fontsize=12, fontweight='bold'
-    )
+    # Check for volume data
+    vol_m3_to_mL = 1e6
+    has_volumes = all(f"region_volume_{reg}" in results[0] for reg in regions)
+    n_panels = 3 if has_volumes else 2
+    fig, axes = plt.subplots(1, n_panels, figsize=(3.3 * n_panels, 3.0))
+    if n_panels == 1:
+        axes = [axes]
 
-    case_colors = ['tab:blue', 'tab:red']
+    panel_configs = [("Total work", "work_true"), ("Fiber work", "work_ff")]
 
-    for ax, (wtype, wkey) in zip(axes, [("Total Work", "work_true"), ("Fiber Work", "work_ff")]):
+    for ax, (panel_title, wkey) in zip(axes[:2], panel_configs):
         x = np.arange(len(regions))
-        n = len(results)
         width = 0.35
 
         for j, (r, lbl) in enumerate(zip(results, labels)):
@@ -913,320 +557,477 @@ def plot_work_redistribution(results, labels, outdir):
             vals_mJ = [v * 1e3 for v in reg_vals]
             pcts = [v / tot * 100 if abs(tot) > 1e-15 else 0.0 for v in reg_vals]
 
-            offset = (j - (n - 1) / 2) * width
+            offset = (j - 0.5) * width
             bars = ax.bar(x + offset, vals_mJ, width,
-                          label=lbl, color=case_colors[j],
-                          alpha=0.75 if j == 0 else 0.55,
-                          edgecolor='k', linewidth=0.5)
-            for bar, v_mJ, pct in zip(bars, vals_mJ, pcts):
-                va = 'bottom' if v_mJ >= 0 else 'top'
-                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(),
-                        f"{v_mJ:.2f}\n({pct:.0f}%)", ha='center', va=va, fontsize=7)
+                          label=lbl, color=COLORS[j],
+                          alpha=0.85 if j == 0 else 0.65,
+                          edgecolor='none')
+            for bar, pct in zip(bars, pcts):
+                h = bar.get_height()
+                va = 'bottom' if h >= 0 else 'top'
+                ax.text(bar.get_x() + bar.get_width() / 2, h,
+                        f"{pct:.0f}%", ha='center', va=va, fontsize=7, color='0.3')
 
         ax.set_xticks(x)
-        ax.set_xticklabels(regions, fontsize=11)
-        ax.set_ylabel("Work (mJ)", fontsize=11)
-        ax.set_title(wtype, fontweight='bold', fontsize=12)
-        ax.legend(fontsize=9, loc='best')
-        ax.grid(True, alpha=0.3, axis='y')
-        ax.axhline(0, color='k', lw=0.8)
+        ax.set_xticklabels(regions)
+        ax.set_title(panel_title, fontweight='bold')
+        ax.axhline(0, color='k', lw=0.5)
+        if ax == axes[0]:
+            ax.set_ylabel("Work (mJ)")
 
-    plt.tight_layout()
-    out = Path(outdir) / "work_redistribution.png"
-    plt.savefig(out, dpi=150)
-    print(f"  Saved: {out}")
-    plt.close()
+    # Panel 3: work density if available
+    if has_volumes:
+        ax = axes[2]
+        x = np.arange(len(regions))
+        width = 0.35
+        for j, (r, lbl) in enumerate(zip(results, labels)):
+            densities = []
+            for reg in regions:
+                w_mJ = total_work(r, f"work_true_{reg}") * 1e3
+                v_mL = float(r[f"region_volume_{reg}"]) * vol_m3_to_mL
+                densities.append(w_mJ / v_mL if v_mL > 0 else 0.0)
+            offset = (j - 0.5) * width
+            ax.bar(x + offset, densities, width,
+                   label=lbl, color=COLORS[j],
+                   alpha=0.85 if j == 0 else 0.65,
+                   edgecolor='none')
+        ax.set_xticks(x)
+        ax.set_xticklabels(regions)
+        ax.set_ylabel("Work density (mJ/mL)")
+        ax.set_title("Work density", fontweight='bold')
+        ax.axhline(0, color='k', lw=0.5)
+        ax.legend(fontsize=6, loc='lower right')
+
+    fig.tight_layout(w_pad=0.8)
+    _save(fig, outdir, "work_redistribution.png")
 
 
-# ─── Figure 10: Pressure-Strain Dyssynchrony Index ──────────────────────────
+# ─── Figure 7: Sensitivity / Proxy Tracking ──────────────────────────────────
 
-def plot_dyssynchrony(results, labels, outdir):
+def _plot_sensitivity_one(results, labels, outdir, strain_comp, strain_label, suffix):
     """
-    Grouped bar chart: time delay (ms) between peak cavity pressure and
-    peak fiber shortening (most negative E_ff) for each region and case.
+    2x3 grid: [Total truth, Fiber truth] x [LV, RV, Septum].
+    Healthy normalized to (1,1). Ideal tracking: points on y=x.
+    Uses independent x/y ranges so axes aren't squashed.
     """
-    regions_cfg = [
-        ("LV",     "mean_E_ff_LV",     [("P_LV", "p_LV")]),
-        ("RV",     "mean_E_ff_RV",     [("P_RV", "p_RV")]),
-        ("Septum", "mean_E_ff_Septum", [("P_LV", "p_LV"), ("P_RV", "p_RV")]),
+    fig, axes = plt.subplots(2, 3, figsize=(9.0, 5.5))
+
+    def get_proxy_total(r, region):
+        if region == "Septum":
+            key = f"work_ps_{strain_comp}_Septum_PLV"
+        else:
+            key = f"work_ps_{strain_comp}_{region}"
+        if key not in r:
+            raise KeyError(f"Missing '{key}'")
+        return total_work(r, key)
+
+    row_labels = ["Total work\n(normalized)", "Fiber work\n(normalized)"]
+
+    fw_configs = [
+        (0, 0, "LV", "work_true_LV"),
+        (0, 1, "RV", "work_true_RV"),
+        (1, 0, "LV", "work_ff_LV"),
+        (1, 1, "RV", "work_ff_RV"),
     ]
+
+    for row, col, region, truth_key in fw_configs:
+        ax = axes[row, col]
+        truth_vals = [total_work(r, truth_key) for r in results]
+        proxy_vals = [get_proxy_total(r, region) for r in results]
+
+        bt, bp = truth_vals[0], proxy_vals[0]
+        if abs(bt) < 1e-12 or abs(bp) < 1e-12:
+            continue
+
+        tn = [v / bt for v in truth_vals]
+        pn = [v / bp for v in proxy_vals]
+
+        # Independent x/y with generous padding
+        x_lo = min(min(pn), 0.5) - 0.1
+        x_hi = max(max(pn), 1.1) + 0.1
+        y_lo = min(min(tn), 0.5) - 0.1
+        y_hi = max(max(tn), 1.1) + 0.1
+        diag_lo, diag_hi = min(x_lo, y_lo), max(x_hi, y_hi)
+
+        ax.plot([diag_lo, diag_hi], [diag_lo, diag_hi], 'k--', alpha=0.15, lw=1)
+        ax.plot(pn, tn, 'o-', color=COLORS[0], lw=1.5, ms=8, zorder=5)
+        for i, lbl in enumerate(labels):
+            ax.annotate(lbl, (pn[i], tn[i]), xytext=(8, 8),
+                        textcoords='offset points', fontsize=7, color='0.4')
+
+        ax.set_xlim(x_lo, x_hi)
+        ax.set_ylim(y_lo, y_hi)
+        ax.grid(True, alpha=0.08)
+        if row == 0:
+            ax.set_title(f"{region} free wall", fontweight='bold')
+        if row == 1:
+            ax.set_xlabel("PS proxy (norm.)")
+        if col == 0:
+            ax.set_ylabel(row_labels[row])
+
+    # Septum: multiple pressure variants
+    septum_variants = [
+        ("p_LV",  r"$P_{LV}$",    COLORS[0],  "o"),
+        ("trans",  "Trans.",        REGION_COLORS["Septum"], "s"),
+        ("p_RV",  r"$P_{RV}$",    COLORS[1],  "^"),
+    ]
+
+    def get_septum_proxy(r, p_variant):
+        variant_map = {"p_LV": "PLV", "trans": "Trans", "p_RV": "PRV"}
+        key = f"work_ps_{strain_comp}_Septum_{variant_map[p_variant]}"
+        if key not in r:
+            raise KeyError(f"Missing '{key}'")
+        return total_work(r, key)
+
+    for row, truth_key in [
+        (0, "work_true_Septum"),
+        (1, "work_ff_Septum"),
+    ]:
+        ax = axes[row, 2]
+        truth_vals = [total_work(r, truth_key) for r in results]
+        bt = truth_vals[0]
+        if abs(bt) < 1e-12:
+            continue
+        tn = [v / bt for v in truth_vals]
+
+        all_x = []
+        for p_variant, plbl, pcol, pmk in septum_variants:
+            pvals = [get_septum_proxy(r, p_variant) for r in results]
+            bp = pvals[0]
+            if abs(bp) < 1e-12:
+                continue
+            pn = [v / bp for v in pvals]
+            all_x.extend(pn)
+            ax.plot(pn, tn, f'{pmk}-', color=pcol, lw=1.5, ms=7,
+                    label=plbl, zorder=5)
+
+        # Independent x/y with generous padding
+        x_lo = min(min(all_x), 0.5) - 0.1
+        x_hi = max(max(all_x), 1.1) + 0.1
+        y_lo = min(min(tn), 0.5) - 0.1
+        y_hi = max(max(tn), 1.1) + 0.1
+        diag_lo, diag_hi = min(x_lo, y_lo), max(x_hi, y_hi)
+        ax.plot([diag_lo, diag_hi], [diag_lo, diag_hi], 'k--', alpha=0.15, lw=1)
+
+        ax.annotate(labels[0], (1.0, 1.0), xytext=(8, 8),
+                    textcoords='offset points', fontsize=7, color='0.4')
+        if len(labels) > 1:
+            ax.annotate(labels[1], (all_x[1] if len(all_x) > 1 else 1.0, tn[1]),
+                        xytext=(8, -14), textcoords='offset points',
+                        fontsize=7, color='0.4')
+
+        ax.set_xlim(x_lo, x_hi)
+        ax.set_ylim(y_lo, y_hi)
+        ax.grid(True, alpha=0.08)
+        if row == 0:
+            ax.set_title("Septum", fontweight='bold')
+            ax.legend(fontsize=7, loc='upper left', handlelength=1.5,
+                      framealpha=0.9)
+        if row == 1:
+            ax.set_xlabel("PS proxy (norm.)")
+
+    fig.tight_layout(h_pad=1.2, w_pad=1.2)
+    _save(fig, outdir, f"sensitivity_{suffix}.png")
+
+
+def plot_sensitivity(results, labels, outdir):
+    _plot_sensitivity_one(results, labels, outdir,
+                          "ll", "Longitudinal Strain E_ll", "longitudinal")
+
+
+# ─── Figure 8: Geometry Context ───────────────────────────────────────────────
+
+def plot_geometry_context(results, labels, outdir):
+    """Region volumes, work density, and volume fractions."""
+    regions = ["LV", "RV", "Septum"]
+
+    vol_m3_to_mL = 1e6
+    volumes = {}
+    has_volumes = True
 
     W = 90
     print("\n" + "=" * W)
-    print(f"{'PRESSURE-STRAIN DYSSYNCHRONY INDEX':^{W}}")
+    print(f"{'GEOMETRY CONTEXT':^{W}}")
     print("=" * W)
-    print(f"  Delay = t(peak pressure) - t(peak fiber shortening, E_ff)  [ms]")
-    print(f"  Positive delay = pressure peaks AFTER max shortening")
-    print("-" * W)
 
-    # Collect all bar data: list of (bar_label, {case: delay_ms})
-    bar_data = []
+    for j, (r, lbl) in enumerate(zip(results, labels)):
+        for region in regions:
+            key = f"region_volume_{region}"
+            if key in r:
+                volumes[(j, region)] = float(r[key]) * vol_m3_to_mL
+            else:
+                has_volumes = False
+                volumes[(j, region)] = 0.0
 
-    for region, strain_key, pressure_defs in regions_cfg:
-        for p_label, p_key in pressure_defs:
-            bar_label = f"{region}\nvs {p_label}" if len(pressure_defs) > 1 else region
-            delays = {}
-            for j, (r, lbl) in enumerate(zip(results, labels)):
-                t = get_array(r, 'time')
-                strain = get_array(r, strain_key)
-                pressure = get_array(r, p_key)
-                if len(t) == 0 or len(strain) == 0 or len(pressure) == 0:
-                    delays[lbl] = float('nan')
+    if not has_volumes:
+        print("  No region_volume_* keys — skipping geometry context plot.")
+        print("=" * W)
+        return
+
+    # Print table
+    print(f"\n  {'Case':<15} {'LV (mL)':>10} {'RV (mL)':>10} {'Sep (mL)':>10}")
+    print("  " + "-" * 50)
+    for j, lbl in enumerate(labels):
+        vols = [volumes[(j, reg)] for reg in regions]
+        print(f"  {lbl:<15} {vols[0]:>10.2f} {vols[1]:>10.2f} {vols[2]:>10.2f}")
+    print("=" * W)
+
+    fig, axes = plt.subplots(1, 3, figsize=(7.0, 2.8))
+
+    # Panel 1: volumes
+    ax = axes[0]
+    x = np.arange(len(regions))
+    width = 0.35
+    for j, lbl in enumerate(labels):
+        vals = [volumes[(j, reg)] for reg in regions]
+        offset = (j - 0.5) * width
+        ax.bar(x + offset, vals, width, label=lbl, color=COLORS[j],
+               alpha=0.85 if j == 0 else 0.65, edgecolor='none')
+    ax.set_xticks(x)
+    ax.set_xticklabels(regions)
+    ax.set_ylabel("Wall volume (mL)")
+    ax.set_title("Region volumes", fontweight='bold')
+    ax.legend(fontsize=6, loc='upper right')
+
+    # Panel 2: work density
+    ax = axes[1]
+    densities = {}
+    for j, r in enumerate(results):
+        for region in regions:
+            w = total_work(r, f"work_true_{region}") * 1e3
+            v = volumes[(j, region)]
+            densities[(j, region)] = w / v if v > 0 else 0.0
+    for j, lbl in enumerate(labels):
+        vals = [densities[(j, reg)] for reg in regions]
+        offset = (j - 0.5) * width
+        ax.bar(x + offset, vals, width, label=lbl, color=COLORS[j],
+               alpha=0.85 if j == 0 else 0.65, edgecolor='none')
+    ax.set_xticks(x)
+    ax.set_xticklabels(regions)
+    ax.set_ylabel("Work density (mJ/mL)")
+    ax.set_title("Work density", fontweight='bold')
+    ax.axhline(0, color='k', lw=0.5)
+
+    # Panel 3: volume fractions
+    ax = axes[2]
+    for j, lbl in enumerate(labels):
+        vols = [volumes[(j, reg)] for reg in regions]
+        tot = sum(vols)
+        fracs = [v / tot * 100 if tot > 0 else 0 for v in vols]
+        bottom = 0
+        for k, (reg, frac) in enumerate(zip(regions, fracs)):
+            ax.bar(j, frac, bottom=bottom, color=REGION_COLORS[reg],
+                   label=reg if j == 0 else None, edgecolor='none')
+            if frac > 8:
+                ax.text(j, bottom + frac / 2, f"{frac:.0f}%",
+                        ha='center', va='center', fontsize=8, color='white',
+                        fontweight='bold')
+            bottom += frac
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("Volume fraction (%)")
+    ax.set_title("Composition", fontweight='bold')
+    ax.legend(fontsize=7)
+    ax.set_ylim(0, 105)
+
+    fig.tight_layout(w_pad=0.8)
+    _save(fig, outdir, "geometry_context.png")
+
+
+# ─── Extra Figures (--all mode) ──────────────────────────────────────────────
+
+def plot_stress_loops_components(results, labels, outdir):
+    """Multi-component stress-strain loops: ff, ss, nn for each region."""
+    components = [
+        ("ff", r"$S_{ff}$ vs $E_{ff}$"),
+        ("ss", r"$S_{ss}$ vs $E_{ss}$"),
+        ("nn", r"$S_{nn}$ vs $E_{nn}$"),
+    ]
+    regions = ["LV", "RV", "Septum"]
+
+    fig, axes = plt.subplots(len(components), 3, figsize=(7.0, 7.0))
+
+    for row, (comp, comp_label) in enumerate(components):
+        for col, region in enumerate(regions):
+            ax = axes[row, col]
+            strain_key = f"mean_E_{comp}_{region}"
+            stress_key = f"mean_S_{comp}_{region}"
+
+            for r, lbl, c in zip(results, labels, COLORS):
+                E = get_array(r, strain_key) * 100
+                S = get_array(r, stress_key) / 1e3
+                if len(E) == 0:
                     continue
-                t_peak_p = t[np.argmax(pressure)]
-                t_peak_short = t[np.argmin(strain)]  # most negative = peak shortening
-                delay_ms = (t_peak_p - t_peak_short) * 1000
-                delays[lbl] = delay_ms
-                print(f"  {region:<8} vs {p_label:<4}  {lbl:<10}  "
-                      f"t_peak_P={t_peak_p*1000:.0f}ms  t_peak_short={t_peak_short*1000:.0f}ms  "
-                      f"delay={delay_ms:+.1f}ms")
-            bar_data.append((bar_label, delays))
+                ax.plot(E, S, color=c, lw=1.5, label=lbl)
+                ax.plot(E[0], S[0], 'o', color=c, ms=3)
 
-    print("=" * W)
+            ax.axhline(0, color='0.5', lw=0.4)
+            ax.axvline(0, color='0.5', lw=0.4)
+            if row == 0:
+                ax.set_title(region, fontweight='bold')
+            if col == 0:
+                ax.set_ylabel(comp_label)
+            if row == len(components) - 1:
+                ax.set_xlabel("Strain (%)")
+            if row == 0 and col == 0:
+                ax.legend(fontsize=6, loc='best', handlelength=1.0)
 
-    # Plot
-    case_colors = ['tab:blue', 'tab:red']
-    fig, ax = plt.subplots(figsize=(12, 6))
-    fig.suptitle(
-        "Pressure-Strain Dyssynchrony Index (using fiber strain E_ff)\n"
-        "delay = t(peak pressure) - t(peak fiber shortening);  "
-        "positive = pressure peaks after max shortening",
-        fontsize=12, fontweight='bold'
-    )
+    fig.tight_layout(h_pad=0.6, w_pad=0.6)
+    _save(fig, outdir, "stress_loops_components.png")
 
-    x = np.arange(len(bar_data))
-    n = len(results)
+
+def plot_fiber_efficiency(results, labels, outdir):
+    """Fiber work fraction: W_ff / W_total for each region."""
+    regions = ["LV", "RV", "Septum"]
+
+    fig, ax = plt.subplots(1, 1, figsize=(4.0, 3.0))
+
+    x = np.arange(len(regions))
     width = 0.35
 
-    for j, (lbl, c) in enumerate(zip(labels, case_colors)):
-        vals = [bd[1].get(lbl, 0.0) for bd in bar_data]
-        offset = (j - (n - 1) / 2) * width
-        bars = ax.bar(x + offset, vals, width, label=lbl, color=c,
-                      alpha=0.75 if j == 0 else 0.55,
-                      edgecolor='k', linewidth=0.5)
-        for bar, v in zip(bars, vals):
-            if not np.isnan(v):
-                va = 'bottom' if v >= 0 else 'top'
-                ax.text(bar.get_x() + bar.get_width() / 2,
-                        bar.get_height(), f"{v:+.0f}",
-                        ha='center', va=va, fontsize=8)
+    for j, (r, lbl) in enumerate(zip(results, labels)):
+        ratios = []
+        for reg in regions:
+            w_ff = total_work(r, f"work_ff_{reg}")
+            w_tot = total_work(r, f"work_true_{reg}")
+            ratios.append(w_ff / w_tot * 100 if abs(w_tot) > 1e-15 else 0.0)
+        offset = (j - 0.5) * width
+        bars = ax.bar(x + offset, ratios, width, label=lbl, color=COLORS[j],
+                      alpha=0.85 if j == 0 else 0.65, edgecolor='none')
+        for bar, v in zip(bars, ratios):
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 1,
+                    f"{v:.0f}%", ha='center', va='bottom', fontsize=7, color='0.3')
 
     ax.set_xticks(x)
-    ax.set_xticklabels([bd[0] for bd in bar_data], fontsize=10)
-    ax.set_ylabel("Delay (ms)", fontsize=11)
-    ax.set_title("Peak Pressure − Peak Shortening Delay per Region", fontweight='bold')
-    ax.legend(fontsize=10)
-    ax.grid(True, alpha=0.3, axis='y')
-    ax.axhline(0, color='k', lw=0.8)
+    ax.set_xticklabels(regions)
+    ax.set_ylabel(r"$W_{ff} / W_{\mathrm{total}}$ (%)")
+    ax.set_title("Fiber work fraction", fontweight='bold')
+    ax.legend(fontsize=7, loc='upper right')
+    ax.set_ylim(0, 110)
 
-    plt.tight_layout()
-    out = Path(outdir) / "dyssynchrony.png"
-    plt.savefig(out, dpi=150)
-    print(f"  Saved: {out}")
-    plt.close()
+    fig.tight_layout()
+    _save(fig, outdir, "fiber_efficiency.png")
 
 
-# ─── Figure: Simplification Cascade ──────────────────────────────────────────
-
-def plot_simplification_cascade(results, labels, outdir):
+def plot_proxy_directional_match(results, labels, outdir):
     """
-    3×3 grid showing the cascade of clinical simplifications:
-      Row 0: S_ff vs E_ff  (FEM fiber stress-strain — gold standard)
-      Row 1: P   vs E_ff   (replace stress with cavity pressure)
-      Row 2: P   vs E_ll   (replace fiber strain with longitudinal/GLS)
-    Columns: LV, RV, Septum.
+    Scatter: proxy vs ground-truth instantaneous power for LV, RV, Septum.
+    Shows how well the proxy tracks the FEM work rate over the cardiac cycle.
     """
-    colors = ['tab:blue', 'tab:red']
-    regions = [
-        ("LV",     "mean_E_ff_LV",     "mean_S_ff_LV",     "mean_E_ll_LV",     "p_LV"),
-        ("RV",     "mean_E_ff_RV",     "mean_S_ff_RV",     "mean_E_ll_RV",     "p_RV"),
-        ("Septum", "mean_E_ff_Septum", "mean_S_ff_Septum", "mean_E_ll_Septum", "p_LV"),
+    regions_cfg = [
+        ("LV",     "work_ff_LV",     "work_ps_ff_LV",     None),
+        ("RV",     "work_ff_RV",     "work_ps_ff_RV",     None),
+        ("Septum", "work_ff_Septum", "work_ps_ff_Septum_PLV", "work_ps_ff_Septum_Trans"),
     ]
 
-    fig, axes = plt.subplots(3, 3, figsize=(20, 18))
-    fig.suptitle(
-        "Cascade of Clinical Simplifications: S:dE → P·dE_ff → P·dE_ll\n"
-        "(each row is a further approximation toward what clinicians can measure)",
-        fontsize=14, fontweight='bold'
-    )
+    fig, axes = plt.subplots(1, 3, figsize=(8.0, 3.0))
 
-    row_labels = [
-        "Level 1: S_ff vs E_ff\n(FEM fiber stress-strain)",
-        "Level 2: P vs E_ff\n(replace stress with pressure)",
-        "Level 3: P vs E_ll\n(replace fiber with longitudinal = GLS)",
-    ]
+    for ax, (region, truth_key, proxy_key, proxy_trans_key) in zip(axes, regions_cfg):
+        all_r2 = []  # collect for annotation box
 
-    for col, (region, eff_key, sff_key, ell_key, p_key) in enumerate(regions):
-        # Row 0: S_ff vs E_ff
-        ax = axes[0, col]
-        for r, lbl, c in zip(results, labels, colors):
-            Eff = get_array(r, eff_key) * 100
-            Sff = get_array(r, sff_key) / 1e3  # Pa → kPa
-            if len(Eff) > 0:
-                ax.plot(Eff, Sff, color=c, lw=1.8, label=lbl)
-                ax.plot(Eff[0], Sff[0], 'o', color=c, ms=6)
-        ax.set_xlabel("Fiber Strain E_ff (%)")
-        ax.set_ylabel("Fiber Stress S_ff (kPa)")
-        ax.set_title(f"{region} — S_ff vs E_ff  (ground truth)", fontweight='bold')
-        ax.legend(fontsize=9)
-        ax.grid(True, alpha=0.3)
-        ax.axhline(0, color='k', lw=0.5, alpha=0.4)
-        ax.axvline(0, color='k', lw=0.5, alpha=0.4)
-
-        # Row 1: P vs E_ff
-        ax = axes[1, col]
-        for r, lbl, c in zip(results, labels, colors):
-            Eff = get_array(r, eff_key) * 100
-            pres = get_array(r, p_key)
-            if len(Eff) > 0:
-                ax.plot(Eff, pres, color=c, lw=1.8, label=lbl)
-                ax.plot(Eff[0], pres[0], 'o', color=c, ms=6)
-                if region == "Septum":
-                    p_rv = get_array(r, 'p_RV')
-                    p_trans = pres - p_rv
-                    ax.plot(Eff, p_trans, color=c, lw=1.5, ls='--', alpha=0.7,
-                            label=f"{lbl} (Trans)")
-        ax.set_xlabel("Fiber Strain E_ff (%)")
-        ax.set_ylabel("Cavity Pressure (mmHg)")
-        ax.set_title(f"{region} — P vs E_ff  (replace stress with pressure)", fontweight='bold')
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-        ax.axhline(0, color='k', lw=0.5, alpha=0.4)
-        ax.axvline(0, color='k', lw=0.5, alpha=0.4)
-
-        # Row 2: P vs E_ll (GLS analogue)
-        ax = axes[2, col]
-        for r, lbl, c in zip(results, labels, colors):
-            Ell = get_array(r, ell_key) * 100
-            pres = get_array(r, p_key)
-            if len(Ell) > 0:
-                ax.plot(Ell, pres, color=c, lw=1.8, label=lbl)
-                ax.plot(Ell[0], pres[0], 'o', color=c, ms=6)
-                if region == "Septum":
-                    p_rv = get_array(r, 'p_RV')
-                    p_trans = pres - p_rv
-                    ax.plot(Ell, p_trans, color=c, lw=1.5, ls='--', alpha=0.7,
-                            label=f"{lbl} (Trans)")
-        ax.set_xlabel("Longitudinal Strain E_ll (%, GLS analogue)")
-        ax.set_ylabel("Cavity Pressure (mmHg)")
-        ax.set_title(f"{region} — P vs E_ll  (clinical measurement)", fontweight='bold')
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.3)
-        ax.axhline(0, color='k', lw=0.5, alpha=0.4)
-        ax.axvline(0, color='k', lw=0.5, alpha=0.4)
-
-    # Row labels on the left
-    for row, rlabel in enumerate(row_labels):
-        axes[row, 0].annotate(rlabel, xy=(-0.35, 0.5), xycoords='axes fraction',
-                              fontsize=10, fontweight='bold', ha='right', va='center',
-                              rotation=90)
-
-    plt.tight_layout(rect=[0.05, 0, 1, 0.95])
-    out = Path(outdir) / "simplification_cascade.png"
-    plt.savefig(out, dpi=150, bbox_inches='tight')
-    print(f"  Saved: {out}")
-    plt.close()
-
-
-# ─── Figure: Pressure vs Transmural Stress ──────────────────────────────────
-
-def plot_pressure_vs_radial_stress(results, labels, outdir):
-    """
-    2×3 panel showing why P ≈ -2σ̄_nn (pressure is proportional to transmural stress).
-      Row 0: Time traces of P(t) and -σ̄_nn(t) overlaid for each region
-      Row 1: Scatter of -σ̄_nn vs P at each timestep, with regression line
-    Columns: LV, RV, Septum.
-    """
-    colors = ['tab:blue', 'tab:red']
-    regions = [
-        ("LV",     "mean_sigma_nn_LV",     "p_LV",  None),
-        ("RV",     "mean_sigma_nn_RV",     "p_RV",  None),
-        ("Septum", "mean_sigma_nn_Septum", "p_LV",  "p_RV"),
-    ]
-
-    fig, axes = plt.subplots(2, 3, figsize=(20, 12))
-    fig.suptitle(
-        "Pressure vs Volume-Averaged Transmural (Cauchy) Stress\n"
-        "Theory: σ̄_nn ≈ -P/2 (thin-wall approximation)  |  "
-        "Confirms that cavity pressure measures transmural stress",
-        fontsize=13, fontweight='bold'
-    )
-
-    for col, (region, sigma_key, p_key, p_key2) in enumerate(regions):
-        ax_time = axes[0, col]
-        ax_scatter = axes[1, col]
-
-        for i, (r, lbl, c) in enumerate(zip(results, labels, colors)):
-            t = get_array(r, 'time')
-            sigma_nn = get_array(r, sigma_key)  # Pa, negative (compressive)
-            pres_mmHg = get_array(r, p_key)
-            pres_Pa = pres_mmHg * 133.322
-
-            if len(t) == 0 or len(sigma_nn) == 0:
+        for i, (r, lbl, c) in enumerate(zip(results, labels, COLORS)):
+            truth = get_array(r, truth_key) * 1e3
+            proxy = get_array(r, proxy_key) * 1e3
+            if len(truth) == 0 or len(proxy) == 0:
                 continue
 
-            neg_sigma = -sigma_nn  # flip sign: compressive → positive
+            ax.scatter(proxy, truth, color=c, s=8, alpha=0.4,
+                       label=lbl, rasterized=True, zorder=3)
 
-            # Row 0: time traces — both on same axis in kPa for direct comparison
-            ax_time.plot(t * 1000, pres_Pa / 1e3, color=c, lw=2,
-                         label=f"{lbl} — P")
-            ax_time.plot(t * 1000, neg_sigma / 1e3, color=c, lw=1.5, ls='--',
-                         label=f"{lbl} — -σ̄_nn")
-            # Also plot P/2 as thin dotted line (thin-wall prediction)
-            ax_time.plot(t * 1000, pres_Pa / 2e3, color=c, lw=1, ls=':',
-                         alpha=0.5, label=f"{lbl} — P/2" if i == 0 else None)
+            # R^2
+            if len(truth) > 2 and np.std(truth) > 0:
+                corr = np.corrcoef(proxy, truth)[0, 1]
+                all_r2.append((lbl, corr**2, c, None))
 
-            # Row 1: scatter -σ̄_nn vs P
-            ax_scatter.scatter(pres_Pa / 1e3, neg_sigma / 1e3, color=c, s=15,
-                               alpha=0.5, label=f"{lbl}")
+            # Transmural variant for septum
+            if proxy_trans_key and proxy_trans_key in r:
+                proxy_t = get_array(r, proxy_trans_key) * 1e3
+                if len(proxy_t) > 0:
+                    ax.scatter(proxy_t, truth, color=c, s=8, alpha=0.2,
+                               marker='s', rasterized=True, zorder=2)
+                    if np.std(truth) > 0:
+                        corr_t = np.corrcoef(proxy_t, truth)[0, 1]
+                        all_r2.append((f"{lbl} trans.", corr_t**2, c, 'italic'))
 
-            # Regression line (through origin)
-            if len(pres_Pa) > 2:
-                slope = np.sum(neg_sigma * pres_Pa) / np.sum(pres_Pa**2)
-                p_fit = np.linspace(0, pres_Pa.max(), 50)
-                ax_scatter.plot(p_fit / 1e3, slope * p_fit / 1e3, color=c, lw=1.5,
-                                ls=':', alpha=0.8,
-                                label=f"slope={slope:.3f} (theory=0.5)")
+        # Clip axes to 2nd-98th percentile to remove outliers
+        all_proxy = np.concatenate([get_array(r, proxy_key) * 1e3 for r in results if proxy_key in r])
+        all_truth = np.concatenate([get_array(r, truth_key) * 1e3 for r in results if truth_key in r])
+        if len(all_proxy) > 10:
+            p2x, p98x = np.percentile(all_proxy, [1, 99])
+            p2y, p98y = np.percentile(all_truth, [1, 99])
+            pad_x = (p98x - p2x) * 0.15
+            pad_y = (p98y - p2y) * 0.15
+            ax.set_xlim(p2x - pad_x, p98x + pad_x)
+            ax.set_ylim(p2y - pad_y, p98y + pad_y)
 
-            # Peak ratio annotation
-            peak_p = np.max(pres_Pa)
-            peak_sigma = np.max(neg_sigma)
-            ratio = peak_sigma / peak_p if peak_p > 0 else 0
-            ax_scatter.annotate(
-                f"{lbl}: |σ̄_nn|/P = {ratio:.3f}",
-                xy=(0.05, 0.92 - i * 0.08), xycoords='axes fraction',
-                fontsize=9, color=c, fontweight='bold'
-            )
+        # y=x reference
+        lo = min(ax.get_xlim()[0], ax.get_ylim()[0])
+        hi = max(ax.get_xlim()[1], ax.get_ylim()[1])
+        ax.plot([lo, hi], [lo, hi], 'k--', lw=0.8, alpha=0.15, zorder=1)
 
-        # Format time axis
-        ax_time.set_xlabel("Time (ms)")
-        ax_time.set_ylabel("Stress / Pressure (kPa)", fontsize=10)
-        p_label = p_key.replace("p_", "P_")
-        ax_time.set_title(f"{region} — P(t) vs -σ̄_nn(t)\n"
-                          f"(solid = {p_label}, dashed = -σ̄_nn, dotted = P/2)",
-                          fontweight='bold')
-        ax_time.legend(fontsize=7, loc='upper left')
-        ax_time.grid(True, alpha=0.3)
+        # R² annotation box (top-left, stacked)
+        r2_text = "\n".join(
+            f"{'$R^2$' if style is None else '$R^2_{trans}$'} = {r2:.2f}"
+            for lbl, r2, c, style in all_r2
+        )
+        if all_r2:
+            # Color-coded lines
+            y_pos = 0.97
+            for lbl, r2, c, style in all_r2:
+                tag = "$R^2$" if style is None else "$R^2_{\\mathrm{trans}}$"
+                ax.text(0.04, y_pos, f"{tag} = {r2:.2f}  ({lbl})",
+                        transform=ax.transAxes, fontsize=6, color=c,
+                        ha='left', va='top',
+                        fontstyle='italic' if style else 'normal')
+                y_pos -= 0.09
 
-        # Format scatter
-        ax_scatter.set_xlabel("Cavity Pressure P (kPa)")
-        ax_scatter.set_ylabel("-σ̄_nn  Transmural Stress (kPa)")
-        ax_scatter.set_title(f"{region} — -σ̄_nn vs P  (slope should be ≈ 0.5)",
-                             fontweight='bold')
+        ax.set_title(region, fontweight='bold')
+        ax.set_xlabel("Proxy (mJ)")
+        ax.grid(True, alpha=0.08)
+        if ax == axes[0]:
+            ax.set_ylabel("FEM fiber work (mJ)")
 
-        # Reference line: y = 0.5x (thin-wall prediction)
-        xlim = ax_scatter.get_xlim()
-        x_ref = np.linspace(0, xlim[1] * 1.1, 50)
-        ax_scatter.plot(x_ref, 0.5 * x_ref, 'k--', lw=1, alpha=0.4,
-                        label="Theory: σ̄_nn = P/2")
-        ax_scatter.legend(fontsize=7, loc='upper left')
-        ax_scatter.grid(True, alpha=0.3)
+    fig.tight_layout(w_pad=1.0)
+    _save(fig, outdir, "proxy_directional_match.png")
 
-    plt.tight_layout(rect=[0, 0, 1, 0.95])
-    out = Path(outdir) / "pressure_vs_transmural_stress.png"
-    plt.savefig(out, dpi=150, bbox_inches='tight')
-    print(f"  Saved: {out}")
-    plt.close()
+
+def plot_dyssynchrony(results, labels, outdir):
+    """
+    Time-resolved regional work rate: LV, RV, Septum on same axes.
+    Shows timing differences in energy generation.
+    """
+    fig, axes = plt.subplots(1, len(results), figsize=(3.5 * len(results), 3.0),
+                              squeeze=False)
+
+    for j, (r, lbl) in enumerate(zip(results, labels)):
+        ax = axes[0, j]
+        t = get_array(r, 'time') * 1000  # ms
+
+        for region, reg_c in REGION_COLORS.items():
+            w = get_array(r, f"work_true_{region}") * 1e3  # mJ
+            if len(w) == 0 or len(t) == 0:
+                continue
+            # Work rate: dW/dt (finite differences)
+            if len(w) == len(t) - 1:
+                t_mid = 0.5 * (t[:-1] + t[1:])
+                dt = np.diff(t)
+                rate = w / dt  # mJ/ms = W
+            elif len(w) == len(t):
+                t_mid = t
+                rate = w
+            else:
+                continue
+            ax.plot(t_mid, rate, color=reg_c, lw=1.2, label=region)
+
+        ax.set_title(lbl, fontweight='bold')
+        ax.set_xlabel("Time (ms)")
+        if j == 0:
+            ax.set_ylabel("Work rate (mJ/ms)")
+            ax.legend(fontsize=7)
+        ax.axhline(0, color='k', lw=0.5)
+
+    fig.tight_layout(w_pad=0.8)
+    _save(fig, outdir, "dyssynchrony.png")
 
 
 # ─── Console Report ──────────────────────────────────────────────────────────
@@ -1241,11 +1042,11 @@ def print_report(results, labels):
     regions = ["LV", "RV", "Septum"]
 
     for region in regions:
-        print(f"  ── {region} {'Freewall' if region != 'Septum' else ''} ──")
+        print(f"  -- {region} {'Freewall' if region != 'Septum' else ''} --")
 
         truth_keys = [
             (f"work_true_{region}",  "Total Work"),
-            (f"work_ff_{region}", "Fiber Work (circ.)"),
+            (f"work_ff_{region}",    "Fiber Work"),
         ]
 
         if region == "Septum":
@@ -1261,36 +1062,30 @@ def print_report(results, labels):
 
         all_keys = truth_keys + proxy_keys
 
-        # Raw values
         for r, lbl in zip(results, labels):
             rv_peak = float(np.max(get_array(r, 'p_RV'))) if 'p_RV' in r else 0.0
             vals = "  ".join(f"{kl}: {total_work(r, kk):>10.3e}" for kk, kl in all_keys)
             print(f"    {lbl:<10} (RV peak {rv_peak:.1f} mmHg)  {vals}")
 
-        # Normalized
         if len(results) >= 2:
-            base, pah = results[0], results[1]
+            r_base, r_comp = results[0], results[1]
             for kk, kl in all_keys:
-                b = total_work(base, kk)
-                p = total_work(pah,  kk)
+                b = total_work(r_base, kk)
+                p = total_work(r_comp,  kk)
                 ratio = p / b if abs(b) > 1e-12 else float('nan')
-                print(f"      {kl:<14}: PAH/Healthy = {ratio:.3f}   ({b:.3e} → {p:.3e})")
+                print(f"      {kl:<14}: {labels[1]}/{labels[0]} = {ratio:.3f}   ({b:.3e} -> {p:.3e})")
         print()
-
-    print("  Interpretation:")
-    print("  * PS proxy uses FIBER STRAIN (E_ff, circumferential) — not longitudinal/GLS")
-    print("  * PS ratio ≈ True Work ratio  → proxy tracks well")
-    print("  * PS ratio >> True Work ratio  → proxy over-estimates in PAH")
-    print("  * Septum Trans proxy uses (P_LV − P_RV) to capture transmural loading")
     print("=" * W)
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Compare Healthy vs PAH cardiac work metrics.")
-    parser.add_argument("healthy_dir", help="Path to Healthy result directory")
-    parser.add_argument("pah_dir", help="Path to PAH result directory")
+    parser = argparse.ArgumentParser(description="Compare two cardiac simulation cases.")
+    parser.add_argument("case_a_dir", help="Path to first (baseline) result directory")
+    parser.add_argument("case_b_dir", help="Path to second (comparison) result directory")
+    parser.add_argument("--labels", nargs=2, default=["Healthy", "PAH"],
+                       help="Labels for the two cases (default: Healthy PAH)")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--primary", action="store_true",
                        help="Run only the primary figure set")
@@ -1300,12 +1095,13 @@ def main():
                        help="Output directory (default: results/sims/compare_cases)")
     args = parser.parse_args()
 
-    # --primary implies not --all
     if args.primary:
         args.run_all = False
 
-    folders = [args.healthy_dir, args.pah_dir]
-    labels  = ["Healthy", "PAH"]
+    setup_style()
+
+    folders = [args.case_a_dir, args.case_b_dir]
+    labels  = args.labels
     if args.outdir:
         outdir = Path(args.outdir)
     else:
@@ -1327,10 +1123,10 @@ def main():
 
     print_report(results, labels)
 
-    # Primary figure set (7 core figures — the cascade story)
     primary_figures = [
-        plot_simplification_cascade,       # THE key figure: S_ff×E_ff → P×E_ff → P×E_ll
-        plot_pressure_vs_radial_stress,    # Why P works: P ≈ -2σ̄_nn
+        plot_geometry_context,
+        plot_simplification_cascade,
+        plot_pressure_vs_radial_stress,
         plot_work_redistribution,
         plot_work_decomposition,
         plot_stress_loops,
@@ -1338,7 +1134,6 @@ def main():
         plot_sensitivity,
     ]
 
-    # Additional figures (--all only)
     extra_figures = [
         plot_proxy_directional_match,
         plot_fiber_efficiency,
@@ -1353,7 +1148,7 @@ def main():
     for fig_fn in figure_set:
         fig_fn(results, labels, outdir)
 
-    print("\nDone. Output files written to:", outdir)
+    print(f"\nDone. Output: {outdir}")
 
 
 if __name__ == "__main__":

@@ -210,8 +210,30 @@ def generate_and_load(comm, outdir, args, logger, manual_refinement=False, geodi
         scale = 1e-2 # cm -> m
     else:
         scale = 1e-3 # mm -> m
-    
+
     geo.mesh.geometry.x[:] *= scale
+
+    # Re-save geometry in meters so postprocessing loads the exact same mesh state.
+    # This ensures adios4dolfinx DOF ordering matches between simulation and replay.
+    comm.barrier()
+    if comm.rank == 0:
+        if (geodir / "geometry.bp").exists():
+            shutil.rmtree(geodir / "geometry.bp")
+    comm.barrier()
+    cardiac_geometries.geometry.save_geometry(
+        path=geodir / "geometry.bp",
+        mesh=geo.mesh,
+        ffun=geo.ffun,
+        markers=geo.markers,
+        info=geo.info,
+        f0=geo.f0,
+        s0=geo.s0,
+        n0=geo.n0,
+        additional_data=geo.additional_data,
+    )
+    logger.info("Re-saved geometry in meters for offline postprocessing")
+
+    geo._geo_scale = 1.0  # Already in meters
 
     return geo
 

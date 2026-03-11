@@ -59,11 +59,11 @@ def get_arr(metrics, keys, min_len=None):
 def plot_clinical_dashboard(metrics, outdir):
     """Creates the 3-row grid for the cardiologist."""
     
-    # Setup Data
+    # Setup Data — prefer FEM cavity volumes (divergence theorem) over 0D-scaled volumes
     p_LV = get_arr(metrics, ["p_LV"])
-    v_LV = get_arr(metrics, ["V_LV"])
+    v_LV = get_arr(metrics, ["V_LV_FEM", "V_LV"])
     p_RV = get_arr(metrics, ["p_RV"])
-    v_RV = get_arr(metrics, ["V_RV"])
+    v_RV = get_arr(metrics, ["V_RV_FEM", "V_RV"])
     
     # Determine safe length
     if p_LV is None: return
@@ -121,6 +121,8 @@ def plot_clinical_dashboard(metrics, outdir):
     # --- PLOTTING ROW 1 (PV) ---
     def plot_cycle(ax, x, y, color, title, xlabel, ylabel):
         if x is None or y is None: return
+        n = min(len(x), len(y))
+        x, y = x[:n], y[:n]
         ax.plot(x, y, color=color, linewidth=2.5)
         ax.set_title(title, fontweight='bold')
         ax.set_xlabel(xlabel)
@@ -261,12 +263,13 @@ def plot_engineering_debug(metrics, outdir):
     ax1.grid(True, alpha=0.3)
     ax1.text(0.05, 0.05, "Must Overlap Perfectly", transform=ax1.transAxes, fontsize=8, color='red')
 
-    # PLOT 2: Geometric Consistency
+    # PLOT 2: Proxy vs Exact Boundary Work
     ax2 = fig.add_subplot(gs[0, 1])
-    ax2.plot(time, np.cumsum(w_pv_proxy), 'b-', label='Clinical Proxy (P·dV)')
-    ax2.plot(time, np.cumsum(w_boundary_exact), 'g--', label='Exact Surface (∫P·u·n)')
-    ax2.set_title("2. Geometric Tags Check", fontsize=12, fontweight='bold')
-    ax2.legend()
+    ax2.plot(time, np.cumsum(w_pv_proxy), 'b-', label='PV Proxy (P·dV₀D)')
+    ax2.plot(time, np.cumsum(w_boundary_exact), 'g--', label='Exact Boundary (P·dV_FEM)')
+    ax2.plot(time, np.cumsum(w_int_total), 'k:', lw=1, alpha=0.5, label='Internal (S:dE)')
+    ax2.set_title("2. Proxy vs Exact Boundary Work", fontsize=12, fontweight='bold')
+    ax2.legend(fontsize=8)
     ax2.grid(True, alpha=0.3)
 
     # PLOT 3: Incompressibility Check
@@ -307,20 +310,20 @@ def plot_engineering_debug(metrics, outdir):
     E_active = np.cumsum(w_active)
     E_passive = np.cumsum(w_passive)
     E_comp = np.cumsum(w_comp)
-    E_PV = np.cumsum(w_pv_proxy)
+    E_boundary = np.cumsum(w_boundary_exact)
     E_Robin = np.cumsum(w_robin)
 
     # LHS: Active + Passive + Compressible (= Total Internal)
     E_LHS = E_active + E_passive + E_comp
-    # RHS: PV + Robin (= Total External)
-    E_RHS = E_PV + E_Robin
+    # RHS: Exact Boundary + Robin (= Total External)
+    E_RHS = E_boundary + E_Robin
 
     ax5.plot(time, E_LHS, 'r-', lw=3, label='Internal: Active + Passive + Comp')
-    ax5.plot(time, E_RHS, 'k--', lw=2, label='External: PV Loop + Robin Springs')
+    ax5.plot(time, E_RHS, 'k--', lw=2, label='External: Boundary + Robin')
     ax5.plot(time, E_active, 'r:', lw=1, alpha=0.5, label='Active Only')
-    ax5.plot(time, E_PV, 'b:', lw=1, alpha=0.5, label='PV Loop Only')
+    ax5.plot(time, E_boundary, 'b:', lw=1, alpha=0.5, label='Boundary Only')
 
-    ax5.set_title("5. Physics Balance: W_Act + W_Pas + W_Comp = W_PV + W_Robin", fontsize=12, fontweight='bold')
+    ax5.set_title("5. Physics Balance: W_Internal = W_Boundary + W_Robin", fontsize=12, fontweight='bold')
     ax5.legend(fontsize=8)
     ax5.grid(True, alpha=0.3)
 
@@ -337,11 +340,11 @@ def plot_engineering_debug(metrics, outdir):
 def plot_full_hemodynamics(metrics, outdir):
     """Creates the Clinical Hemodynamics dashboard (Reconstructed Volumes)."""
     
-    # 1. Retrieve Data
+    # 1. Retrieve Data — use 0D model pressures with 0D volumes for consistency
     v_LV_clin = get_arr(metrics, ["V_LV_Clinical"])
     v_RV_clin = get_arr(metrics, ["V_RV_Clinical"])
-    p_LV = get_arr(metrics, ["p_LV"])
-    p_RV = get_arr(metrics, ["p_RV"])
+    p_LV = get_arr(metrics, ["p_LV_0D", "p_LV"])  # Prefer 0D pressures, fallback to solver
+    p_RV = get_arr(metrics, ["p_RV_0D", "p_RV"])
     
     # Get Time (safely)
     if p_LV is not None:

@@ -96,7 +96,6 @@ def analyze_proxies(metrics, outdir, truth_type="total"):
     prx_sep_trans = get_data(metrics, "work_ps_ff_Septum_Trans") # P_LV - P_RV
     prx_sep_plv   = get_data(metrics, "work_ps_ff_Septum_PLV")   # P_LV
     prx_sep_prv   = get_data(metrics, "work_ps_ff_Septum_PRV")   # P_RV
-    prx_sep_mean  = get_data(metrics, "work_ps_ff_Septum_Mean")  # Mean P
 
     # Proxies - RV
     prx_pv_rv = get_data(metrics, "work_proxy_pv_RV")
@@ -129,11 +128,11 @@ def analyze_proxies(metrics, outdir, truth_type="total"):
     # Stats for Septum variants
     s_trans = calculate_stats(tru_sep, prx_sep_trans)
     s_plv   = calculate_stats(tru_sep, prx_sep_plv)
-    s_mean  = calculate_stats(tru_sep, prx_sep_mean)
-    
-    sep_vals = [s_trans["W_true"], s_trans["W_proxy"], s_plv["W_proxy"], s_mean["W_proxy"]]
-    sep_lbls = ["True", "Trans\n(LV-RV)", "P_LV", "Mean P"]
-    sep_cols = ['black', 'tab:green', 'tab:blue', 'tab:purple']
+    s_prv   = calculate_stats(tru_sep, prx_sep_prv)
+
+    sep_vals = [s_trans["W_true"], s_trans["W_proxy"], s_plv["W_proxy"], s_prv["W_proxy"]]
+    sep_lbls = ["True", "Trans\n(LV-RV)", "P_LV", "P_RV"]
+    sep_cols = ['black', 'tab:green', 'tab:blue', 'tab:red']
     
     bars_sep = ax_sep.bar(sep_lbls, sep_vals, color=sep_cols, alpha=0.7)
     ax_sep.bar_label(bars_sep, fmt='%.1e', padding=3)
@@ -225,7 +224,7 @@ def analyze_proxies(metrics, outdir, truth_type="total"):
     print("-" * 60)
     pr("Septum: Trans (LV-RV)", s_trans)
     pr("Septum: P_LV Only", s_plv)
-    pr("Septum: Mean P", s_mean)
+    pr("Septum: P_RV Only", s_prv)
     print("-" * 60)
     pr("RV: PV (P*dV)", stats_rv_pv)
     pr("RV: PS (P*dE)", stats_rv_ps)
@@ -239,7 +238,7 @@ def analyze_proxies(metrics, outdir, truth_type="total"):
             "Correlation_Slope_PV": m_pv, "Correlation_Slope_PS": m_ps
         },
         "Septum": {
-            "Trans": s_trans, "PLV": s_plv, "Mean": s_mean,
+            "Trans": s_trans, "PLV": s_plv, "PRV": s_prv,
             "Correlation_Slope_Trans": m_trans, "Correlation_Slope_PLV": m_plv
         },
         "RV": {

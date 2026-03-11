@@ -50,6 +50,7 @@ parser.add_argument('--metrics_space', type=str, default="DG0", help='Function s
 parser.add_argument('--circulation_params', type=str, default=None, help='Path to JSON file with circulation parameters')
 parser.add_argument('--alpha_epi', type=float, default=1e5, help='Epicardial spring stiffness (Pa/m) (default: 1e5)')
 parser.add_argument('--alpha_base', type=float, default=1e6, help='Basal spring stiffness (Pa/m) (default: 1e6)')
+parser.add_argument('--one-sided-robin', action='store_true', help='Use one-sided Robin BC (only resists outward displacement)')
 parser.add_argument('--incompressible', action='store_true', help='Use incompressible formulation')
 parser.add_argument('--manual-refinement', action='store_true',
                     help='Launch interactive Septum Tag Editor after LDRB tagging to manually correct septum region before simulation')
@@ -473,12 +474,12 @@ def setup_problem(geometry, f0, s0, material_params, alpha_epi_val=1e5, alpha_ba
     alpha_epi = pulse.Variable(
         dolfinx.fem.Constant(geometry.mesh, dolfinx.default_scalar_type(alpha_epi_val)), "Pa / m",
     )
-    robin_epi = pulse.RobinBC(value=alpha_epi, marker=geometry.markers["EPI"][0])
+    robin_epi = pulse.RobinBC(value=alpha_epi, marker=geometry.markers["EPI"][0], one_sided=args.one_sided_robin)
 
     alpha_base = pulse.Variable(
         dolfinx.fem.Constant(geometry.mesh, dolfinx.default_scalar_type(alpha_base_val)), "Pa / m",
     )
-    robin_base = pulse.RobinBC(value=alpha_base, marker=geometry.markers["BASE"][0])
+    robin_base = pulse.RobinBC(value=alpha_base, marker=geometry.markers["BASE"][0], one_sided=args.one_sided_robin)
     robin = [robin_epi, robin_base]
 
     def dirichlet_bc(V: dolfinx.fem.FunctionSpace):
@@ -583,6 +584,12 @@ geometry.deform(u_pre)
 logger.info("Mapping fibers to Reference Configuration...")
 f0_quad = pulse.utils.map_vector_field(f=geo.f0, u=u_pre, normalize=True, name="f0_unloaded")
 s0_quad = pulse.utils.map_vector_field(f=geo.s0, u=u_pre, normalize=True, name="s0_unloaded")
+
+# Map n0 and l0 for saving with checkpoint (same file = same DOF ordering)
+n0_quad = None
+if geo.n0 is not None:
+    n0_quad = pulse.utils.map_vector_field(f=geo.n0, u=u_pre, normalize=True, name="n0_unloaded")
+l0_field = geo.additional_data.get("apex_gradient", None)
 f0_map = pulse.utils.map_vector_field(
     geo.additional_data["f0_DG_1"], u=u_pre, normalize=True, name="f0",
 )
@@ -777,8 +784,18 @@ adios4dolfinx.write_mesh(checkpoint_file, geometry.mesh)
 adios4dolfinx.write_meshtags(checkpoint_file, mesh=geometry.mesh, meshtags=geometry.facet_tags, meshtag_name="ffun")
 adios4dolfinx.write_meshtags(checkpoint_file, mesh=geometry.mesh, meshtags=geo.additional_data["markers_mt"], meshtag_name="cfun")
 
+# Write fiber fields into checkpoint file (MUST be same file as mesh for DOF ordering)
+adios4dolfinx.write_function(checkpoint_file, u=f0_quad, name="f0", time=0.0)
+adios4dolfinx.write_function(checkpoint_file, u=s0_quad, name="s0", time=0.0)
+if n0_quad is not None:
+    adios4dolfinx.write_function(checkpoint_file, u=n0_quad, name="n0", time=0.0)
+if l0_field is not None:
+    adios4dolfinx.write_function(checkpoint_file, u=l0_field, name="l0", time=0.0)
+logger.info("Checkpoint initialized: mesh + markers + fibers")
+
 Ta_history: list = []
 Ta_solver_history: list = []
+pressure_history: list = []  # Solver cavity pressures (mmHg) at each step
 
 def callback(model, i: int, t: float, save=True):
     # 1. Record activation for postprocessing
@@ -788,6 +805,11 @@ def callback(model, i: int, t: float, save=True):
     # Also record the actual solver Ta (may differ slightly due to substep convergence)
     solver_ta_array = Ta.value.x.array[:]
     Ta_solver_history.append(solver_ta_array.copy())
+
+    # Record solver cavity pressures (the Lagrange multiplier — exact surface traction)
+    lv_p_Pa = float(problem.cavity_pressures[0].x.array[0])
+    rv_p_Pa = float(problem.cavity_pressures[1].x.array[0])
+    pressure_history.append([lv_p_Pa * 1e-3 / 0.133322, rv_p_Pa * 1e-3 / 0.133322])  # Pa -> mmHg
 
     max_ta_solver = np.max(solver_ta_array)
 
@@ -846,7 +868,9 @@ finally:
             # Save Ta history: [N_timesteps, 3] array with [LV, Septum, RV] activation (kPa)
             np.save(solver_dir / "Ta_history.npy", np.array(Ta_history))
             np.save(solver_dir / "Ta_solver_history.npy", np.array(Ta_solver_history))
+            np.save(solver_dir / "pressure_history.npy", np.array(pressure_history))
             logger.info(f"  Ta history saved: {len(Ta_history)} timesteps")
+            logger.info(f"  Pressure history saved: {len(pressure_history)} timesteps")
 
             # Save simulation parameters needed for offline reconstruction
             sim_params = {
@@ -859,7 +883,8 @@ finally:
                 "incompressible": args.incompressible,
                 "alpha_epi": args.alpha_epi,
                 "alpha_base": args.alpha_base,
-                "material_params": {k: {"value": float(v.value), "unit": str(v.unit)} for k, v in material_params.items()},
+                "one_sided_robin": args.one_sided_robin,
+                "material_params": {k: {"value": float(v.value), "unit": str(v.original_unit)} for k, v in material_params.items()},
                 "activation": {
                     "TC": TC_ACTIVATION,
                     "TR": TR_ACTIVATION,
@@ -872,6 +897,7 @@ finally:
                 "rvv_unloaded_m3": float(rvv_unloaded),
                 "lvv_target_m3": float(lvv_target),
                 "rvv_target_m3": float(rvv_target),
+                "geo_scale": getattr(geo, '_geo_scale', 1.0),
             }
             with open(outdir / "simulation_params.json", "w") as f:
                 json.dump(sim_params, f, indent=2, default=custom_json)
