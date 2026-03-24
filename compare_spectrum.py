@@ -24,6 +24,12 @@ import matplotlib as mpl
 from matplotlib.lines import Line2D
 from pathlib import Path
 
+try:
+    from scipy import stats as scipy_stats
+    _HAS_SCIPY = True
+except ImportError:
+    _HAS_SCIPY = False
+
 
 # ─── Thesis Figure Style ─────────────────────────────────────────────────────
 
@@ -84,6 +90,23 @@ def _save(fig, outdir, name):
 
 # ─── Data Loading ────────────────────────────────────────────────────────────
 
+def _load_0d_last_beat(folder, beat_duration=0.8):
+    """Load 0D circulation last beat from circulation/history.npy.
+    Returns dict with p_LV_0d, V_LV_0d, p_RV_0d, V_RV_0d arrays (converged)."""
+    circ = Path(folder) / "circulation" / "history.npy"
+    if not circ.exists():
+        return {}
+    h = np.load(circ, allow_pickle=True).item()
+    t = np.array(h["time"])
+    mask = t >= (t[-1] - beat_duration)
+    out = {}
+    for ch in ["LV", "RV"]:
+        for kind, src in [("p", f"p_{ch}"), ("V", f"V_{ch}")]:
+            if src in h:
+                out[f"{kind}_{ch}_0d"] = np.array(h[src])[mask]
+    return out
+
+
 def load_metrics(folder):
     path = Path(folder)
     search_dirs = [
@@ -99,7 +122,10 @@ def load_metrics(folder):
         if files:
             print(f"  Loading: {files[0]}")
             m = np.load(files[0], allow_pickle=True).item()
-            return _normalize_keys(m)
+            m = _normalize_keys(m)
+            # Merge in converged 0D last-beat hemodynamics (preferred over FEM for trends)
+            m.update(_load_0d_last_beat(folder))
+            return m
     print(f"  No metrics found in {folder}")
     return None
 
@@ -160,7 +186,9 @@ def load_hemodynamics(folder):
 # ─── Hemodynamic Summary Table ───────────────────────────────────────────────
 
 def extract_hemodynamics(results, labels):
-    """Extract key hemodynamic indices from the metrics arrays."""
+    """Extract key hemodynamic indices from the metrics arrays (FEM-extracted).
+    NOTE: volumes/SV/EF are from the single coupled FEM beat and are not yet
+    in hemodynamic steady state. Pressures from the solver are more reliable."""
     hemo_data = []
     for r, lbl in zip(results, labels):
         p_lv = get_array(r, "p_LV")
@@ -280,6 +308,8 @@ def plot_pv_loops(results, labels, colors, outdir):
             p = get_array(r, p_key)
             if len(v) == 0 or len(p) == 0:
                 continue
+            n = min(len(v), len(p))
+            v, p = v[:n], p[:n]
             ax.plot(v, p, color=c, lw=1.5, label=lbl)
             ax.plot(v[0], p[0], 'o', color=c, ms=4)
 
@@ -321,44 +351,92 @@ def plot_stress_strain_spectrum(results, labels, colors, outdir):
     _save(fig, outdir, "stress_strain_spectrum.png")
 
 
-# ─── Figure 4: Pressure-Strain Loops ─────────────────────────────────────────
+# ─── Figure 4: Simplification Cascade (Spectrum) ─────────────────────────────
 
-def plot_pressure_strain_spectrum(results, labels, colors, outdir):
-    """Overlay pressure-strain loops (clinical proxy) across severity."""
-    regions = [
-        ("LV",     "mean_E_ff_LV",     "mean_E_ll_LV",     "p_LV"),
-        ("RV",     "mean_E_ff_RV",     "mean_E_ll_RV",     "p_RV"),
-        ("Septum", "mean_E_ff_Septum", "mean_E_ll_Septum", "p_LV"),
+def plot_simplification_cascade_spectrum(results, labels, colors, outdir):
+    """
+    3x3 grid showing the cascade from FEM ground truth to clinical measurement,
+    with all spectrum cases overlaid (blue=healthy → red=severe).
+
+      Row 0: S_ff vs E_ff  — FEM fiber stress-strain (ground truth)
+      Row 1: P   vs E_ff  — replace stress with cavity pressure
+      Row 2: P   vs E_ll  — replace fiber strain with longitudinal (≈ GLS)
+
+    Columns: LV, RV, Septum.
+    Septum rows 1-2: solid = P_LV, dashed = transmural (P_LV - P_RV).
+    """
+    region_specs = [
+        ("LV",     "mean_E_ff_LV",     "mean_S_ff_LV",     "mean_E_ll_LV",     "p_LV"),
+        ("RV",     "mean_E_ff_RV",     "mean_S_ff_RV",     "mean_E_ll_RV",     "p_RV"),
+        ("Septum", "mean_E_ff_Septum", "mean_S_ff_Septum", "mean_E_ll_Septum", "p_LV"),
     ]
 
-    fig, axes = plt.subplots(2, 3, figsize=(8.0, 5.5))
-    row_titles = [r"$P$ vs $E_{ff}$ (fiber)", r"$P$ vs $E_{ll}$ (longitudinal)"]
+    row_info = [
+        (r"$S_{ff}$ vs $E_{ff}$" + "\n(FEM ground truth)",
+         r"$E_{ff}$ (%)",  r"$S_{ff}$ (kPa)"),
+        (r"$P$ vs $E_{ff}$" + "\n(pressure substitution)",
+         r"$E_{ff}$ (%)",  "Pressure (mmHg)"),
+        (r"$P$ vs $E_{ll}$" + "\n(clinical proxy)",
+         r"$E_{ll}$ (%)",  "Pressure (mmHg)"),
+    ]
 
-    for col, (region, eff_key, ell_key, p_key) in enumerate(regions):
-        for row, (strain_key, row_title) in enumerate([(eff_key, row_titles[0]),
-                                                        (ell_key, row_titles[1])]):
+    fig, axes = plt.subplots(3, 3, figsize=(7.5, 8.0))
+
+    for col, (region, eff_key, sff_key, ell_key, p_key) in enumerate(region_specs):
+        for row in range(3):
             ax = axes[row, col]
+
             for r, lbl, c in zip(results, labels, colors):
-                strain = get_array(r, strain_key) * 100
-                pressure = get_array(r, p_key)
-                if len(strain) == 0 or len(pressure) == 0:
+                if row == 0:
+                    x = get_array(r, eff_key) * 100
+                    y = get_array(r, sff_key) / 1e3
+                elif row == 1:
+                    x = get_array(r, eff_key) * 100
+                    y = get_array(r, p_key)
+                else:
+                    x = get_array(r, ell_key) * 100
+                    y = get_array(r, p_key)
+
+                if len(x) == 0:
                     continue
-                ax.plot(strain, pressure, color=c, lw=1.5, label=lbl)
-                ax.plot(strain[0], pressure[0], 'o', color=c, ms=3)
+                ax.plot(x, y, color=c, lw=1.5, label=lbl)
+                ax.plot(x[0], y[0], 'o', color=c, ms=3, zorder=5)
+
+                # Septum: add transmural pressure as dashed overlay
+                if region == "Septum" and row >= 1:
+                    p_rv = get_array(r, "p_RV")
+                    n = min(len(x), len(y), len(p_rv))
+                    if n > 0:
+                        p_trans = y[:n] - p_rv[:n]
+                        ax.plot(x[:n], p_trans, color=c, lw=1.2, ls='--', alpha=0.7)
 
             ax.axhline(0, color='0.5', lw=0.4)
             ax.axvline(0, color='0.5', lw=0.4)
+
             if row == 0:
                 ax.set_title(region, fontweight='bold')
-            strain_lbl = r"$E_{ff}$ (%)" if row == 0 else r"$E_{ll}$ (%)"
-            ax.set_xlabel(strain_lbl)
             if col == 0:
-                ax.set_ylabel("$P$ (mmHg)")
-                if row == 0:
-                    ax.legend(fontsize=5.5, loc='best')
+                ax.set_ylabel(row_info[row][2])
+            if row == 2:
+                ax.set_xlabel(row_info[row][1])
 
-    fig.tight_layout(h_pad=0.8, w_pad=0.8)
-    _save(fig, outdir, "pressure_strain_spectrum.png")
+            # Legend: severity gradient in top-left panel; septum trans note bottom-right
+            if row == 0 and col == 0:
+                ax.legend(fontsize=6, loc='upper right', handlelength=1.0)
+            if row == 1 and col == 2:
+                ax.annotate("dashed = transmural\n($P_{LV} - P_{RV}$)",
+                            xy=(0.97, 0.05), xycoords='axes fraction',
+                            fontsize=6, ha='right', va='bottom',
+                            color='0.45', style='italic')
+
+    # Row labels on left margin
+    for row, (rlabel, _, _) in enumerate(row_info):
+        axes[row, 0].annotate(
+            rlabel, xy=(-0.48, 0.5), xycoords='axes fraction',
+            fontsize=7.5, ha='right', va='center', rotation=90, style='italic')
+
+    fig.tight_layout(rect=[0.07, 0, 1, 1], h_pad=1.2, w_pad=0.8)
+    _save(fig, outdir, "simplification_cascade_spectrum.png")
 
 
 # ─── Figure 5: Work Trends ──────────────────────────────────────────────────
@@ -428,35 +506,49 @@ def plot_work_trends(results, labels, colors, outdir):
 # ─── Figure 6: Work Decomposition Spectrum ───────────────────────────────────
 
 def plot_work_decomposition_spectrum(results, labels, colors, outdir):
-    """Grouped bar chart: ff/ss/nn/cross work per region, all cases side by side."""
+    """Stacked bar chart: ff/ss/nn/shear as % of total work per case, per region."""
     components = [
-        ("work_ff", "Fiber"),
-        ("work_ss", "Sheet"),
-        ("work_nn", "Normal"),
-        ("work_cross", "Cross"),
+        ("work_ff",    "Fiber",  "#4878A8"),
+        ("work_ss",    "Sheet",  "#C25454"),
+        ("work_nn",    "Normal", "#5EA55E"),
+        ("work_cross", "Shear",  "#D4A030"),
     ]
     regions = ["LV", "RV", "Septum"]
     n = len(results)
+    x = np.arange(n)
 
-    fig, axes = plt.subplots(1, 3, figsize=(8.5, 3.5))
+    fig, axes = plt.subplots(1, 3, figsize=(9.0, 3.5))
 
     for ax, region in zip(axes, regions):
-        x = np.arange(len(components))
-        width = 0.8 / n
+        # Absolute magnitudes per component per case
+        vals = np.array([
+            [abs(total_work(r, f"{ckey}_{region}")) for ckey, _, _ in components]
+            for r in results
+        ])  # shape (n_cases, 4)
 
-        for j, (r, lbl, c) in enumerate(zip(results, labels, colors)):
-            vals = [total_work(r, f"{ckey}_{region}") * 1e3 for ckey, _ in components]
-            offset = (j - (n - 1) / 2) * width
-            ax.bar(x + offset, vals, width, label=lbl, color=c,
-                   alpha=0.85, edgecolor='none')
+        totals = vals.sum(axis=1, keepdims=True)
+        totals[totals == 0] = 1
+        pcts = vals / totals * 100  # (n_cases, 4)
+
+        bottoms = np.zeros(n)
+        for j, (_, clbl, cc) in enumerate(components):
+            ax.bar(x, pcts[:, j], bottom=bottoms, label=clbl,
+                   color=cc, alpha=0.88, edgecolor='white', linewidth=0.5)
+            for xi, pct, bot in zip(x, pcts[:, j], bottoms):
+                if pct > 5:
+                    ax.text(xi, bot + pct / 2, f"{pct:.0f}%",
+                            ha='center', va='center', fontsize=6.5,
+                            color='white', fontweight='bold')
+            bottoms += pcts[:, j]
 
         ax.set_xticks(x)
-        ax.set_xticklabels([clbl for _, clbl in components], fontsize=8)
+        ax.set_xticklabels(labels, fontsize=7, rotation=30, ha='right')
         ax.set_title(region, fontweight='bold')
-        ax.axhline(0, color='k', lw=0.5)
+        ax.set_ylim(0, 108)
+        ax.set_yticks([0, 25, 50, 75, 100])
         if region == "LV":
-            ax.set_ylabel("Work (mJ)")
-            ax.legend(fontsize=5.5, loc='best', ncol=1)
+            ax.set_ylabel("Work fraction (%)")
+            ax.legend(fontsize=7, loc='upper right')
 
     fig.tight_layout(w_pad=0.8)
     _save(fig, outdir, "work_decomposition_spectrum.png")
@@ -723,6 +815,98 @@ def plot_stress_components_spectrum(results, labels, colors, outdir):
     _save(fig, outdir, "stress_components_spectrum.png")
 
 
+# ─── Core Statistics ─────────────────────────────────────────────────────────
+
+def _pearson(x, y):
+    x, y = np.array(x, dtype=float), np.array(y, dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+    n = int(mask.sum())
+    if n < 3:
+        return {"r": None, "p": None, "n": n}
+    r = float(np.corrcoef(x[mask], y[mask])[0, 1])
+    if _HAS_SCIPY:
+        t = r * np.sqrt((n - 2) / max(1 - r**2, 1e-15))
+        p = float(2 * scipy_stats.t.sf(abs(t), df=n - 2))
+    else:
+        p = None
+    return {"r": round(r, 4), "p": round(p, 4) if p is not None else None, "n": n}
+
+
+def compute_and_save_stats(results, labels, outdir):
+    """Compute core statistics and correlations; write core_stats.json to outdir."""
+
+    def tw(r, k):
+        return float(np.sum(r.get(k, [0])))
+
+    hemo = extract_hemodynamics(results, labels)
+    rv_esp    = [h.get("RV_ESP", float("nan")) for h in hemo]
+    lv_esp    = [h.get("LV_ESP", float("nan")) for h in hemo]
+
+    wt_lv     = [tw(r, "work_true_LV")            for r in results]
+    wt_rv     = [tw(r, "work_true_RV")            for r in results]
+    wt_sep    = [tw(r, "work_true_Septum")        for r in results]
+    wf_lv     = [tw(r, "work_ff_LV")              for r in results]
+    wf_rv     = [tw(r, "work_ff_RV")              for r in results]
+    wf_sep    = [tw(r, "work_ff_Septum")          for r in results]
+    ps_lv     = [tw(r, "work_ps_ll_LV")           for r in results]
+    ps_rv     = [tw(r, "work_ps_ll_RV")           for r in results]
+    ps_plv    = [tw(r, "work_ps_ll_Septum_PLV")   for r in results]
+    ps_trans  = [tw(r, "work_ps_ll_Septum_Trans") for r in results]
+    ps_prv    = [tw(r, "work_ps_ll_Septum_PRV")   for r in results]
+
+    def _ratio(p, f):
+        return round(p / f, 3) if abs(f) > 1e-12 else None
+
+    out = {
+        "n_cases": len(results),
+        "labels": labels,
+        "hemodynamics_mmHg": {
+            "RV_ESP": [round(v, 1) if np.isfinite(v) else None for v in rv_esp],
+            "LV_ESP": [round(v, 1) if np.isfinite(v) else None for v in lv_esp],
+        },
+        "work_mJ": {
+            "LV_total":              [round(v * 1e3, 2) for v in wt_lv],
+            "RV_total":              [round(v * 1e3, 2) for v in wt_rv],
+            "Septum_total":          [round(v * 1e3, 2) for v in wt_sep],
+            "LV_fiber":              [round(v * 1e3, 2) for v in wf_lv],
+            "RV_fiber":              [round(v * 1e3, 2) for v in wf_rv],
+            "Septum_fiber":          [round(v * 1e3, 2) for v in wf_sep],
+            "proxy_ll_LV":           [round(v * 1e3, 2) for v in ps_lv],
+            "proxy_ll_RV":           [round(v * 1e3, 2) for v in ps_rv],
+            "proxy_ll_Septum_PLV":   [round(v * 1e3, 2) for v in ps_plv],
+            "proxy_ll_Septum_Trans": [round(v * 1e3, 2) for v in ps_trans],
+            "proxy_ll_Septum_PRV":   [round(v * 1e3, 2) for v in ps_prv],
+        },
+        "correlations": {
+            "RV_ESP_vs_RV_total_work":     _pearson(rv_esp,  wt_rv),
+            "RV_ESP_vs_LV_total_work":     _pearson(rv_esp,  wt_lv),
+            "RV_ESP_vs_Septum_total_work": _pearson(rv_esp,  wt_sep),
+            "RV_ESP_vs_LV_ESP":            _pearson(rv_esp,  lv_esp),
+            "RV_ESP_vs_RV_proxy_ll":       _pearson(rv_esp,  ps_rv),
+            "RV_ESP_vs_LV_proxy_ll":       _pearson(rv_esp,  ps_lv),
+            "Sep_fiber_vs_proxy_PLV":      _pearson(wf_sep,  ps_plv),
+            "Sep_fiber_vs_proxy_Trans":    _pearson(wf_sep,  ps_trans),
+            "Sep_fiber_vs_proxy_PRV":      _pearson(wf_sep,  ps_prv),
+            "Sep_total_vs_RV_total_work":  _pearson(wt_sep,  wt_rv),
+            "Sep_total_vs_RV_ESP":         _pearson(wt_sep,  rv_esp),
+            "Sep_total_vs_LV_ESP":         _pearson(wt_sep,  lv_esp),
+        },
+        "proxy_ratios_proxy_over_fiber": {
+            "LV":           [_ratio(p, f) for p, f in zip(ps_lv,    wf_lv)],
+            "RV":           [_ratio(p, f) for p, f in zip(ps_rv,    wf_rv)],
+            "Septum_PLV":   [_ratio(p, f) for p, f in zip(ps_plv,   wf_sep)],
+            "Septum_Trans": [_ratio(p, f) for p, f in zip(ps_trans, wf_sep)],
+            "Septum_PRV":   [_ratio(p, f) for p, f in zip(ps_prv,   wf_sep)],
+        },
+    }
+
+    out_path = Path(outdir) / "core_stats.json"
+    with open(out_path, "w") as f:
+        json.dump(out, f, indent=2)
+    print(f"  Saved: {out_path}")
+    return out
+
+
 # ─── Console Report ──────────────────────────────────────────────────────────
 
 def print_work_report(results, labels):
@@ -845,17 +1029,19 @@ def main():
     hemo = extract_hemodynamics(results, labels)
     print_hemodynamic_table(hemo)
     print_work_report(results, labels)
+    print("\nComputing core statistics...")
+    compute_and_save_stats(results, labels, outdir)
 
     # Figures
     primary_figures = [
-        ("Hemodynamic trends",      plot_hemodynamic_trends),
-        ("PV loops",                plot_pv_loops),
-        ("Stress-strain loops",     plot_stress_strain_spectrum),
-        ("Pressure-strain loops",   plot_pressure_strain_spectrum),
-        ("Work trends",             plot_work_trends),
-        ("Work decomposition",      plot_work_decomposition_spectrum),
-        ("Work redistribution",     plot_work_redistribution_spectrum),
-        ("Proxy accuracy",          plot_proxy_accuracy_spectrum),
+        ("Hemodynamic trends",         plot_hemodynamic_trends),
+        ("PV loops",                   plot_pv_loops),
+        ("Stress-strain loops",        plot_stress_strain_spectrum),
+        ("Simplification cascade",     plot_simplification_cascade_spectrum),
+        ("Work trends",                plot_work_trends),
+        ("Work decomposition",         plot_work_decomposition_spectrum),
+        ("Work redistribution",        plot_work_redistribution_spectrum),
+        ("Proxy accuracy",             plot_proxy_accuracy_spectrum),
     ]
 
     extra_figures = [

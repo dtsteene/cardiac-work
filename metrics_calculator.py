@@ -559,49 +559,53 @@ class MetricsCalculator:
     
     def _calculate_pressure_proxies(self, model_history, current_state=None):
         """
-        Calculate PV-based proxies with Artifact Protection & Unit Scaling.
+        Pure 0D PV loop work proxy: P_0D * dV_0D (clinical analogue).
+
+        Uses 0D Windkessel pressure and unscaled 0D volume — the quantities
+        a clinician would measure from echo + catheter.  No mixing of solver
+        Lagrange-multiplier pressure with 0D volumes.
         """
         proxies = {}
         current_state = current_state or {}
-        
-        # Unit Conversions
+
         MMHG_TO_PA = 133.322
         ML_TO_M3 = 1e-6
-        
-        # 1. Get Inputs (Convert to SI Units)
-        p_LV_Pa = (current_state.get("p_LV", 0.0) or 0.0) * MMHG_TO_PA
-        p_RV_Pa = (current_state.get("p_RV", 0.0) or 0.0) * MMHG_TO_PA
-        
-        V_LV_m3 = (current_state.get("V_LV", 0.0) or 0.0) * ML_TO_M3
-        V_RV_m3 = (current_state.get("V_RV", 0.0) or 0.0) * ML_TO_M3
-        
-        # 2. INITIALIZATION CHECK (Prevents the "Inflation Spike")
+
+        # Pure 0D quantities (fallback to solver values if 0D keys missing)
+        p_LV_Pa = (current_state.get("p_LV_0D", 0.0) or 0.0) * MMHG_TO_PA
+        p_RV_Pa = (current_state.get("p_RV_0D", 0.0) or 0.0) * MMHG_TO_PA
+        V_LV_m3 = (current_state.get("V_LV_Clinical", 0.0) or 0.0) * ML_TO_M3
+        V_RV_m3 = (current_state.get("V_RV_Clinical", 0.0) or 0.0) * ML_TO_M3
+
+        # Initialization (first call — store previous, return zero work)
         if self.V_LV_prev is None:
             self.V_LV_prev = V_LV_m3
             self.V_RV_prev = V_RV_m3
+            self.p_LV_0D_prev = p_LV_Pa
+            self.p_RV_0D_prev = p_RV_Pa
             return {"work_proxy_pv_LV": 0.0, "work_proxy_pv_RV": 0.0}
-            
-        # 3. Calculate Increments
+
+        # Volume increments
         dV_LV = V_LV_m3 - self.V_LV_prev
         dV_RV = V_RV_m3 - self.V_RV_prev
-        
-        # 4. ARTIFACT PROTECTION
-        # If dV > 10mL in one step, ignore it (solver reset/glitch)
+
+        # Artifact protection: ignore dV > 10 mL in one step
         if abs(dV_LV) > 1e-5: dV_LV = 0.0
         if abs(dV_RV) > 1e-5: dV_RV = 0.0
-        
-        # 5. CALCULATE WORK (External Work P*dV in Joules)
-        # Upgrade to Trapezoidal Rule (2nd Order): W = avg(P) * dV
-        p_LV_avg = 0.5 * (p_LV_Pa + self.p_LV_prev)
-        p_RV_avg = 0.5 * (p_RV_Pa + self.p_RV_prev)
-        
+
+        # Trapezoidal rule: W = P_avg * dV
+        p_LV_avg = 0.5 * (p_LV_Pa + self.p_LV_0D_prev)
+        p_RV_avg = 0.5 * (p_RV_Pa + self.p_RV_0D_prev)
+
         proxies["work_proxy_pv_LV"] = p_LV_avg * dV_LV
         proxies["work_proxy_pv_RV"] = p_RV_avg * dV_RV
-        
-        # Update Previous State (Volumes only - Pressures handled in boundary calc)
+
+        # Update previous state
         self.V_LV_prev = V_LV_m3
         self.V_RV_prev = V_RV_m3
-        
+        self.p_LV_0D_prev = p_LV_Pa
+        self.p_RV_0D_prev = p_RV_Pa
+
         return proxies
 
     def _calculate_pressure_strain_work(self, current_state, mechanics_data):

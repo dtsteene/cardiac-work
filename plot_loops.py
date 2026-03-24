@@ -190,8 +190,19 @@ def plot_engineering_debug(metrics, outdir):
     time = np.array(metrics["time"])
 
     # --- A. The Sinks (External Outputs) ---
-    # 1. PV Loop Work (The Clinical Output)
-    w_pv_proxy = get_safe(["work_proxy_pv_LV"]) + get_safe(["work_proxy_pv_RV"])
+    # 1. PV Loop Work — pure 0D clinical proxy: P_0D * dV_0D
+    #    Recompute from saved arrays so it works with old and new metrics files.
+    MMHG_TO_PA = 133.322
+    ML_TO_M3 = 1e-6
+    p_lv_0d = get_safe(["p_LV_0D", "p_LV"]) * MMHG_TO_PA
+    p_rv_0d = get_safe(["p_RV_0D", "p_RV"]) * MMHG_TO_PA
+    v_lv_0d = get_safe(["V_LV_Clinical", "V_LV"]) * ML_TO_M3
+    v_rv_0d = get_safe(["V_RV_Clinical", "V_RV"]) * ML_TO_M3
+    dV_lv = np.diff(v_lv_0d, prepend=v_lv_0d[0])
+    dV_rv = np.diff(v_rv_0d, prepend=v_rv_0d[0])
+    p_lv_avg = 0.5 * (p_lv_0d + np.roll(p_lv_0d, 1)); p_lv_avg[0] = p_lv_0d[0]
+    p_rv_avg = 0.5 * (p_rv_0d + np.roll(p_rv_0d, 1)); p_rv_avg[0] = p_rv_0d[0]
+    w_pv_proxy = p_lv_avg * dV_lv + p_rv_avg * dV_rv
     
     # 2. Robin Springs (The Elastic Support)
     w_robin = get_safe(["work_robin_epi"]) + get_safe(["work_robin_base"])
@@ -265,10 +276,10 @@ def plot_engineering_debug(metrics, outdir):
 
     # PLOT 2: Proxy vs Exact Boundary Work
     ax2 = fig.add_subplot(gs[0, 1])
-    ax2.plot(time, np.cumsum(w_pv_proxy), 'b-', label='PV Proxy (P·dV₀D)')
-    ax2.plot(time, np.cumsum(w_boundary_exact), 'g--', label='Exact Boundary (P·dV_FEM)')
-    ax2.plot(time, np.cumsum(w_int_total), 'k:', lw=1, alpha=0.5, label='Internal (S:dE)')
-    ax2.set_title("2. Proxy vs Exact Boundary Work", fontsize=12, fontweight='bold')
+    ax2.plot(time, np.cumsum(w_pv_proxy), 'b-', label=r'Clinical PV ($P_{0D} \cdot dV_{0D}$)')
+    ax2.plot(time, np.cumsum(w_boundary_exact), 'g--', label=r'Exact Boundary ($P_{solv} \cdot dV_{FEM}$)')
+    ax2.plot(time, np.cumsum(w_int_total), 'k:', lw=1, alpha=0.5, label=r'Internal ($\mathbf{S}:\mathrm{d}\mathbf{E}$)')
+    ax2.set_title("2. Clinical PV vs Exact Boundary Work", fontsize=12, fontweight='bold')
     ax2.legend(fontsize=8)
     ax2.grid(True, alpha=0.3)
 

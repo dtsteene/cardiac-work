@@ -7,6 +7,426 @@ import dolfinx
 import ldrb
 import cardiac_geometries
 import cardiac_geometries.geometry
+import cardiac_geometries.utils
+
+
+# ── Wall Thickness Modification ───────────────────────────────
+# Point cloud vertex ranges from the UKB atlas (ukb/surface.py)
+_LV_ENDO = (0, 1500)
+_RV_ENDO_RANGES = [(1500, 2165), (2165, 3224)]
+_RVFW_RANGE = (5729, 5808)
+_EPI_RANGE = (3224, 5582)
+
+
+def modify_wall_thickness(points, displacement_mm, logger=None):
+    """
+    Modify wall thickness by displacing endocardial points.
+
+    For each endocardial point, we find its nearest epicardial point.
+    The vector from endo → epi is the through-wall direction.
+    We move the endo point along this vector:
+      displacement_mm < 0: move INTO cavity  → wall THICKENS
+      displacement_mm > 0: move TOWARD epi   → wall THINS
+      displacement_mm = 0: no change
+
+    The epicardial surface is always kept fixed.
+
+    Parameters
+    ----------
+    points : np.ndarray, shape (n_points, 3)
+        Full UKB point cloud (before unwanted node removal).
+    displacement_mm : float
+        How far to move endocardial points (mm). Negative = thickening.
+    logger : logging.Logger, optional
+        Logger for status messages.
+
+    Returns
+    -------
+    np.ndarray
+        Modified point cloud (same shape as input).
+    """
+    from scipy.spatial import KDTree
+
+    if displacement_mm == 0.0:
+        return points.copy()
+
+    pts = points.copy()
+    epi = pts[_EPI_RANGE[0]:_EPI_RANGE[1]]
+    epi_tree = KDTree(epi)
+
+    def _displace(sl, region_name):
+        endo = pts[sl]
+        # Average direction over k nearest epi points → smooth displacement field
+        # (single nearest-epi gives kinks that cause GMSH to hang/fail)
+        k = min(5, len(epi))
+        _, nearest_idxs = epi_tree.query(endo, k=k)  # (n, k)
+        if k == 1:
+            nearest_idxs = nearest_idxs[:, np.newaxis]
+        neighbors = epi[nearest_idxs]          # (n, k, 3)
+        raw_dir = neighbors - endo[:, np.newaxis, :]  # (n, k, 3)
+        direction = raw_dir.mean(axis=1)       # (n, 3) — smoothed transmural vector
+        norms = np.linalg.norm(direction, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-10)
+        # Use single-nearest distance as local wall thickness for clamping
+        thick = np.linalg.norm(epi[nearest_idxs[:, 0]] - endo, axis=1)
+        max_abs = 0.40 * thick
+        clamped = np.clip(displacement_mm, -max_abs, max_abs)
+        pts[sl] = endo + clamped[:, np.newaxis] * (direction / norms)
+        if logger:
+            thick_after = np.mean(np.linalg.norm(epi[nearest_idxs[:, 0]] - pts[sl], axis=1))
+            actual_disp = np.mean(np.abs(clamped))
+            logger.info(f"  {region_name}: {np.mean(thick):.2f} → {thick_after:.2f} mm "
+                        f"(mean |disp| = {actual_disp:.2f} mm)")
+
+    if logger:
+        logger.info(f"Modifying wall thickness (displacement = {displacement_mm:+.1f} mm):")
+
+    _displace(slice(_LV_ENDO[0], _LV_ENDO[1]), "LV endo")
+    for s, e in _RV_ENDO_RANGES:
+        _displace(slice(s, e), f"RV endo [{s}:{e}]")
+    # Note: RVFW (79 pts, indices 5729-5808) is NOT displaced — it sits outside
+    # the EPI range and displacing it simultaneously with RV endo causes PLC
+    # self-intersections in GMSH at ≥2mm displacement.
+
+    return pts
+
+
+def compute_pca_thickness_direction(atlas_path, strategy="global_no_size", n_modes=50, logger=None):
+    """
+    Find the optimal direction in PCA space for wall thickness control.
+
+    Strategies:
+      - "rv_fw_no_size": Maximize RV free wall thickness, orthogonal to overall size
+      - "rv_all_no_size": Maximize all-RV thickness, orthogonal to size
+      - "global_no_size": Maximize LV+RV thickness, orthogonal to size
+      - "max_rv_fw": Maximize RV free wall (no size constraint)
+
+    Returns: unit vector z of length n_modes
+    """
+    from scipy.spatial import KDTree, ConvexHull
+    import h5py
+
+    with h5py.File(atlas_path, "r") as hdf:
+        n_avail = min(n_modes, hdf["COEFF"].shape[0])
+
+        # Get baseline
+        mu = np.transpose(hdf["MU"])
+        N = mu.shape[1] // 2
+        pts_base = np.reshape(mu[0, :N], (-1, 3))
+
+        lv_base = pts_base[_LV_ENDO[0]:_LV_ENDO[1]]
+        rv_base = np.vstack([pts_base[s:e] for s, e in _RV_ENDO_RANGES])
+        epi_base = pts_base[_EPI_RANGE[0]:_EPI_RANGE[1]]
+        tree_base = KDTree(epi_base)
+        lv_thick_base = np.mean(tree_base.query(lv_base)[0])
+        rv_thick_base = np.mean(tree_base.query(rv_base)[0])
+        rv_fw_thick_base = np.mean(tree_base.query(rv_base[665:])[0])  # 665 = sept count
+        epi_vol_base = ConvexHull(epi_base).volume
+        lv_vol_base = ConvexHull(lv_base).volume
+
+        # Per-mode sensitivities
+        sens_lv = np.zeros(n_avail)
+        sens_rv = np.zeros(n_avail)
+        sens_rv_fw = np.zeros(n_avail)
+        sens_epi_vol = np.zeros(n_avail)
+        sens_lv_vol = np.zeros(n_avail)
+
+        for m in range(n_avail):
+            eigenvalue = hdf["LATENT"][0, m]
+            eigenvector = hdf["COEFF"][m, :]
+            S = mu + np.sqrt(eigenvalue) * eigenvector
+            pts = np.reshape(S[0, :N], (-1, 3))
+
+            lv = pts[_LV_ENDO[0]:_LV_ENDO[1]]
+            rv = np.vstack([pts[s:e] for s, e in _RV_ENDO_RANGES])
+            epi = pts[_EPI_RANGE[0]:_EPI_RANGE[1]]
+            tree = KDTree(epi)
+
+            sens_lv[m] = np.mean(tree.query(lv)[0]) - lv_thick_base
+            sens_rv[m] = np.mean(tree.query(rv)[0]) - rv_thick_base
+            sens_rv_fw[m] = np.mean(tree.query(rv[665:])[0]) - rv_fw_thick_base
+            sens_epi_vol[m] = (ConvexHull(epi).volume - epi_vol_base) / epi_vol_base * 100
+            sens_lv_vol[m] = (ConvexHull(lv).volume - lv_vol_base) / lv_vol_base * 100
+
+    def _orthogonalize(z, constraints):
+        for c in constraints:
+            c = c[:len(z)]
+            norm_c = np.linalg.norm(c)
+            if norm_c > 1e-10:
+                c_unit = c / norm_c
+                z = z - np.dot(z, c_unit) * c_unit
+        return z
+
+    if strategy == "rv_fw_no_size":
+        z = _orthogonalize(sens_rv_fw.copy(), [sens_epi_vol])
+    elif strategy == "rv_all_no_size":
+        z = _orthogonalize(sens_rv.copy(), [sens_epi_vol])
+    elif strategy == "global_no_size":
+        z = _orthogonalize(sens_lv + sens_rv, [sens_epi_vol, sens_lv_vol])
+    elif strategy == "max_rv_fw":
+        z = sens_rv_fw.copy()
+    else:
+        raise ValueError(f"Unknown PCA strategy: {strategy}")
+
+    norm = np.linalg.norm(z)
+    if norm < 1e-10:
+        raise ValueError(f"Strategy {strategy} resulted in zero direction")
+    z = z / norm
+
+    if logger:
+        # Report expected thickness change per σ
+        drvfw = np.dot(z, sens_rv_fw[:n_avail])
+        dlv = np.dot(z, sens_lv[:n_avail])
+        dsize = np.dot(z, sens_epi_vol[:n_avail])
+        logger.info(f"PCA strategy '{strategy}': per 1σ → "
+                    f"ΔRVFW={drvfw:+.3f}mm, ΔLV={dlv:+.3f}mm, ΔEpiVol={dsize:+.1f}%")
+
+    return z
+
+
+def _create_clipped_mesh_robust(folder, case, char_length_max, char_length_min):
+    """Like ukb.mesh.create_clipped_mesh but handles variable surface counts.
+
+    The upstream code hardcodes addPlaneSurface(..., tag=4) which fails when
+    the clipped PLY files produce 4+ surfaces. This version auto-detects
+    the topology and assigns tags dynamically.
+    """
+    import gmsh
+
+    _logger = logging.getLogger(__name__)
+
+    gmsh.initialize()
+    gmsh.option.setNumber("General.Verbosity", 0)
+
+    gmsh.merge(f"{folder}/lv_clipped.ply")
+    gmsh.merge(f"{folder}/rv_clipped.ply")
+    gmsh.merge(f"{folder}/epi_clipped.ply")
+
+    gmsh.model.mesh.removeDuplicateNodes()
+    gmsh.model.mesh.create_topology()
+    gmsh.model.mesh.create_geometry()
+
+    surfaces_before = gmsh.model.getEntities(2)
+    curves = gmsh.model.getEntities(1)
+    n_surf = len(surfaces_before)
+    n_curves = len(curves)
+    _logger.info(f"  Clipped mesh: {n_surf} surfaces, {n_curves} curves after topology")
+
+    # Create base plane from boundary curves
+    curve_tags = [c[1] for c in curves]
+    base_ring = gmsh.model.geo.addCurveLoop(curve_tags)
+    base_tag = gmsh.model.geo.addPlaneSurface([base_ring])
+    gmsh.model.geo.synchronize()
+
+    surfaces_after = gmsh.model.getEntities(2)
+    surf_loop = gmsh.model.geo.addSurfaceLoop([s[1] for s in surfaces_after])
+    vol = gmsh.model.geo.addVolume([surf_loop])
+    gmsh.model.geo.synchronize()
+
+    # Assign physical groups dynamically
+    # PLY load order: LV, RV, EPI → typically surfaces 1, 2, 3
+    # But topology classification may split them
+    surf_tags = [s[1] for s in surfaces_before]
+    if n_surf == 3:
+        physical_groups = {"LV": [1], "RV": [2], "EPI": [3], "BASE": [base_tag]}
+    elif n_surf == 4:
+        # Most likely RV split into 2 parts
+        physical_groups = {"LV": [1], "RV": [2, 3], "EPI": [4], "BASE": [base_tag]}
+    elif n_surf == 5:
+        physical_groups = {"LV": [1], "RV": [2, 3], "EPI": [4, 5], "BASE": [base_tag]}
+    else:
+        # Generic fallback
+        physical_groups = {
+            "LV": [surf_tags[0]],
+            "RV": surf_tags[1:-1],
+            "EPI": [surf_tags[-1]],
+            "BASE": [base_tag],
+        }
+        _logger.warning(f"Unexpected {n_surf} surfaces — using fallback grouping")
+
+    for name, tags in physical_groups.items():
+        p = gmsh.model.addPhysicalGroup(2, tags)
+        gmsh.model.setPhysicalName(2, p, name)
+
+    p = gmsh.model.addPhysicalGroup(3, [vol])
+    gmsh.model.setPhysicalName(3, p, "Wall")
+
+    gmsh.option.setNumber("Mesh.Optimize", 1)
+    gmsh.option.setNumber("Mesh.OptimizeNetgen", 1)
+    gmsh.option.setNumber("Mesh.Smoothing", 1)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthMax", char_length_max)
+    gmsh.option.setNumber("Mesh.CharacteristicLengthMin", char_length_min)
+    gmsh.option.setNumber("Mesh.Algorithm3D", 1)
+    gmsh.option.setNumber("Mesh.AngleToleranceFacetOverlap", 0.1)
+    gmsh.model.geo.synchronize()
+
+    try:
+        gmsh.model.mesh.generate(3)
+    except Exception as e:
+        _logger.warning(f"Delaunay meshing failed ({e}), trying HXT algorithm...")
+        gmsh.option.setNumber("Mesh.Algorithm3D", 10)  # HXT
+        gmsh.model.mesh.generate(3)
+
+    outfile = (folder / f"{case}_clipped").with_suffix(".msh")
+    gmsh.write(str(outfile))
+    _logger.info(f"Created mesh {outfile}")
+    gmsh.finalize()
+
+
+def _generate_ukb_with_pca(geodir, char_length, pca_scores, logger):
+    """
+    Generate UKB geometry using arbitrary PCA score vector.
+
+    Parameters
+    ----------
+    pca_scores : np.ndarray
+        Z-score for each PCA mode. Shape = mu + sum(z_i * sqrt(lambda_i) * v_i)
+    """
+    import ukb.atlas
+    import ukb.surface as ukb_surf
+    import ukb.clip
+    import ukb.mesh as ukb_mesh
+    import h5py
+
+    case = "ED"
+
+    logger.info("Step 1/6: Generating point cloud from PCA scores...")
+    atlas_path = ukb.atlas.download_atlas(Path.home() / ".ukb", all=False)
+    with h5py.File(atlas_path, "r") as hdf:
+        mu = np.transpose(hdf["MU"])
+        S = mu.copy()
+        for i, z in enumerate(pca_scores):
+            if z != 0:
+                eigenvalue = hdf["LATENT"][0, i]
+                eigenvector = hdf["COEFF"][i, :]
+                S = S + z * np.sqrt(eigenvalue) * eigenvector
+    N = S.shape[1] // 2
+    ed_full = np.reshape(S[0, :N], (-1, 3))
+
+    # Measure resulting thickness
+    from scipy.spatial import KDTree
+    epi = ed_full[_EPI_RANGE[0]:_EPI_RANGE[1]]
+    tree = KDTree(epi)
+    lv = ed_full[_LV_ENDO[0]:_LV_ENDO[1]]
+    rv = np.vstack([ed_full[s:e] for s, e in _RV_ENDO_RANGES])
+    logger.info(f"  LV thickness: {np.mean(tree.query(lv)[0]):.2f} mm")
+    logger.info(f"  RV sept thickness: {np.mean(tree.query(rv[:665])[0]):.2f} mm")
+    logger.info(f"  RV FW thickness: {np.mean(tree.query(rv[665:])[0]):.2f} mm")
+
+    # Step 3: Write STL surfaces
+    logger.info("Step 3/6: Writing STL surfaces...")
+    geodir.mkdir(parents=True, exist_ok=True)
+    ukb_surf.get_epi_mesh(ed_full).write(str(geodir / f"EPI_{case}.stl"))
+    for ch in ["LV", "RV", "RVFW"]:
+        ukb_surf.get_chamber_mesh(ch, ed_full).write(str(geodir / f"{ch}_{case}.stl"))
+    for v in ["MV", "AV", "TV", "PV"]:
+        ukb_surf.get_valve_mesh(v, ed_full).write(str(geodir / f"{v}_{case}.stl"))
+
+    # Step 4: Clip
+    logger.info("Step 4/6: Clipping surfaces...")
+    ukb.clip.main(folder=geodir, case=case, smooth=True)
+
+    # Step 5: GMSH (use robust version that handles variable surface count)
+    logger.info("Step 5/6: Generating volumetric mesh (GMSH)...")
+    _create_clipped_mesh_robust(
+        folder=geodir, case=case,
+        char_length_max=char_length, char_length_min=char_length,
+    )
+
+    # Step 6: Convert to DOLFINx
+    logger.info("Step 6/6: Converting to DOLFINx Geometry...")
+    mesh_name = geodir / f"{case}_clipped.msh"
+    geometry = cardiac_geometries.utils.gmsh2dolfin(
+        comm=MPI.COMM_SELF, msh_file=mesh_name,
+    )
+
+    geo = cardiac_geometries.geometry.Geometry(
+        mesh=geometry.mesh,
+        markers=geometry.markers,
+        ffun=geometry.ffun,
+        f0=None, s0=None, n0=None,
+        info={"mesh_type": "ukb_pca", "pca_scores": pca_scores.tolist()},
+    )
+    return geo
+
+
+def _generate_ukb_with_thickness(geodir, char_length, wall_displacement_mm, logger):
+    """
+    Replicate what cardiac_geometries.mesh.ukb() does, but with a
+    wall thickness modification step injected between surface generation
+    and clipping/meshing.
+
+    Steps:
+      1. Generate point cloud from PCA atlas (mean shape)
+      2. ** Modify endocardial points to change wall thickness **
+      3. Write modified STL surfaces
+      4. Clip surfaces
+      5. Generate volumetric mesh with GMSH
+      6. Convert to DOLFINx Geometry
+
+    Returns a Geometry object identical to what mesh.ukb() would return.
+    """
+    import ukb.atlas
+    import ukb.surface as ukb_surf
+    import ukb.clip
+    import ukb.mesh as ukb_mesh
+
+    case = "ED"
+
+    # Step 1: Generate point cloud from atlas
+    logger.info("Step 1/6: Generating point cloud from UKB atlas (mean shape)...")
+    atlas_path = ukb.atlas.download_atlas(Path.home() / ".ukb", all=False)
+    # We need the FULL point cloud (before unwanted node removal) for surface
+    # generation, since connectivity.txt references original indices.
+    import h5py
+    with h5py.File(atlas_path, "r") as hdf:
+        S = ukb.atlas.compute_S(hdf, mode=-1)
+    N = S.shape[1] // 2
+    ed_full = np.reshape(S[0, :N], (-1, 3))  # full point cloud, original indices
+
+    # Step 2: Modify wall thickness
+    logger.info("Step 2/6: Modifying wall thickness...")
+    ed_modified = modify_wall_thickness(ed_full, wall_displacement_mm, logger)
+
+    # Step 3: Write STL surfaces from modified points
+    logger.info("Step 3/6: Writing modified STL surfaces...")
+    geodir.mkdir(parents=True, exist_ok=True)
+
+    ukb_surf.get_epi_mesh(ed_modified).write(str(geodir / f"EPI_{case}.stl"))
+    for ch in ["LV", "RV", "RVFW"]:
+        ukb_surf.get_chamber_mesh(ch, ed_modified).write(str(geodir / f"{ch}_{case}.stl"))
+    for v in ["MV", "AV", "TV", "PV"]:
+        ukb_surf.get_valve_mesh(v, ed_modified).write(str(geodir / f"{v}_{case}.stl"))
+
+    # Step 4: Clip surfaces
+    logger.info("Step 4/6: Clipping surfaces...")
+    ukb.clip.main(folder=geodir, case=case, smooth=True)
+
+    # Step 5: Generate volumetric mesh with GMSH (robust version handles
+    # variable surface counts that arise from displaced endo surfaces)
+    logger.info("Step 5/6: Generating volumetric mesh (GMSH)...")
+    _create_clipped_mesh_robust(
+        folder=geodir, case=case,
+        char_length_max=char_length, char_length_min=char_length,
+    )
+
+    # Step 6: Convert to DOLFINx
+    logger.info("Step 6/6: Converting to DOLFINx Geometry...")
+    mesh_name = geodir / f"{case}_clipped.msh"
+    geometry = cardiac_geometries.utils.gmsh2dolfin(
+        comm=MPI.COMM_SELF,
+        msh_file=mesh_name,
+    )
+
+    geo = cardiac_geometries.geometry.Geometry(
+        mesh=geometry.mesh,
+        markers=geometry.markers,
+        ffun=geometry.ffun,
+        f0=None, s0=None, n0=None,
+        info={"mesh_type": "ukb", "wall_displacement_mm": wall_displacement_mm},
+    )
+    return geo
+
 
 def generate_and_load(comm, outdir, args, logger, manual_refinement=False, geodir=None):
     """
@@ -20,20 +440,25 @@ def generate_and_load(comm, outdir, args, logger, manual_refinement=False, geodi
     if geodir is None:
         geodir = outdir / "geometry"
 
+    # Wall displacement: 0.0 = baseline, negative = thickening (mm)
+    wall_displacement_mm = getattr(args, 'wall_displacement', 0.0)
+    pca_strategy = getattr(args, 'pca_strategy', None)
+    pca_magnitude = getattr(args, 'pca_magnitude', 0.0)
+
     # ========================================================================
     # PHASE 1: GENERATION (Rank 0 Only)
     # ========================================================================
     # We check if geometry exists. If not, Rank 0 generates it.
     if comm.rank == 0 and not (geodir / "geometry.bp").exists():
         logger.info("Generating and processing geometry (Rank 0)...")
-        
+
         # Determine settings from args
         char_length = args.char_length
-        
+
         if args.mesh:
             # --- CUSTOM MESH PATH ---
             logger.info(f"Loading CUSTOM MESH from: {args.mesh}")
-            
+
             with dolfinx.io.XDMFFile(MPI.COMM_SELF, args.mesh, "r") as xdmf:
                 mesh_in = xdmf.read_mesh(name="mesh")
                 mesh_in.topology.create_connectivity(mesh_in.topology.dim - 1, mesh_in.topology.dim)
@@ -42,8 +467,8 @@ def generate_and_load(comm, outdir, args, logger, manual_refinement=False, geodi
                 except RuntimeError:
                     logger.warning("Could not read 'facet_tags', trying 'mesh_tags'...")
                     ft_in = xdmf.read_meshtags(mesh_in, name="mesh_tags")
-            
-            
+
+
             # Standard Marker Map
             markers = {
                 "BASE": (10, 2),
@@ -51,7 +476,7 @@ def generate_and_load(comm, outdir, args, logger, manual_refinement=False, geodi
                 "ENDO_RV": (20, 2),
                 "EPI": (40, 2)
             }
-            
+
             geo = cardiac_geometries.geometry.Geometry(
                 mesh=mesh_in,
                 markers=markers,
@@ -59,9 +484,28 @@ def generate_and_load(comm, outdir, args, logger, manual_refinement=False, geodi
                 f0=None, s0=None, n0=None
             )
             # Assume custom meshes are pre-rotated
-            
+
+        elif pca_strategy is not None and pca_magnitude != 0.0:
+            # --- UKB WITH PCA-BASED THICKNESS ---
+            logger.info(f"Generating UKB mesh via PCA thickness control "
+                        f"(strategy={pca_strategy}, magnitude={pca_magnitude:+.1f}σ)...")
+            atlas_path = Path.home() / ".ukb" / "UKBRVLV.h5"
+            z_dir = compute_pca_thickness_direction(atlas_path, strategy=pca_strategy, logger=logger)
+            pca_scores = z_dir * pca_magnitude
+            geo = _generate_ukb_with_pca(geodir, char_length, pca_scores, logger)
+            geo = geo.rotate(target_normal=[1.0, 0.0, 0.0], base_marker="BASE")
+
+        elif wall_displacement_mm != 0.0:
+            # --- UKB WITH WALL THICKNESS MODIFICATION ---
+            logger.info(f"Generating UKB mesh with wall thickness modification "
+                        f"(displacement = {wall_displacement_mm:+.1f} mm)...")
+            geo = _generate_ukb_with_thickness(
+                geodir, char_length, wall_displacement_mm, logger
+            )
+            geo = geo.rotate(target_normal=[1.0, 0.0, 0.0], base_marker="BASE")
+
         else:
-            # --- DEFAULT UKB GENERATION ---
+            # --- DEFAULT UKB GENERATION (no thickness change) ---
             logger.info("Generating synthetic UKB mesh...")
             geo = cardiac_geometries.mesh.ukb(
                 outdir=geodir,
@@ -279,6 +723,32 @@ if __name__ == "__main__":
         action="store_true",
         help="Launch interactive Septum Tag Editor after LDRB tagging to manually correct tags before saving"
     )
+    parser.add_argument(
+        "-w", "--wall-displacement",
+        type=float,
+        default=0.0,
+        help=("Wall thickness displacement in mm. "
+              "Negative = thicken (endo moves into cavity), "
+              "positive = thin (endo moves toward epi). "
+              "Default: 0.0 (no change)")
+    )
+    parser.add_argument(
+        "--pca-strategy",
+        type=str,
+        choices=["rv_fw_no_size", "rv_all_no_size", "global_no_size", "max_rv_fw"],
+        default=None,
+        help=("PCA thickness strategy. Uses multi-mode combination for "
+              "physiologically realistic thickness variation. "
+              "Requires --pca-magnitude.")
+    )
+    parser.add_argument(
+        "--pca-magnitude",
+        type=float,
+        default=0.0,
+        help=("PCA score magnitude (in standard deviations). "
+              "Positive = thicker, negative = thinner. "
+              "E.g. --pca-magnitude 3.0 for +3σ thickening.")
+    )
 
     cli_args = parser.parse_args()
     
@@ -329,6 +799,9 @@ if __name__ == "__main__":
         args = argparse.Namespace(
             char_length=cli_args.char_length,
             mesh=mesh_path,
+            wall_displacement=cli_args.wall_displacement,
+            pca_strategy=cli_args.pca_strategy,
+            pca_magnitude=cli_args.pca_magnitude,
         )
         
         # Log info

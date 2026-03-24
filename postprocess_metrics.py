@@ -83,8 +83,36 @@ if not circ_path.exists():
     sys.exit(1)
 
 circ_history = np.load(circ_path, allow_pickle=True).item()
+
+# FIX: The history.npy may contain multi-beat 0D pre-run data (e.g. 10 beats, 0-8s)
+# while the FEM checkpoint is only 1 coupled beat (0-0.8s). If we interpolate FEM times
+# against this multi-beat history, we read from beat 1 (transient) instead of the last
+# (quasi-steady) beat. Detect this and use only the last beat.
+circ_time_arr = np.array(circ_history["time"])
+HR_Hz = sim_params["BPM"] / 60.0
+cycle_length = 1.0 / HR_Hz
+circ_duration = circ_time_arr[-1] - circ_time_arr[0]
+
+if circ_duration > cycle_length * 1.5:
+    # Multi-beat history detected — extract last beat
+    last_beat_start = circ_time_arr[-1] - cycle_length
+    mask = circ_time_arr >= last_beat_start - 1e-10
+    if rank == 0:
+        logger.warning(
+            f"⚠️  Multi-beat circulation history detected ({circ_duration:.1f}s = "
+            f"{circ_duration/cycle_length:.0f} beats). Extracting last beat from "
+            f"t={last_beat_start:.2f}s onward ({np.sum(mask)} points)."
+        )
+    # Shift time so last beat starts at 0
+    for key in circ_history:
+        arr = np.array(circ_history[key])
+        if len(arr) == len(circ_time_arr):
+            circ_history[key] = arr[mask]
+    circ_history["time"] = np.array(circ_history["time"]) - last_beat_start
+
 if rank == 0:
-    logger.info(f"Loaded circulation history: {len(circ_history['time'])} points")
+    logger.info(f"Loaded circulation history: {len(circ_history['time'])} points, "
+                f"time range: {circ_history['time'][0]:.4f} - {circ_history['time'][-1]:.4f}s")
 
 # ─── 4. Load Geometry from Checkpoint ─────────────────────────────────────────
 #

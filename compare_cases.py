@@ -229,9 +229,9 @@ def plot_simplification_cascade(results, labels, outdir):
                 ax.set_xlabel(row_info[row][1])
 
             if row == 0 and col == 0:
-                ax.legend(fontsize=6, loc='lower left', handlelength=1.0)
+                ax.legend(fontsize=6, loc='upper right', handlelength=1.0)
             if row == 1 and col == 2:
-                ax.legend(fontsize=5, loc='lower left', handlelength=1.0)
+                ax.legend(fontsize=5, loc='upper right', handlelength=1.0)
 
     # Row labels on the left margin
     for row, (rlabel, _, _) in enumerate(row_info):
@@ -244,69 +244,6 @@ def plot_simplification_cascade(results, labels, outdir):
 
 
 # ─── Figure 2: Pressure-Strain Loops ─────────────────────────────────────────
-
-def plot_pressure_strain(results, labels, outdir):
-    """
-    2x3 panel: pressure-strain loops.
-    Row 0: fiber strain (E_ff). Row 1: longitudinal strain (E_ll).
-    """
-    strain_rows = [
-        ("mean_E_ff", r"Fiber strain $E_{ff}$ (%)", "circumferential"),
-        ("mean_E_ll", r"Longitudinal strain $E_{ll}$ (%)", "longitudinal"),
-    ]
-
-    fig, axes = plt.subplots(2, 3, figsize=(7.0, 5.0), squeeze=False)
-
-    for row, (strain_prefix, xlabel, _) in enumerate(strain_rows):
-        for col, (region, p_key) in enumerate([("LV", "p_LV"), ("RV", "p_RV")]):
-            ax = axes[row, col]
-            strain_key = f"{strain_prefix}_{region}"
-            for r, lbl, c in zip(results, labels, COLORS):
-                strain = get_array(r, strain_key) * 100
-                pressure = get_array(r, p_key)
-                if len(strain) == 0:
-                    continue
-                ax.plot(strain, pressure, color=c, lw=1.5, label=lbl)
-                ax.plot(strain[0], pressure[0], 'o', color=c, ms=3)
-
-            ax.axhline(0, color='0.5', lw=0.4)
-            ax.axvline(0, color='0.5', lw=0.4)
-            if row == 0:
-                ax.set_title(f"{region} free wall", fontweight="bold")
-            if row == 1:
-                ax.set_xlabel(xlabel)
-            if col == 0:
-                ax.set_ylabel("Pressure (mmHg)")
-            if row == 0 and col == 0:
-                ax.legend(fontsize=6)
-
-        # Septum: P_LV solid, transmural dashed
-        ax = axes[row, 2]
-        strain_key = f"{strain_prefix}_Septum"
-        for r, lbl, c in zip(results, labels, COLORS):
-            strain = get_array(r, strain_key) * 100
-            p_lv = get_array(r, 'p_LV')
-            p_rv = get_array(r, 'p_RV')
-            if len(strain) == 0:
-                continue
-            ax.plot(strain, p_lv, color=c, lw=1.5, label=f"{lbl} ($P_{{LV}}$)")
-            ax.plot(strain[0], p_lv[0], 'o', color=c, ms=3)
-            p_trans = p_lv - p_rv
-            ax.plot(strain, p_trans, color=c, lw=1.2, ls='--',
-                    label=f"{lbl} (trans.)")
-
-        ax.axhline(0, color='0.5', lw=0.4)
-        ax.axvline(0, color='0.5', lw=0.4)
-        if row == 0:
-            ax.set_title("Septum", fontweight="bold")
-        if row == 1:
-            ax.set_xlabel(xlabel)
-        if row == 0:
-            ax.legend(fontsize=5, loc='upper right', ncol=1, handlelength=1.2)
-
-    fig.tight_layout(h_pad=0.8, w_pad=0.5)
-    _save(fig, outdir, "pressure_strain.png")
-
 
 # ─── Figure 3: Fiber Stress-Strain Loops ─────────────────────────────────────
 
@@ -358,7 +295,8 @@ def plot_stress_loops(results, labels, outdir):
         ax_loop.set_title(region, fontweight="bold")
         if col == 0:
             ax_loop.set_ylabel(r"$S_{ff}$ (kPa)")
-            ax_loop.legend()
+        if col == 2:
+            ax_loop.legend(fontsize=7, loc='upper right')
         ax_time.set_xlabel("Time (ms)")
         if col == 0:
             ax_time.set_ylabel(r"$E_{ff}$ (%)")
@@ -372,7 +310,7 @@ def plot_stress_loops(results, labels, outdir):
 def plot_work_decomposition(results, labels, outdir):
     """
     1x3 grouped bar chart: fiber/sheet/normal/cross work for LV, RV, Septum.
-    PS proxy shown as horizontal reference lines.
+    PS proxy shown as grouped bars (same style as components) after a separator.
     """
     components = [
         ("work_ff",    "Fiber"),
@@ -395,46 +333,155 @@ def plot_work_decomposition(results, labels, outdir):
             raise KeyError(f"Missing '{key}' — rerun postprocessing")
         return total_work(r, key) * 1e3
 
-    fig, axes = plt.subplots(1, 3, figsize=(7.0, 3.0))
+    fig, axes = plt.subplots(1, 3, figsize=(8.5, 3.0))
 
     for ax, region in zip(axes, ["LV", "RV", "Septum"]):
-        x = np.arange(len(components))
         n = len(results)
         width = 0.35
 
+        # Build per-region component + proxy list
+        if region in ("LV", "RV"):
+            all_comps = components + [("ps_ll", "PS")]
+        else:
+            all_comps = components + [("ps_ll_plv", r"PS $P_{LV}$"),
+                                      ("ps_ll_trans", "PS Trans.")]
+
+        def _get_val(r, ckey, region):
+            if ckey == "ps_ll":
+                return _ps_ll(r, region)
+            elif ckey == "ps_ll_plv":
+                return _ps_ll(r, region, "default")
+            elif ckey == "ps_ll_trans":
+                return _ps_ll(r, region, "trans")
+            else:
+                return total_work(r, f"{ckey}_{region}") * 1e3
+
+        x = np.arange(len(all_comps))
+
         for j, (r, lbl) in enumerate(zip(results, labels)):
-            vals = [total_work(r, f"{ckey}_{region}") * 1e3 for ckey, _ in components]
+            vals = [_get_val(r, ckey, region) for ckey, _ in all_comps]
             offset = (j - (n - 1) / 2) * width
             ax.bar(x + offset, vals, width,
                    label=lbl, color=COLORS[j],
                    alpha=0.85 if j == 0 else 0.65,
                    edgecolor='none')
 
-        # PS proxy reference lines
-        if region in ("LV", "RV"):
-            for j, (r, lbl) in enumerate(zip(results, labels)):
-                ps_val = _ps_ll(r, region)
-                ax.axhline(ps_val, ls=':', lw=1.0, color=COLORS[j], alpha=0.7)
-        else:
-            for p_variant, ls_style in [("default", ':'), ("trans", '-.')]:
-                for j, (r, lbl) in enumerate(zip(results, labels)):
-                    ps_val = _ps_ll(r, region, p_variant)
-                    lbl_str = r"$P_{LV}$" if p_variant == "default" else "Trans."
-                    ax.axhline(ps_val, ls=ls_style, lw=1.0, color=COLORS[j],
-                               alpha=0.6, label=f"PS {lbl_str} ({lbl})" if j == 0 else None)
+        # Separator between decomposition components and PS proxy
+        sep_x = len(components) - 0.5
+        ax.axvline(sep_x, color='gray', lw=0.7, ls='--', alpha=0.4)
 
         ax.set_xticks(x)
-        ax.set_xticklabels([clbl for _, clbl in components], fontsize=8)
+        ax.set_xticklabels([clbl for _, clbl in all_comps], fontsize=7)
         ax.set_title(region, fontweight='bold')
         ax.axhline(0, color='k', lw=0.5)
         if region == "LV":
             ax.set_ylabel("Work (mJ)")
             ax.legend(fontsize=6.5, loc='best')
-        if region == "Septum":
-            ax.legend(fontsize=6, loc='best')
 
     fig.tight_layout(w_pad=0.8)
     _save(fig, outdir, "work_decomposition.png")
+
+
+def plot_work_decomposition_stacked(results, labels, outdir):
+    """
+    1x3 stacked bar chart: per-case bars for each region, stacked by component.
+    Each segment labelled with its % of |total work|.
+    PS proxy shown as grouped bars (case-colored) after a separator.
+    """
+    components = [
+        ("work_ff",    "Fiber"),
+        ("work_ss",    "Sheet"),
+        ("work_nn",    "Normal"),
+        ("work_cross", "Cross"),
+    ]
+    # Distinct colors per component (colorblind-friendly)
+    COMP_COLORS = ["#4878A8", "#6AB187", "#C25454", "#9B59B6"]
+
+    def _ps_ll_val(r, region, p_variant="default"):
+        if region in ("LV", "RV"):
+            key = f"work_ps_ll_{region}"
+        elif p_variant == "default":
+            key = "work_ps_ll_Septum_PLV"
+        elif p_variant == "trans":
+            key = "work_ps_ll_Septum_Trans"
+        else:
+            return 0.0
+        return total_work(r, key) * 1e3 if key in r else 0.0
+
+    fig, axes = plt.subplots(1, 3, figsize=(9.5, 3.5))
+    n = len(results)
+
+    for ax, region in zip(axes, ["LV", "RV", "Septum"]):
+        width_stacked = 0.5
+        width_ps = 0.35
+
+        # --- Stacked bars at x = 0, 1, ..., n-1 ---
+        for j, r in enumerate(results):
+            vals = [total_work(r, f"{ckey}_{region}") * 1e3 for ckey, _ in components]
+            total_abs = sum(abs(v) for v in vals)
+
+            pos_bot = 0.0
+            neg_bot = 0.0
+            for k, (v, (_, clbl)) in enumerate(zip(vals, components)):
+                color = COMP_COLORS[k]
+                bot = pos_bot if v >= 0 else neg_bot
+                ax.bar(j, v, width_stacked, bottom=bot, color=color, alpha=0.85,
+                       edgecolor='white', lw=0.5,
+                       label=clbl if j == 0 else None)
+                pct = abs(v) / total_abs * 100 if total_abs > 0 else 0
+                if pct > 5:
+                    mid = bot + v / 2
+                    ax.text(j, mid, f"{pct:.0f}%",
+                            ha='center', va='center', fontsize=7,
+                            color='white', fontweight='bold')
+                if v >= 0:
+                    pos_bot += v
+                else:
+                    neg_bot += v
+
+        # --- PS proxy bars after separator ---
+        sep_x = n - 0.5 + 0.3
+        ax.axvline(sep_x, color='gray', lw=0.7, ls='--', alpha=0.4)
+
+        if region in ("LV", "RV"):
+            ps_center = sep_x + 0.9
+            for j, (r, lbl) in enumerate(zip(results, labels)):
+                ps_val = _ps_ll_val(r, region)
+                offset = (j - (n - 1) / 2) * width_ps
+                ax.bar(ps_center + offset, ps_val, width_ps,
+                       color=COLORS[j], alpha=0.85 if j == 0 else 0.65,
+                       edgecolor='none')
+            all_ticks = list(range(n)) + [ps_center]
+            all_ticklabels = list(labels) + ["PS"]
+        else:
+            # Septum: PLV and Trans variants
+            ps_center1 = sep_x + 0.9
+            ps_center2 = ps_center1 + n * width_ps + 0.35
+            for j, (r, lbl) in enumerate(zip(results, labels)):
+                ps_plv = _ps_ll_val(r, region, "default")
+                ps_trans = _ps_ll_val(r, region, "trans")
+                offset = (j - (n - 1) / 2) * width_ps
+                ax.bar(ps_center1 + offset, ps_plv, width_ps,
+                       color=COLORS[j], alpha=0.85 if j == 0 else 0.65,
+                       edgecolor='none')
+                ax.bar(ps_center2 + offset, ps_trans, width_ps,
+                       color=COLORS[j], alpha=0.85 if j == 0 else 0.65,
+                       edgecolor='none')
+            all_ticks = list(range(n)) + [ps_center1, ps_center2]
+            all_ticklabels = list(labels) + [r"PS $P_{LV}$", "PS Trans."]
+
+        ax.set_xticks(all_ticks)
+        ax.set_xticklabels(all_ticklabels, fontsize=7)
+        ax.set_title(region, fontweight='bold')
+        ax.axhline(0, color='k', lw=0.5)
+        if region == "LV":
+            ax.set_ylabel("Work (mJ)")
+
+    # Component legend on RV panel (bottom right — least overlap)
+    axes[1].legend(fontsize=6.5, loc='lower right')
+
+    fig.tight_layout(w_pad=0.8)
+    _save(fig, outdir, "work_decomposition_stacked.png")
 
 
 # ─── Figure 5: Pressure vs Transmural Stress ─────────────────────────────────
@@ -600,6 +647,92 @@ def plot_work_redistribution(results, labels, outdir):
 
     fig.tight_layout(w_pad=0.8)
     _save(fig, outdir, "work_redistribution.png")
+
+
+def plot_work_density(results, labels, outdir):
+    """
+    Standalone work density figure: total and fiber work density per region.
+    Shows how work per unit volume shifts across LV, RV, Septum.
+    """
+    regions = ["LV", "RV", "Septum"]
+    vol_m3_to_mL = 1e6
+
+    has_volumes = all(f"region_volume_{reg}" in results[0] for reg in regions)
+    if not has_volumes:
+        print("  No region_volume_* keys — skipping work density plot.")
+        return
+
+    fig, axes = plt.subplots(1, 2, figsize=(6.0, 3.2))
+
+    for ax, (panel_title, wkey) in zip(axes, [("Total work density", "work_true"),
+                                               ("Fiber work density", "work_ff")]):
+        x = np.arange(len(regions))
+        width = 0.35
+
+        for j, (r, lbl) in enumerate(zip(results, labels)):
+            densities = []
+            for reg in regions:
+                w_mJ = total_work(r, f"{wkey}_{reg}") * 1e3
+                v_mL = float(r[f"region_volume_{reg}"]) * vol_m3_to_mL
+                densities.append(w_mJ / v_mL if v_mL > 0 else 0.0)
+            offset = (j - 0.5) * width
+            ax.bar(x + offset, densities, width,
+                   label=lbl, color=COLORS[j],
+                   alpha=0.85 if j == 0 else 0.65,
+                   edgecolor='none')
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(regions)
+        ax.set_title(panel_title, fontweight='bold')
+        ax.axhline(0, color='k', lw=0.5)
+        if ax == axes[0]:
+            ax.set_ylabel("Work density (mJ/mL)")
+
+    axes[1].legend(fontsize=6.5, loc='lower right')
+    fig.tight_layout(w_pad=1.0)
+    _save(fig, outdir, "work_density.png")
+
+
+def plot_work_redistribution_stacked(results, labels, outdir):
+    """
+    Stacked bar version of work redistribution.
+    One bar per case for Total work and Fiber work, stacked by region (LV/RV/Septum).
+    Work density is not stackable and is omitted.
+    """
+    regions = ["LV", "RV", "Septum"]
+    panel_configs = [("Total work", "work_true"), ("Fiber work", "work_ff")]
+
+    fig, axes = plt.subplots(1, 2, figsize=(5.0, 3.5))
+
+    for ax, (panel_title, wkey) in zip(axes, panel_configs):
+        x = np.arange(len(results))
+        width = 0.5
+
+        for j, r in enumerate(results):
+            reg_vals = [total_work(r, f"{wkey}_{reg}") * 1e3 for reg in regions]
+            total = sum(reg_vals)
+            bot = 0.0
+            for k, (reg, v) in enumerate(zip(regions, reg_vals)):
+                ax.bar(j, v, width, bottom=bot, color=REGION_COLORS[reg],
+                       alpha=0.85, edgecolor='white', lw=0.5,
+                       label=reg if j == 0 else None)
+                pct = abs(v / total) * 100 if abs(total) > 1e-15 else 0.0
+                if pct > 5:
+                    ax.text(j, bot + v / 2, f"{pct:.0f}%",
+                            ha='center', va='center', fontsize=8,
+                            color='white', fontweight='bold')
+                bot += v
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=8)
+        ax.set_title(panel_title, fontweight='bold')
+        ax.axhline(0, color='k', lw=0.5)
+        if ax == axes[0]:
+            ax.set_ylabel("Work (mJ)")
+            ax.legend(fontsize=7, loc='upper left')
+
+    fig.tight_layout(w_pad=0.8)
+    _save(fig, outdir, "work_redistribution_stacked.png")
 
 
 # ─── Figure 7: Sensitivity / Proxy Tracking ──────────────────────────────────
@@ -787,7 +920,7 @@ def plot_geometry_context(results, labels, outdir):
     ax.set_xticklabels(regions)
     ax.set_ylabel("Wall volume (mL)")
     ax.set_title("Region volumes", fontweight='bold')
-    ax.legend(fontsize=6, loc='upper right')
+    ax.legend(fontsize=6, loc='upper left')
 
     # Panel 2: work density
     ax = axes[1]
@@ -832,6 +965,52 @@ def plot_geometry_context(results, labels, outdir):
 
     fig.tight_layout(w_pad=0.8)
     _save(fig, outdir, "geometry_context.png")
+
+
+def plot_geometry_context_stacked(results, labels, outdir):
+    """
+    Stacked bar version of region volumes: one bar per case, stacked by region.
+    Work density is not stackable and is omitted.
+    """
+    regions = ["LV", "RV", "Septum"]
+    vol_m3_to_mL = 1e6
+
+    volumes = {}
+    for j, r in enumerate(results):
+        for region in regions:
+            key = f"region_volume_{region}"
+            if key not in r:
+                return  # silently skip if no volume data
+            volumes[(j, region)] = float(r[key]) * vol_m3_to_mL
+
+    fig, ax = plt.subplots(1, 1, figsize=(3.2, 3.2))
+
+    x = np.arange(len(results))
+    width = 0.5
+
+    for j in range(len(results)):
+        vols = [volumes[(j, reg)] for reg in regions]
+        total = sum(vols)
+        bot = 0.0
+        for k, (reg, v) in enumerate(zip(regions, vols)):
+            ax.bar(j, v, width, bottom=bot, color=REGION_COLORS[reg],
+                   alpha=0.85, edgecolor='white', lw=0.5,
+                   label=reg if j == 0 else None)
+            pct = v / total * 100 if total > 0 else 0.0
+            if pct > 5:
+                ax.text(j, bot + v / 2, f"{pct:.0f}%",
+                        ha='center', va='center', fontsize=8,
+                        color='white', fontweight='bold')
+            bot += v
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, fontsize=8)
+    ax.set_ylabel("Wall volume (mL)")
+    ax.set_title("Region volumes", fontweight='bold')
+    ax.legend(fontsize=7, loc='upper left')
+
+    fig.tight_layout()
+    _save(fig, outdir, "geometry_context_stacked.png")
 
 
 # ─── Extra Figures (--all mode) ──────────────────────────────────────────────
@@ -943,10 +1122,13 @@ def plot_proxy_directional_match(results, labels, outdir):
             if proxy_trans_key and proxy_trans_key in r:
                 proxy_t = get_array(r, proxy_trans_key) * 1e3
                 if len(proxy_t) > 0:
-                    ax.scatter(proxy_t, truth, color=c, s=8, alpha=0.2,
+                    # Align lengths (trans proxy may be 1 shorter due to diff)
+                    n_common = min(len(proxy_t), len(truth))
+                    pt, tt = proxy_t[:n_common], truth[:n_common]
+                    ax.scatter(pt, tt, color=c, s=8, alpha=0.2,
                                marker='s', rasterized=True, zorder=2)
-                    if np.std(truth) > 0:
-                        corr_t = np.corrcoef(proxy_t, truth)[0, 1]
+                    if np.std(tt) > 0:
+                        corr_t = np.corrcoef(pt, tt)[0, 1]
                         all_r2.append((f"{lbl} trans.", corr_t**2, c, 'italic'))
 
         # Clip axes to 2nd-98th percentile to remove outliers
@@ -1125,12 +1307,15 @@ def main():
 
     primary_figures = [
         plot_geometry_context,
+        plot_geometry_context_stacked,
         plot_simplification_cascade,
         plot_pressure_vs_radial_stress,
         plot_work_redistribution,
+        plot_work_redistribution_stacked,
         plot_work_decomposition,
+        plot_work_decomposition_stacked,
+        plot_work_density,
         plot_stress_loops,
-        plot_pressure_strain,
         plot_sensitivity,
     ]
 

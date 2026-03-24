@@ -212,6 +212,8 @@ def update_parameters_from_json(params, json_params):
              # Key in JSON but not in defaults. Add it.
              params[key] = value
 
+_json_initial_state = None  # Set by get_updated_parameters() if JSON has initial_state
+
 def get_updated_parameters():
     """
     Returns Regazzoni2020 parameters consistent with the configured BPM.
@@ -229,15 +231,22 @@ def get_updated_parameters():
         if p_path.exists():
             if comm.rank == 0:
                 logger.info(f"Loading circulation parameters from {p_path}")
-            
+
             with open(p_path) as f:
                 data = json.load(f)
-            
+
             # JSON file structure is {"parameters": {...}} or just {...}
             # We look for "parameters" key first
             json_params = data.get("parameters", data)
-            
+
             update_parameters_from_json(params, json_params)
+
+            # Store initial_state from JSON for 0D pre-run (if converged ICs available)
+            global _json_initial_state
+            _json_initial_state = data.get("initial_state", None)
+            if _json_initial_state and comm.rank == 0:
+                converged = data.get("initial_state_converged", False)
+                logger.info(f"  Loaded initial_state from JSON (converged={converged})")
 
     # Scale factor relative to reference RR=0.8s (75 BPM)
     factor = RR_INTERVAL / 0.8
@@ -311,7 +320,13 @@ init_state_circ = {
 }
 
 if comm.rank == 0:
-    history, circ_state = run_0D(init_state=None)
+    # Use converged ICs from JSON if available, otherwise model defaults
+    ic_0d = _json_initial_state
+    if ic_0d is not None:
+        logger.info(f"Using initial_state from JSON for 0D pre-run")
+    else:
+        logger.info(f"No initial_state in JSON, using model defaults for 0D pre-run")
+    history, circ_state = run_0D(init_state=ic_0d)
     np.save(outdir / "state.npy", circ_state, allow_pickle=True)
     np.save(outdir / "history.npy", history, allow_pickle=True)
 comm.Barrier()
@@ -704,74 +719,112 @@ problem.old_rv_volume = rv_volume.value.copy()
 # --- Multiscale Coupling Loop (Hybrid Logic) ---
 
 def p_BiV_func(V_LV, V_RV, t):
+    """
+    Coupling function: receives volumes (mL) and time from the 0D model,
+    drives the FEM to the corresponding state, returns pressures (mmHg).
+    """
     logger.info(f"Coupling Time {t:.4f}: Target V_LV={V_LV:.2f}, V_RV={V_RV:.2f}")
 
-    # Logic from V1: Get array value
-    value = get_activation(t)
-    old_Ta = problem.old_Ta
-    dTa = value - old_Ta # Vector subtraction
-
-    # Ratio Coupling: Scale 0D volume request by the mesh volume fraction
+    # --- Compute targets ---
+    # Convert 0D volumes (mL) to FEM volumes (m³) with ratio scaling
     new_value_LV = (V_LV * ratio_LV) * (1.0 / volume2ml)
     new_value_RV = (V_RV * ratio_RV) * (1.0 / volume2ml)
+    new_value_Ta = get_activation(t)
 
+    # --- Load previous converged state ---
     old_lv_volume = problem.old_lv_volume
     old_rv_volume = problem.old_rv_volume
+    old_Ta = problem.old_Ta
 
     dLV = new_value_LV - old_lv_volume
     dRV = new_value_RV - old_rv_volume
+    dTa = new_value_Ta - old_Ta
 
-    converged = False
-    num_failures = 0
-    num_steps = 1
     tol = 1e-12
 
-    old_lv_it = old_lv_volume.copy()
-    old_rv_it = old_rv_volume.copy()
-    old_Ta_it = Ta.value.x.array.copy()
-
-    # Hybrid check: abs for volumes, max(abs) for Ta array
+    # Skip FEM solve entirely if nothing changed (e.g. rest phase)
     if abs(dLV) > tol or abs(dRV) > tol or np.max(np.abs(dTa)) > tol:
 
-        while not converged and num_failures < 20:
-            for i in range(num_steps):
-                lv_volume.value = old_lv_volume + (i + 1) * (new_value_LV - old_lv_it) / num_steps
-                rv_volume.value = old_rv_volume + (i + 1) * (new_value_RV - old_rv_it) / num_steps
+        # Iteration tracking: these advance as sub-steps succeed,
+        # giving us a "checkpoint" to reset to on failure
+        old_lv_it = old_lv_volume.copy()
+        old_rv_it = old_rv_volume.copy()
+        old_Ta_it = old_Ta.copy()
 
-                # V1 Logic: Update the array
-                Ta.assign(old_Ta + (i + 1) * dTa / num_steps)
+        converged = False
+        num_failures = 0
+        num_steps = 1  # Start optimistic: try one full step
+        max_failures = 20
+
+        while not converged and num_failures < max_failures:
+
+            # Snapshot before this attempt so we can detect progress
+            snapshot_lv = old_lv_it.copy()
+
+            for i in range(num_steps):
+                frac = (i + 1) / num_steps
+                lv_volume.value = old_lv_it + frac * (new_value_LV - old_lv_it)
+                rv_volume.value = old_rv_it + frac * (new_value_RV - old_rv_it)
+                Ta.assign(old_Ta_it + frac * (new_value_Ta - old_Ta_it))
 
                 try:
                     problem.solve()
                 except RuntimeError as e:
-                    # V2 Logic: Robust logging and reset
                     print(f"Error during solve: {e}")
-                    lv_volume.value = old_lv_volume.copy()
-                    rv_volume.value = old_rv_volume.copy()
-                    Ta.assign(old_Ta)
+
+                    # Reset FEM to last known good state so Newton
+                    # starts from a converged configuration next attempt
+                    lv_volume.value = old_lv_it.copy()
+                    rv_volume.value = old_rv_it.copy()
+                    Ta.assign(old_Ta_it)
                     problem.reset()
+
                     num_failures += 1
-                    num_steps *= 2
                     converged = False
+                    break
                 else:
+                    # Sub-step succeeded: advance the checkpoint
                     converged = True
                     old_lv_it = lv_volume.value.copy()
                     old_rv_it = rv_volume.value.copy()
                     old_Ta_it = Ta.value.x.array.copy()
 
-            if not converged:
-                msg = f"Failed to converge. LV: {new_value_LV}, RV: {new_value_RV}, Ta max: {np.max(value)}"
-                logger.error(msg)
-                raise RuntimeError("Failed to converge on pressure calculation.")
+            # All sub-steps succeeded, we're done
+            if converged:
+                break
 
+            # Decide step size for next attempt
+            made_progress = not np.isclose(old_lv_it, snapshot_lv)
+            if made_progress:
+                # Some sub-steps worked before we failed.
+                # The remaining range is already smaller, just bisect it.
+                num_steps = 2
+            else:
+                # Failed on the very first sub-step, no progress at all.
+                # The step size itself is too large, must halve it.
+                num_steps *= 2
+
+        if not converged:
+            msg = (
+                f"Failed to converge after {num_failures} attempts. "
+                f"LV: {new_value_LV}, RV: {new_value_RV}, "
+                f"Ta remaining: {np.max(np.abs(new_value_Ta - old_Ta_it)):.4f}"
+            )
+            logger.error(msg)
+            raise RuntimeError(msg)
+
+    # --- Save state for next coupling call ---
     problem.old_Ta = Ta.value.x.array.copy()
     problem.old_lv_volume = lv_volume.value.copy()
     problem.old_rv_volume = rv_volume.value.copy()
 
+    # --- Extract pressures and return ---
+    # Lagrange multipliers come out in Pa, convert to mmHg for 0D model
     lv_p_kPa = problem.cavity_pressures[0].x.array[0] * 1e-3
     rv_p_kPa = problem.cavity_pressures[1].x.array[0] * 1e-3
 
     return circulation.units.kPa_to_mmHg(lv_p_kPa), circulation.units.kPa_to_mmHg(rv_p_kPa)
+
 
 # --- Checkpointing and Callback ---
 
@@ -858,8 +911,12 @@ else:
     logger.info(f"✓ PRODUCTION MODE: Running full beat ({RR_INTERVAL:.3f}s)")
 
 try:
-    circulation_model.solve(num_beats=num_beats, initial_state=circ_state, dt=dt, T=end_time)
+    coupled_history = circulation_model.solve(num_beats=num_beats, initial_state=circ_state, dt=dt, T=end_time)
     logger.info("Simulation complete.")
+    # Overwrite pre-run history with coupled history so postprocessing uses correct 0D data
+    if comm.rank == 0:
+        np.save(outdir / "history.npy", coupled_history, allow_pickle=True)
+        logger.info(f"Saved coupled circulation history: {len(coupled_history['time'])} points")
 finally:
     # --- Save Checkpoint Data (ALWAYS, even if simulation crashes) ---
     if comm.rank == 0:
