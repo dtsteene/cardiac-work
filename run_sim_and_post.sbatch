@@ -3,24 +3,13 @@
 # --- Slurm Job Configuration ---
 #SBATCH --job-name=cardiac_sim
 #SBATCH --partition=mi50q
+#SBATCH --exclude=n052
 #SBATCH --nodes=1
 #SBATCH --ntasks=8
 #SBATCH --cpus-per-task=1
-#SBATCH --time=2:00:00
-#SBATCH --exclude=n052
-
-# --- NEW: Temporary Log Handling ---
-# This creates the files, but we will merge and delete them inside the script
-#SBATCH --output=init_slurm_%j.out
-#SBATCH --error=init_slurm_%j.err
-
-# --- Usage Examples ---
-# 1. Default (UKB, 1 Beat):            sbatch run_sim.sbatch
-# 2. Multi-beat Run:                   sbatch --export=BEATS=10 run_sim.sbatch
-# 3. PAH Mesh (Auto-loads JSON):       sbatch --export=MESH=PAH run_sim.sbatch
-# 4. PAH Mesh (Force Default):         sbatch --export=MESH=PAH,CIRCULATION_PARAMS="DEFAULT" run_sim.sbatch
-# 5. Custom Mesh:                      sbatch --export=MESH="./my_mesh.xdmf" run_sim.sbatch
-# 6. Pre-tagged Geometry (skip gen):   sbatch --export=GEOMETRY_DIR="/home/dtsteene/D1/cardiac-work/data/geometries/ukb_tagged" run_sim.sbatch
+#SBATCH --time=8:00:00
+#SBATCH --output=slurm-%j.out
+#SBATCH --error=slurm-%j.err
 
 # --- 1. Variable Defaults ---
 MESH=${MESH:-"UKB"}
@@ -35,13 +24,10 @@ ALPHA_BASE=${ALPHA_BASE:-""}
 INCOMPRESSIBLE=${INCOMPRESSIBLE:-0}
 ONE_SIDED_ROBIN=${ONE_SIDED_ROBIN:-0}
 COMMENT=${COMMENT:-"No description provided"}
-# Path to a pre-built, manually tagged geometry directory (skips generation entirely).
-# Prep locally with: python geometry_generator.py --manual-refinement --single ukb -o ./tagged_geos
-# Then rsync to the server and point GEOMETRY_DIR at it.
 GEOMETRY_DIR=${GEOMETRY_DIR:-""}
+RESTART_FROM=${RESTART_FROM:-""}
 
 # --- 2. Paths & Environment ---
-SUBMIT_DIR=$SLURM_SUBMIT_DIR
 SIM_DIR="/home/dtsteene/D1/cardiac-work"
 DATA_DIR="${SIM_DIR}/data"
 
@@ -56,27 +42,20 @@ elif [ "$MESH" == "PAH" ]; then
     ACTUAL_MESH_PATH="${DATA_DIR}/pah.xdmf"
     GEO_TAG="PAH"
     PAH_PARAMS_FILE="${DATA_DIR}/ph_circulation_params.json"
-    
+
     echo "Geometry: PAH Preset (${ACTUAL_MESH_PATH})"
 
-    # --- PAH Special Logic ---
     if [ "$CIRCULATION_PARAMS" == "DEFAULT" ]; then
         echo "  ! Override: User forced DEFAULT circulation params (Ignoring PAH JSON)."
-        CIRCULATION_PARAMS="" 
-        
+        CIRCULATION_PARAMS=""
     elif [ -n "$CIRCULATION_PARAMS" ]; then
         echo "  ! Override: User provided custom circulation params: $CIRCULATION_PARAMS"
-        
     else
         if [ -f "$PAH_PARAMS_FILE" ]; then
             CIRCULATION_PARAMS="$PAH_PARAMS_FILE"
-            echo "  ✓ Auto-loaded PAH Circulation Params: $PAH_PARAMS_FILE"
+            echo "  Auto-loaded PAH Circulation Params: $PAH_PARAMS_FILE"
         else
-            echo ""
-            echo "❌ CRITICAL ERROR: Circulation Parameters Missing"
-            echo "   Missing: $PAH_PARAMS_FILE"
-            echo "   To Fix: Ensure file exists OR run with CIRCULATION_PARAMS='DEFAULT'"
-            echo ""
+            echo "CRITICAL ERROR: Missing $PAH_PARAMS_FILE"
             exit 1
         fi
     fi
@@ -88,24 +67,17 @@ elif [ "$MESH" == "HEALTHY" ]; then
 
     echo "Geometry: Healthy Preset (${ACTUAL_MESH_PATH})"
 
-    # --- HEALTHY Special Logic (mirrors PAH) ---
     if [ "$CIRCULATION_PARAMS" == "DEFAULT" ]; then
         echo "  ! Override: User forced DEFAULT circulation params (Ignoring Healthy JSON)."
         CIRCULATION_PARAMS=""
-
     elif [ -n "$CIRCULATION_PARAMS" ]; then
         echo "  ! Override: User provided custom circulation params: $CIRCULATION_PARAMS"
-
     else
         if [ -f "$HEALTHY_PARAMS_FILE" ]; then
             CIRCULATION_PARAMS="$HEALTHY_PARAMS_FILE"
-            echo "  ✓ Auto-loaded Healthy Circulation Params: $HEALTHY_PARAMS_FILE"
+            echo "  Auto-loaded Healthy Circulation Params: $HEALTHY_PARAMS_FILE"
         else
-            echo ""
-            echo "❌ CRITICAL ERROR: Circulation Parameters Missing"
-            echo "   Missing: $HEALTHY_PARAMS_FILE"
-            echo "   To Fix: Ensure file exists OR run with CIRCULATION_PARAMS='DEFAULT'"
-            echo ""
+            echo "CRITICAL ERROR: Missing $HEALTHY_PARAMS_FILE"
             exit 1
         fi
     fi
@@ -127,7 +99,6 @@ fi
 # --- 4. Prepare Arguments for Python ---
 ARGS_STR=""
 
-# Mesh selection
 if [ -n "$ACTUAL_MESH_PATH" ]; then
     ARGS_STR="$ARGS_STR --mesh $ACTUAL_MESH_PATH"
 else
@@ -137,36 +108,16 @@ fi
 ARGS_STR="$ARGS_STR --beats $BEATS"
 ARGS_STR="$ARGS_STR --metrics_space $METRICS_SPACE"
 
-if [ -n "$CIRCULATION_PARAMS" ]; then
-    ARGS_STR="$ARGS_STR --circulation_params $CIRCULATION_PARAMS"
-fi
+[ -n "$CIRCULATION_PARAMS" ] && ARGS_STR="$ARGS_STR --circulation_params $CIRCULATION_PARAMS"
+[ "$CI" = "1" ] && ARGS_STR="$ARGS_STR --ci"
+[ -n "$ALPHA_EPI" ] && ARGS_STR="$ARGS_STR --alpha_epi $ALPHA_EPI"
+[ -n "$ALPHA_BASE" ] && ARGS_STR="$ARGS_STR --alpha_base $ALPHA_BASE"
+[ "$INCOMPRESSIBLE" = "1" ] && ARGS_STR="$ARGS_STR --incompressible"
+[ "$ONE_SIDED_ROBIN" = "1" ] && ARGS_STR="$ARGS_STR --one-sided-robin"
+[ -n "$GEOMETRY_DIR" ] && ARGS_STR="$ARGS_STR --geometry-dir $GEOMETRY_DIR"
+[ -n "$RESTART_FROM" ] && ARGS_STR="$ARGS_STR --restart-from $RESTART_FROM"
 
-if [ "$CI" = "1" ]; then
-    ARGS_STR="$ARGS_STR --ci"
-fi
-
-if [ -n "$ALPHA_EPI" ]; then
-    ARGS_STR="$ARGS_STR --alpha_epi $ALPHA_EPI"
-fi
-
-if [ -n "$ALPHA_BASE" ]; then
-    ARGS_STR="$ARGS_STR --alpha_base $ALPHA_BASE"
-fi
-
-if [ "$INCOMPRESSIBLE" = "1" ]; then
-    ARGS_STR="$ARGS_STR --incompressible"
-fi
-
-if [ "$ONE_SIDED_ROBIN" = "1" ]; then
-    ARGS_STR="$ARGS_STR --one-sided-robin"
-fi
-
-if [ -n "$GEOMETRY_DIR" ]; then
-    ARGS_STR="$ARGS_STR --geometry-dir $GEOMETRY_DIR"
-    echo "Geometry: Pre-built (skipping generation) → $GEOMETRY_DIR"
-fi
-
-# --- 5. Setup Logging & Directories ---
+# --- 5. Setup Directories & Logging ---
 echo "--- Job Started: $SLURM_JOB_ID ---"
 date
 
@@ -179,26 +130,13 @@ mkdir -p ${RESULTS_BASE} ${LOG_DIR} ${RESULTS_DIR}
 
 echo "$COMMENT" > "${RESULTS_DIR}/run_description.txt"
 
-# Define the Final Log Files
+# Log file paths (for copying into results dir at end)
 LOG_FILE="${LOG_DIR}/${GEO_TAG}_sim_${SLURM_JOB_ID}.out"
 ERR_FILE="${LOG_DIR}/${GEO_TAG}_sim_${SLURM_JOB_ID}.err"
+# NOTE: Do NOT use exec redirects here — they cause MPI ranks to block on
+# shared file descriptor writes. Slurm --output/--error handles this natively.
 
-# --- LOGGING MAGIC STARTS HERE ---
-# 1. Flush current buffer so everything printed so far is saved to init_slurm...
-sync
-
-# 2. Merge the temporary start-up logs into the final logs
-cat "init_slurm_${SLURM_JOB_ID}.out" >> "${LOG_FILE}" 2>/dev/null
-cat "init_slurm_${SLURM_JOB_ID}.err" >> "${ERR_FILE}" 2>/dev/null
-
-# 3. Redirect all FUTURE output to the final logs
-exec 1>>"${LOG_FILE}"
-exec 2>>"${ERR_FILE}"
-
-# 4. Clean up the temporary files from the submit dir
-rm -f "init_slurm_${SLURM_JOB_ID}.out" "init_slurm_${SLURM_JOB_ID}.err"
-# --- LOGGING MAGIC ENDS HERE ---
-
+# Work directory on local scratch
 WORK_DIR="/work/$USER/cardiac_${GEO_TAG}_${SLURM_JOB_ID}"
 mkdir -p ${WORK_DIR}
 export XDG_CACHE_HOME="${WORK_DIR}/.cache"
@@ -214,14 +152,22 @@ export MPICH_HYDRA_LAUNCHER=fork
 # --- 7. Execution ---
 cd ${WORK_DIR}
 echo "Running Simulation..."
-echo "  Geometry: $GEO_TAG"
-echo "  Beats:    $BEATS"
-echo "  Params:   ${CIRCULATION_PARAMS:-'Default (Internal)'}"
-echo "  Save Dir: $RESULTS_DIR"
+echo "  Geometry:  $GEO_TAG"
+echo "  Beats:     $BEATS"
+echo "  Params:    ${CIRCULATION_PARAMS:-'Default (Internal)'}"
+echo "  Restart:   ${RESTART_FROM:-'None (fresh run)'}"
+echo "  Save Dir:  $RESULTS_DIR"
 
 time $CONDA_PREFIX/bin/mpirun -n ${SLURM_NTASKS} -launcher fork $CONDA_PREFIX/bin/python ${SIM_DIR}/complete_cycle.py $BPM $ARGS_STR
+SIM_EXIT=$?
 
-echo "✓ Simulation completed"
+if [ $SIM_EXIT -ne 0 ]; then
+    echo "SIMULATION FAILED (exit code $SIM_EXIT) — skipping post-processing"
+    rm -rf ${WORK_DIR}
+    exit $SIM_EXIT
+fi
+
+echo "Simulation completed"
 
 # --- 8. Data Transfer ---
 echo "Transferring data..."
@@ -229,7 +175,7 @@ RESULTS_WORK=$(find . -maxdepth 1 -type d -name "results_*" | grep -v "geometry"
 
 if [ -d "$RESULTS_WORK" ]; then
     cp -r "$RESULTS_WORK"/* ${RESULTS_DIR}/ 2>/dev/null || true
-    echo "✓ Data saved to ${RESULTS_DIR}/"
+    echo "Data saved to ${RESULTS_DIR}/"
 else
     echo "CRITICAL WARNING: No results found in work folder."
 fi
@@ -239,20 +185,23 @@ echo "Running Offline Metrics Computation..."
 cd ${RESULTS_DIR}
 
 if [ -f "simulation_params.json" ] && [ -d "solver/checkpoint.bp" ]; then
-    # Compute metrics from checkpoint (replays displacement + Ta)
     $CONDA_PREFIX/bin/mpirun -n ${SLURM_NTASKS} -launcher fork $CONDA_PREFIX/bin/python ${SIM_DIR}/postprocess_metrics.py .
-    echo "✓ Metrics computed"
+    echo "Metrics computed"
 
-    # Run plotting/analysis pipeline
     python3 ${SIM_DIR}/run_postprocessing.py .
-    echo "✓ Analysis complete"
+    echo "Analysis complete"
 else
     echo "Skipping post-processing (missing checkpoint data)."
 fi
 
-# Copy logs inside the results folder for easy access
-cp ${LOG_FILE} ${RESULTS_DIR}/simulation.log 2>/dev/null
-cp ${ERR_FILE} ${RESULTS_DIR}/simulation.err 2>/dev/null
+# Copy slurm logs inside the results folder for easy access
+SLURM_OUT="${SIM_DIR}/slurm-${SLURM_JOB_ID}.out"
+SLURM_ERR="${SIM_DIR}/slurm-${SLURM_JOB_ID}.err"
+cp ${SLURM_OUT} ${RESULTS_DIR}/simulation.log 2>/dev/null
+cp ${SLURM_ERR} ${RESULTS_DIR}/simulation.err 2>/dev/null
+# Also copy to log dir
+cp ${SLURM_OUT} ${LOG_FILE} 2>/dev/null
+cp ${SLURM_ERR} ${ERR_FILE} 2>/dev/null
 
 rm -rf ${WORK_DIR}
 echo "--- Job Finished ---"

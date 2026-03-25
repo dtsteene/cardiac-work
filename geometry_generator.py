@@ -91,6 +91,161 @@ def modify_wall_thickness(points, displacement_mm, logger=None):
     return pts
 
 
+def _get_atlas_points(pca_scores=None, logger=None):
+    """Get UKB atlas point cloud, optionally deformed by PCA scores.
+
+    Parameters
+    ----------
+    pca_scores : np.ndarray, optional
+        Z-score per PCA mode. If None, returns the mean shape.
+
+    Returns
+    -------
+    np.ndarray, shape (N, 3)
+        Full UKB point cloud (ED frame).
+    """
+    import ukb.atlas
+    import h5py
+
+    atlas_path = ukb.atlas.download_atlas(Path.home() / ".ukb", all=False)
+    with h5py.File(atlas_path, "r") as hdf:
+        mu = np.transpose(hdf["MU"])
+        S = mu.copy()
+        if pca_scores is not None:
+            for i, z in enumerate(pca_scores):
+                if z != 0:
+                    eigenvalue = hdf["LATENT"][0, i]
+                    eigenvector = hdf["COEFF"][i, :]
+                    S = S + z * np.sqrt(eigenvalue) * eigenvector
+    N = S.shape[1] // 2
+    pts = np.reshape(S[0, :N], (-1, 3))
+    if logger:
+        from scipy.spatial import KDTree
+        epi = pts[_EPI_RANGE[0]:_EPI_RANGE[1]]
+        tree = KDTree(epi)
+        lv = pts[_LV_ENDO[0]:_LV_ENDO[1]]
+        rv = np.vstack([pts[s:e] for s, e in _RV_ENDO_RANGES])
+        logger.info(f"  LV thickness: {np.mean(tree.query(lv)[0]):.2f} mm")
+        logger.info(f"  RV sept thickness: {np.mean(tree.query(rv[:665])[0]):.2f} mm")
+        logger.info(f"  RV FW thickness: {np.mean(tree.query(rv[665:])[0]):.2f} mm")
+    return pts
+
+
+# ── Default UKB Clipping Plane ───────────────────────────────
+# Values from ukb.clip.main defaults — used for warp base constraint
+_CLIP_ORIGIN = np.array([-13.612554383622273, 18.55767189380559, 15.135103714006394])
+_CLIP_NORMAL = np.array([-0.7160843664428893, 0.544394641424108, 0.4368725838557541])
+
+
+def _generate_baseline_mesh(baseline_dir, char_length, logger):
+    """Generate a baseline (mean shape) clipped mesh for warping.
+
+    If the mesh already exists in *baseline_dir*, it is reused.
+    Returns the path to the .msh file.
+    """
+    import ukb.surface as ukb_surf
+    import ukb.clip
+
+    msh_file = baseline_dir / "ED_clipped.msh"
+    if msh_file.exists():
+        logger.info(f"Reusing existing baseline mesh: {msh_file}")
+        return msh_file
+
+    baseline_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = Path.home() / ".ukb"
+
+    logger.info("Generating baseline (mean) surfaces...")
+    ukb_surf.main(folder=baseline_dir, case="ED", mode=-1, std=0.0, cache_dir=cache_dir)
+
+    logger.info("Clipping baseline surfaces...")
+    ukb.clip.main(folder=baseline_dir, case="ED", smooth=True)
+
+    logger.info("Meshing baseline volume (GMSH)...")
+    _create_clipped_mesh_robust(
+        folder=baseline_dir, case="ED",
+        char_length_max=char_length, char_length_min=char_length,
+    )
+
+    logger.info(f"Baseline mesh ready: {msh_file}")
+    return msh_file
+
+
+def _generate_ukb_with_warp(geodir, char_length, target_points, logger,
+                            baseline_dir=None, info=None):
+    """Generate UKB geometry by warping a baseline mesh to target points.
+
+    Instead of re-meshing from scratch, this warps the mean-shape baseline mesh
+    using PDE-based deformation (fenicsx-warp).  The mesh topology and facet tags
+    are preserved exactly, ensuring consistent region assignments across variants.
+
+    Parameters
+    ----------
+    geodir : Path
+        Output directory for warped geometry files.
+    char_length : float
+        Characteristic mesh length (only used if baseline needs generation).
+    target_points : np.ndarray, shape (N, 3)
+        Target UKB point cloud.
+    logger : logging.Logger
+    baseline_dir : Path, optional
+        Directory containing the baseline mesh.  If None, uses
+        ``geodir.parent / "warp_baseline"``.
+    info : dict, optional
+        Additional info to store in the Geometry object.
+    """
+    from warp import warp_mesh
+
+    # 1. Ensure baseline mesh exists
+    if baseline_dir is None:
+        baseline_dir = geodir.parent / "warp_baseline"
+    msh_file = _generate_baseline_mesh(baseline_dir, char_length, logger)
+
+    # 2. Load baseline mesh into DOLFINx (facet tags preserved)
+    logger.info(f"Loading baseline mesh from {msh_file}...")
+    geometry = cardiac_geometries.utils.gmsh2dolfin(
+        comm=MPI.COMM_SELF, msh_file=msh_file,
+    )
+
+    # 3. Get reference (mean) point cloud
+    logger.info("Computing reference (mean) point cloud...")
+    points_mean = _get_atlas_points(pca_scores=None)
+
+    # 4. Log target thickness
+    logger.info("Target shape:")
+    from scipy.spatial import KDTree
+    epi_t = target_points[_EPI_RANGE[0]:_EPI_RANGE[1]]
+    tree_t = KDTree(epi_t)
+    lv_t = target_points[_LV_ENDO[0]:_LV_ENDO[1]]
+    rv_t = np.vstack([target_points[s:e] for s, e in _RV_ENDO_RANGES])
+    logger.info(f"  LV thickness: {np.mean(tree_t.query(lv_t)[0]):.2f} mm")
+    logger.info(f"  RV sept thickness: {np.mean(tree_t.query(rv_t[:665])[0]):.2f} mm")
+    logger.info(f"  RV FW thickness: {np.mean(tree_t.query(rv_t[665:])[0]):.2f} mm")
+
+    # 5. Warp mesh in-place
+    logger.info("Warping mesh (hyperelastic solver, RBF interpolation)...")
+    warp_mesh(
+        domain=geometry.mesh,
+        points_reference=points_mean,
+        points_target=target_points,
+        interpolation_method="rbf",
+        solver_method="hyperelastic",
+        clip_origin=tuple(_CLIP_ORIGIN),
+        clip_normal=tuple(_CLIP_NORMAL),
+    )
+    logger.info("Warp complete.")
+
+    # 6. Build Geometry (mesh warped in-place, facet tags preserved)
+    geodir.mkdir(parents=True, exist_ok=True)
+    geo = cardiac_geometries.geometry.Geometry(
+        mesh=geometry.mesh,
+        markers=geometry.markers,
+        ffun=geometry.ffun,
+        f0=None, s0=None, n0=None,
+        info=info or {"mesh_type": "ukb_warp"},
+    )
+    return geo
+
+
 def compute_pca_thickness_direction(atlas_path, strategy="global_no_size", n_modes=50, logger=None):
     """
     Find the optimal direction in PCA space for wall thickness control.
@@ -275,43 +430,20 @@ def _create_clipped_mesh_robust(folder, case, char_length_max, char_length_min):
 
 def _generate_ukb_with_pca(geodir, char_length, pca_scores, logger):
     """
-    Generate UKB geometry using arbitrary PCA score vector.
+    Generate UKB geometry using arbitrary PCA score vector (re-mesh approach).
 
     Parameters
     ----------
     pca_scores : np.ndarray
         Z-score for each PCA mode. Shape = mu + sum(z_i * sqrt(lambda_i) * v_i)
     """
-    import ukb.atlas
     import ukb.surface as ukb_surf
     import ukb.clip
-    import ukb.mesh as ukb_mesh
-    import h5py
 
     case = "ED"
 
     logger.info("Step 1/6: Generating point cloud from PCA scores...")
-    atlas_path = ukb.atlas.download_atlas(Path.home() / ".ukb", all=False)
-    with h5py.File(atlas_path, "r") as hdf:
-        mu = np.transpose(hdf["MU"])
-        S = mu.copy()
-        for i, z in enumerate(pca_scores):
-            if z != 0:
-                eigenvalue = hdf["LATENT"][0, i]
-                eigenvector = hdf["COEFF"][i, :]
-                S = S + z * np.sqrt(eigenvalue) * eigenvector
-    N = S.shape[1] // 2
-    ed_full = np.reshape(S[0, :N], (-1, 3))
-
-    # Measure resulting thickness
-    from scipy.spatial import KDTree
-    epi = ed_full[_EPI_RANGE[0]:_EPI_RANGE[1]]
-    tree = KDTree(epi)
-    lv = ed_full[_LV_ENDO[0]:_LV_ENDO[1]]
-    rv = np.vstack([ed_full[s:e] for s, e in _RV_ENDO_RANGES])
-    logger.info(f"  LV thickness: {np.mean(tree.query(lv)[0]):.2f} mm")
-    logger.info(f"  RV sept thickness: {np.mean(tree.query(rv[:665])[0]):.2f} mm")
-    logger.info(f"  RV FW thickness: {np.mean(tree.query(rv[665:])[0]):.2f} mm")
+    ed_full = _get_atlas_points(pca_scores=pca_scores, logger=logger)
 
     # Step 3: Write STL surfaces
     logger.info("Step 3/6: Writing STL surfaces...")
@@ -366,23 +498,14 @@ def _generate_ukb_with_thickness(geodir, char_length, wall_displacement_mm, logg
 
     Returns a Geometry object identical to what mesh.ukb() would return.
     """
-    import ukb.atlas
     import ukb.surface as ukb_surf
     import ukb.clip
-    import ukb.mesh as ukb_mesh
 
     case = "ED"
 
-    # Step 1: Generate point cloud from atlas
+    # Step 1: Generate mean point cloud from atlas
     logger.info("Step 1/6: Generating point cloud from UKB atlas (mean shape)...")
-    atlas_path = ukb.atlas.download_atlas(Path.home() / ".ukb", all=False)
-    # We need the FULL point cloud (before unwanted node removal) for surface
-    # generation, since connectivity.txt references original indices.
-    import h5py
-    with h5py.File(atlas_path, "r") as hdf:
-        S = ukb.atlas.compute_S(hdf, mode=-1)
-    N = S.shape[1] // 2
-    ed_full = np.reshape(S[0, :N], (-1, 3))  # full point cloud, original indices
+    ed_full = _get_atlas_points(pca_scores=None)
 
     # Step 2: Modify wall thickness
     logger.info("Step 2/6: Modifying wall thickness...")
@@ -444,6 +567,9 @@ def generate_and_load(comm, outdir, args, logger, manual_refinement=False, geodi
     wall_displacement_mm = getattr(args, 'wall_displacement', 0.0)
     pca_strategy = getattr(args, 'pca_strategy', None)
     pca_magnitude = getattr(args, 'pca_magnitude', 0.0)
+    use_warp = getattr(args, 'warp', False)
+    warp_baseline = getattr(args, 'warp_baseline', None)
+    baseline_dir = Path(warp_baseline) if warp_baseline else None
 
     # ========================================================================
     # PHASE 1: GENERATION (Rank 0 Only)
@@ -492,16 +618,43 @@ def generate_and_load(comm, outdir, args, logger, manual_refinement=False, geodi
             atlas_path = Path.home() / ".ukb" / "UKBRVLV.h5"
             z_dir = compute_pca_thickness_direction(atlas_path, strategy=pca_strategy, logger=logger)
             pca_scores = z_dir * pca_magnitude
-            geo = _generate_ukb_with_pca(geodir, char_length, pca_scores, logger)
+
+            if use_warp:
+                logger.info("Using WARP method (topology-preserving)")
+                target_points = _get_atlas_points(pca_scores=pca_scores, logger=logger)
+                geo = _generate_ukb_with_warp(
+                    geodir, char_length, target_points, logger,
+                    baseline_dir=baseline_dir,
+                    info={"mesh_type": "ukb_pca_warp",
+                          "pca_strategy": pca_strategy,
+                          "pca_magnitude": pca_magnitude,
+                          "pca_scores": pca_scores.tolist()},
+                )
+            else:
+                logger.info("Using REMESH method")
+                geo = _generate_ukb_with_pca(geodir, char_length, pca_scores, logger)
             geo = geo.rotate(target_normal=[1.0, 0.0, 0.0], base_marker="BASE")
 
         elif wall_displacement_mm != 0.0:
             # --- UKB WITH WALL THICKNESS MODIFICATION ---
             logger.info(f"Generating UKB mesh with wall thickness modification "
                         f"(displacement = {wall_displacement_mm:+.1f} mm)...")
-            geo = _generate_ukb_with_thickness(
-                geodir, char_length, wall_displacement_mm, logger
-            )
+
+            if use_warp:
+                logger.info("Using WARP method (topology-preserving)")
+                mean_points = _get_atlas_points(pca_scores=None)
+                target_points = modify_wall_thickness(mean_points, wall_displacement_mm, logger)
+                geo = _generate_ukb_with_warp(
+                    geodir, char_length, target_points, logger,
+                    baseline_dir=baseline_dir,
+                    info={"mesh_type": "ukb_warp",
+                          "wall_displacement_mm": wall_displacement_mm},
+                )
+            else:
+                logger.info("Using REMESH method")
+                geo = _generate_ukb_with_thickness(
+                    geodir, char_length, wall_displacement_mm, logger
+                )
             geo = geo.rotate(target_normal=[1.0, 0.0, 0.0], base_marker="BASE")
 
         else:
@@ -649,33 +802,49 @@ def generate_and_load(comm, outdir, args, logger, manual_refinement=False, geodi
     geo = cardiac_geometries.geometry.Geometry.from_folder(comm=comm, folder=geodir)
 
     # --- SCALING ---
-    # Apply scaling based on source assumption (Custom=cm, UKB=mm)
-    if args.mesh:
-        scale = 1e-2 # cm -> m
+    # Apply scaling based on source assumption (Custom=cm, UKB=mm).
+    # SKIP scaling if geometry was loaded from a pre-built directory that is
+    # already in meters (extent ~0.05-0.15 m). This prevents the double-scaling
+    # bug where re-running with GEOMETRY_DIR applies 1e-3 again and corrupts
+    # the geometry.bp on re-save.
+    coords = geo.mesh.geometry.x
+    extent_max = float((coords.max(axis=0) - coords.min(axis=0)).max())
+    if extent_max < 1.0 and extent_max > 0.01:
+        # Already in meters — skip scaling
+        logger.info(f"Geometry extent={extent_max:.4f} m — already in meters, skipping scaling")
+        scale = 1.0
+    elif args.mesh:
+        scale = 1e-2  # cm -> m
     else:
-        scale = 1e-3 # mm -> m
+        scale = 1e-3  # mm -> m
 
-    geo.mesh.geometry.x[:] *= scale
+    if scale != 1.0:
+        geo.mesh.geometry.x[:] *= scale
 
     # Re-save geometry in meters so postprocessing loads the exact same mesh state.
     # This ensures adios4dolfinx DOF ordering matches between simulation and replay.
-    comm.barrier()
-    if comm.rank == 0:
-        if (geodir / "geometry.bp").exists():
-            shutil.rmtree(geodir / "geometry.bp")
-    comm.barrier()
-    cardiac_geometries.geometry.save_geometry(
-        path=geodir / "geometry.bp",
-        mesh=geo.mesh,
-        ffun=geo.ffun,
-        markers=geo.markers,
-        info=geo.info,
-        f0=geo.f0,
-        s0=geo.s0,
-        n0=geo.n0,
-        additional_data=geo.additional_data,
-    )
-    logger.info("Re-saved geometry in meters for offline postprocessing")
+    # SKIP re-save if no scaling was applied (geometry already in meters) — avoids
+    # deleting geometry.bp while other MPI ranks are still reading it.
+    if scale != 1.0:
+        comm.barrier()
+        if comm.rank == 0:
+            if (geodir / "geometry.bp").exists():
+                shutil.rmtree(geodir / "geometry.bp")
+        comm.barrier()
+        cardiac_geometries.geometry.save_geometry(
+            path=geodir / "geometry.bp",
+            mesh=geo.mesh,
+            ffun=geo.ffun,
+            markers=geo.markers,
+            info=geo.info,
+            f0=geo.f0,
+            s0=geo.s0,
+            n0=geo.n0,
+            additional_data=geo.additional_data,
+        )
+        logger.info("Re-saved geometry in meters for offline postprocessing")
+    else:
+        logger.info("Geometry already in meters — skipping re-save")
 
     geo._geo_scale = 1.0  # Already in meters
 
@@ -749,6 +918,22 @@ if __name__ == "__main__":
               "Positive = thicker, negative = thinner. "
               "E.g. --pca-magnitude 3.0 for +3σ thickening.")
     )
+    parser.add_argument(
+        "--warp",
+        action="store_true",
+        default=False,
+        help=("Use mesh warping (fenicsx-warp) instead of re-meshing for "
+              "thickness/PCA variants. Preserves baseline mesh topology and "
+              "facet tags across variants for consistent comparisons.")
+    )
+    parser.add_argument(
+        "--warp-baseline",
+        type=str,
+        default=None,
+        help=("Path to pre-existing baseline mesh directory for warping "
+              "(must contain ED_clipped.msh). If not provided, baseline is "
+              "auto-generated alongside the output directory.")
+    )
 
     cli_args = parser.parse_args()
     
@@ -802,6 +987,8 @@ if __name__ == "__main__":
             wall_displacement=cli_args.wall_displacement,
             pca_strategy=cli_args.pca_strategy,
             pca_magnitude=cli_args.pca_magnitude,
+            warp=cli_args.warp,
+            warp_baseline=cli_args.warp_baseline,
         )
         
         # Log info
