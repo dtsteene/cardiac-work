@@ -91,6 +91,87 @@ def modify_wall_thickness(points, displacement_mm, logger=None):
     return pts
 
 
+def modify_wall_thickness_regional(points, displacement_mm, region="all",
+                                    max_fraction=0.90, logger=None):
+    """
+    Modify wall thickness for a specific region only.
+
+    Parameters
+    ----------
+    points : np.ndarray, shape (n_points, 3)
+        Full UKB point cloud.
+    displacement_mm : float
+        How far to move endocardial points (mm). Negative = thickening.
+    region : str
+        Which region to thicken:
+        - "all": all endocardial surfaces (same as modify_wall_thickness)
+        - "rv_fw": RV freewall only (indices 2165-3224, the non-septal RV endo)
+        - "rv": all RV endo (septal + freewall, indices 1500-3224)
+        - "lv": LV endo only (indices 0-1500)
+    max_fraction : float
+        Maximum displacement as fraction of local wall thickness (default 0.90).
+        Higher values allow more aggressive thickening. Safe for warp-based
+        meshes where the PDE solver maintains element quality.
+    logger : logging.Logger, optional
+
+    Returns
+    -------
+    np.ndarray
+        Modified point cloud.
+    """
+    if region == "all":
+        return modify_wall_thickness(points, displacement_mm, logger)
+
+    from scipy.spatial import KDTree
+
+    if displacement_mm == 0.0:
+        return points.copy()
+
+    pts = points.copy()
+    epi = pts[_EPI_RANGE[0]:_EPI_RANGE[1]]
+    epi_tree = KDTree(epi)
+
+    def _displace(sl, region_name):
+        endo = pts[sl]
+        k = min(5, len(epi))
+        _, nearest_idxs = epi_tree.query(endo, k=k)
+        if k == 1:
+            nearest_idxs = nearest_idxs[:, np.newaxis]
+        neighbors = epi[nearest_idxs]
+        raw_dir = neighbors - endo[:, np.newaxis, :]
+        direction = raw_dir.mean(axis=1)
+        norms = np.linalg.norm(direction, axis=1, keepdims=True)
+        norms = np.maximum(norms, 1e-10)
+        thick = np.linalg.norm(epi[nearest_idxs[:, 0]] - endo, axis=1)
+        max_abs = max_fraction * thick
+        clamped = np.clip(displacement_mm, -max_abs, max_abs)
+        pts[sl] = endo + clamped[:, np.newaxis] * (direction / norms)
+        if logger:
+            thick_after = np.mean(np.linalg.norm(epi[nearest_idxs[:, 0]] - pts[sl], axis=1))
+            actual_disp = np.mean(np.abs(clamped))
+            logger.info(f"  {region_name}: {np.mean(thick):.2f} → {thick_after:.2f} mm "
+                        f"(mean |disp| = {actual_disp:.2f} mm, "
+                        f"clamp={max_fraction*100:.0f}%)")
+
+    if logger:
+        logger.info(f"Regional thickness modification: region={region}, "
+                    f"displacement={displacement_mm:+.1f} mm")
+
+    region_map = {
+        "rv_fw": [(2165, 3224, "RV freewall endo")],
+        "rv": [(1500, 2165, "RV septal endo"), (2165, 3224, "RV freewall endo")],
+        "lv": [(0, 1500, "LV endo")],
+    }
+
+    if region not in region_map:
+        raise ValueError(f"Unknown region '{region}'. Choose from: all, rv_fw, rv, lv")
+
+    for start, end, name in region_map[region]:
+        _displace(slice(start, end), name)
+
+    return pts
+
+
 def _get_atlas_points(pca_scores=None, logger=None):
     """Get UKB atlas point cloud, optionally deformed by PCA scores.
 
@@ -222,7 +303,10 @@ def _generate_ukb_with_warp(geodir, char_length, target_points, logger,
     logger.info(f"  RV FW thickness: {np.mean(tree_t.query(rv_t[665:])[0]):.2f} mm")
 
     # 5. Warp mesh in-place
-    logger.info("Warping mesh (hyperelastic solver, RBF interpolation)...")
+    # Auto-detect required incremental steps from max displacement magnitude.
+    max_disp = float(np.max(np.linalg.norm(target_points - points_mean, axis=1)))
+    n_steps = max(1, int(np.ceil(max_disp / 2.0)))  # 1 step per 2mm of displacement
+    logger.info(f"Warping mesh (hyperelastic, RBF, max_disp={max_disp:.1f}mm, n_steps={n_steps})...")
     warp_mesh(
         domain=geometry.mesh,
         points_reference=points_mean,
@@ -231,6 +315,7 @@ def _generate_ukb_with_warp(geodir, char_length, target_points, logger,
         solver_method="hyperelastic",
         clip_origin=tuple(_CLIP_ORIGIN),
         clip_normal=tuple(_CLIP_NORMAL),
+        n_steps=n_steps,
     )
     logger.info("Warp complete.")
 

@@ -58,7 +58,35 @@ parser.add_argument('--geometry-dir', type=str, default=None,
                     help='Path to a pre-built geometry directory (containing geometry.bp). '
                          'Skips all geometry generation and loads directly from this path. '
                          'Use after a local --manual-refinement prep run.')
+parser.add_argument('--restart-from', type=str, default=None,
+                    help='Path to previous results directory to continue from. '
+                         'Loads displacement checkpoint + 0D state and continues for --beats more beats. '
+                         'Automatically uses geometry from the restart dir.')
+parser.add_argument('--warp', action='store_true', default=False,
+                    help='Use mesh warping (fenicsx-warp) instead of re-meshing for thickness/PCA variants')
+parser.add_argument('--warp-baseline', type=str, default=None,
+                    help='Path to baseline mesh directory for warping (must contain ED_clipped.msh)')
 args = parser.parse_args()
+
+# --- Restart Setup ---
+RESTART_MODE = args.restart_from is not None
+RESTART_DIR = Path(args.restart_from) if RESTART_MODE else None
+if RESTART_MODE:
+    # Copy geometry from restart dir into output dir (don't modify the source!)
+    # The geometry_generator scaling code re-saves geometry.bp in-place,
+    # which would corrupt the original results if we point at them directly.
+    if args.geometry_dir is None:
+        import shutil as _shutil_restart
+        _restart_geo_src = RESTART_DIR / "geometry"
+        # Use a unique temp name to avoid collisions with stale dirs
+        _restart_geo_dst = Path(f"_restart_geo_{os.getpid()}")
+        if _restart_geo_dst.exists():
+            _shutil_restart.rmtree(_restart_geo_dst, ignore_errors=True)
+        _shutil_restart.copytree(_restart_geo_src, _restart_geo_dst)
+        args.geometry_dir = str(_restart_geo_dst)
+    # Load BPM from old simulation params
+    with open(RESTART_DIR / "simulation_params.json") as _f:
+        _restart_sp = json.load(_f)
 
 # Determine BPM
 if args.bpm is not None:
@@ -173,19 +201,25 @@ mesh_unit = "m"
 def parser_ds(ds_measure, marker_id):
     return ds_measure(marker_id)
 
-lvv_target = 0.0
-rvv_target = 0.0
+if RESTART_MODE:
+    # Load target volumes from old simulation params
+    lvv_target = _restart_sp["lvv_target_m3"]
+    rvv_target = _restart_sp["rvv_target_m3"]
+    logger.info(f"RESTART: ED Volumes from old sim: LV={lvv_target * volume2ml:.2f} mL, RV={rvv_target * volume2ml:.2f} mL")
+else:
+    lvv_target = 0.0
+    rvv_target = 0.0
 
-# Determine correct markers for volume calculation
-lv_vol_marker = "LV" if "LV" in geometry.markers else "ENDO_LV"
-rv_vol_marker = "RV" if "RV" in geometry.markers else "ENDO_RV"
+    # Determine correct markers for volume calculation
+    lv_vol_marker = "LV" if "LV" in geometry.markers else "ENDO_LV"
+    rv_vol_marker = "RV" if "RV" in geometry.markers else "ENDO_RV"
 
-lvv_target = comm.allreduce(geometry.volume(lv_vol_marker), op=MPI.SUM)
-rvv_target = comm.allreduce(geometry.volume(rv_vol_marker), op=MPI.SUM)
+    lvv_target = comm.allreduce(geometry.volume(lv_vol_marker), op=MPI.SUM)
+    rvv_target = comm.allreduce(geometry.volume(rv_vol_marker), op=MPI.SUM)
 
-logger.info(
-    f"ED Volumes: LV={lvv_target * volume2ml:.2f} mL, RV={rvv_target * volume2ml:.2f} mL",
-)
+    logger.info(
+        f"ED Volumes: LV={lvv_target * volume2ml:.2f} mL, RV={rvv_target * volume2ml:.2f} mL",
+    )
 
 # --- 0D Circulation Model (From V2) ---
 
@@ -319,33 +353,56 @@ init_state_circ = {
     "V_RV": rvv_target * volume2ml * circulation.units.ureg("mL"),
 }
 
-if comm.rank == 0:
-    # Use converged ICs from JSON if available, otherwise model defaults
-    ic_0d = _json_initial_state
-    if ic_0d is not None:
-        logger.info(f"Using initial_state from JSON for 0D pre-run")
-    else:
-        logger.info(f"No initial_state in JSON, using model defaults for 0D pre-run")
-    history, circ_state = run_0D(init_state=ic_0d)
-    np.save(outdir / "state.npy", circ_state, allow_pickle=True)
-    np.save(outdir / "history.npy", history, allow_pickle=True)
-comm.Barrier()
+if not RESTART_MODE:
+    # --- FRESH RUN: run standalone 0D to get initial circulation state ---
+    if comm.rank == 0:
+        # Use converged ICs from JSON if available, otherwise model defaults
+        ic_0d = _json_initial_state
+        if ic_0d is not None:
+            logger.info(f"Using initial_state from JSON for 0D pre-run")
+        else:
+            logger.info(f"No initial_state in JSON, using model defaults for 0D pre-run")
+        history, circ_state = run_0D(init_state=ic_0d)
+        np.save(outdir / "state.npy", circ_state, allow_pickle=True)
+        np.save(outdir / "history.npy", history, allow_pickle=True)
+    comm.Barrier()
 
-history = np.load(outdir / "history.npy", allow_pickle=True).item()
-circ_state = np.load(outdir / "state.npy", allow_pickle=True).item()
+    history = np.load(outdir / "history.npy", allow_pickle=True).item()
+    circ_state = np.load(outdir / "state.npy", allow_pickle=True).item()
+else:
+    # --- RESTART: extract 0D state and ratios from old simulation ---
+    logger.info("RESTART: Skipping 0D pre-run (will use state from previous coupled simulation)")
+    history = None  # Will be replaced by coupled_history
+
+    # Extract final 0D state from old coupled history
+    restart_history_tmp = np.load(RESTART_DIR / "circulation" / "history.npy", allow_pickle=True).item()
+    circ_state_names = ["V_LA", "V_LV", "V_RA", "V_RV", "p_AR_SYS", "p_VEN_SYS",
+                        "p_AR_PUL", "p_VEN_PUL", "Q_AR_SYS", "Q_VEN_SYS", "Q_AR_PUL", "Q_VEN_PUL"]
+    circ_state = {k: float(restart_history_tmp[k][-1]) for k in circ_state_names if k in restart_history_tmp}
+    logger.info(f"RESTART: Extracted 0D state from old history (V_LV={circ_state['V_LV']:.2f}, V_RV={circ_state['V_RV']:.2f})")
+
+    # Store restart targets for the inflation ramp (used after problem setup)
+    last_V_LV_0D = circ_state["V_LV"]
+    last_V_RV_0D = circ_state["V_RV"]
+    old_Ta_solver_history = np.load(RESTART_DIR / "solver" / "Ta_solver_history.npy")
 
 error_LV = 0.0 # Deprecated: Offset removed in favor of Ratio Coupling
 error_RV = 0.0 # Deprecated: Offset removed in favor of Ratio Coupling
 
 # Scaling Ratios for Multiplicative Coupling (Ratio = Mesh_ED / Circ_ED)
-ratio_LV = init_state_circ["V_LV"].magnitude / circ_state["V_LV"]
-ratio_RV = init_state_circ["V_RV"].magnitude / circ_state["V_RV"]
+if RESTART_MODE:
+    # Load ratios from old simulation to ensure consistency
+    ratio_LV = _restart_sp["ratio_LV"]
+    ratio_RV = _restart_sp["ratio_RV"]
+else:
+    ratio_LV = init_state_circ["V_LV"].magnitude / circ_state["V_LV"]
+    ratio_RV = init_state_circ["V_RV"].magnitude / circ_state["V_RV"]
 
 if comm.rank == 0:
     logger.info(f"Coupling Ratios (Mesh/Circ): LV={ratio_LV:.4f}, RV={ratio_RV:.4f}")
 
-# Plotting 0D results (Rank 0 only)
-if comm.rank == 0:
+# Plotting 0D results (Rank 0 only, skip for restart)
+if comm.rank == 0 and history is not None:
     fig, ax = plt.subplots(2, 3, figsize=(16, 7), gridspec_kw={"width_ratios": [1, 1, 0.6]})
     fig.suptitle(f"0D Circulation Model — {BPM} BPM", fontsize=14, fontweight="bold")
 
@@ -489,12 +546,12 @@ def setup_problem(geometry, f0, s0, material_params, alpha_epi_val=1e5, alpha_ba
     alpha_epi = pulse.Variable(
         dolfinx.fem.Constant(geometry.mesh, dolfinx.default_scalar_type(alpha_epi_val)), "Pa / m",
     )
-    robin_epi = pulse.RobinBC(value=alpha_epi, marker=geometry.markers["EPI"][0], one_sided=args.one_sided_robin)
+    robin_epi = pulse.RobinBC(value=alpha_epi, marker=geometry.markers["EPI"][0])  # one_sided removed for pulse 0.6 compat
 
     alpha_base = pulse.Variable(
         dolfinx.fem.Constant(geometry.mesh, dolfinx.default_scalar_type(alpha_base_val)), "Pa / m",
     )
-    robin_base = pulse.RobinBC(value=alpha_base, marker=geometry.markers["BASE"][0], one_sided=args.one_sided_robin)
+    robin_base = pulse.RobinBC(value=alpha_base, marker=geometry.markers["BASE"][0])  # one_sided removed for pulse 0.6 compat
     robin = [robin_epi, robin_base]
 
     def dirichlet_bc(V: dolfinx.fem.FunctionSpace):
@@ -541,8 +598,13 @@ model, robin, dirichlet_bc, Ta = setup_problem(
 
 # --- Prestressing (Inverse Elasticity) ---
 
-p_LV_ED = mmHg_to_kPa(history["p_LV"][-1])
-p_RV_ED = mmHg_to_kPa(history["p_RV"][-1])
+if RESTART_MODE:
+    # Use dummy pressures — prestress is cached and won't be recomputed
+    p_LV_ED = 0.0
+    p_RV_ED = 0.0
+else:
+    p_LV_ED = mmHg_to_kPa(history["p_LV"][-1])
+    p_RV_ED = mmHg_to_kPa(history["p_RV"][-1])
 
 logger.info(f"Target ED Pressures: p_LV={p_LV_ED:.2f} kPa, p_RV={p_RV_ED:.2f} kPa")
 
@@ -565,6 +627,21 @@ bcs_prestress = pulse.BoundaryConditions(
 
 solver_dir = outdir / "solver"
 viz_dir = outdir / "visualization"
+
+# For restart: copy cached prestress files from old results dir (rank 0 only to avoid race)
+if RESTART_MODE and comm.rank == 0:
+    import shutil as _shutil
+    for _pf in ["prestress_inverse.bp", "prestress_backward.bp"]:
+        _src = RESTART_DIR / "solver" / _pf
+        _dst = solver_dir / _pf
+        if _src.exists() and not _dst.exists():
+            if _src.is_dir():
+                _shutil.copytree(_src, _dst)
+            else:
+                _shutil.copy2(_src, _dst)
+            logger.info(f"RESTART: Copied {_pf} from old results")
+if RESTART_MODE:
+    comm.barrier()
 
 prestress_fname = solver_dir / "prestress_inverse.bp"
 if not prestress_fname.exists():
@@ -691,30 +768,83 @@ vtx_stress = dolfinx.io.VTXWriter(geometry.mesh.comm, viz_dir / "stress_strain.b
 
 # --- Inflation (Reference -> End-Diastole) ---
 
-logger.info("Inflating to End-Diastolic Target...")
-ramp_steps = 10
-for i in range(ramp_steps):
-    factor = (i + 1) / ramp_steps
-    current_lvv = lvv_unloaded + factor * (lvv_target - lvv_unloaded)
-    current_rvv = rvv_unloaded + factor * (rvv_target - rvv_unloaded)
-    lv_volume.value = current_lvv
-    rv_volume.value = current_rvv
-    problem.solve()
+if not RESTART_MODE:
+    logger.info("Inflating to End-Diastolic Target...")
+    ramp_steps = 20
+    for i in range(ramp_steps):
+        factor = (i + 1) / ramp_steps
+        current_lvv = lvv_unloaded + factor * (lvv_target - lvv_unloaded)
+        current_rvv = rvv_unloaded + factor * (rvv_target - rvv_unloaded)
+        lv_volume.value = current_lvv
+        rv_volume.value = current_rvv
+        problem.solve()
 
-    plv = problem.cavity_pressures[0].x.array[0] * 1e-3
-    prv = problem.cavity_pressures[1].x.array[0] * 1e-3
-    if comm.rank == 0:
-        logger.info(f"Inflation Step {i + 1}/{ramp_steps}: pLV={plv:.2f} kPa, pRV={prv:.2f} kPa")
+        plv = problem.cavity_pressures[0].x.array[0] * 1e-3
+        prv = problem.cavity_pressures[1].x.array[0] * 1e-3
+        if comm.rank == 0:
+            logger.info(f"Inflation Step {i + 1}/{ramp_steps}: pLV={plv:.2f} kPa, pRV={prv:.2f} kPa")
 
-vtx_u.write(0.0)
-if vtx_p:
-    vtx_p.write(0.0)
-vtx_stress.write(0.0)
+    vtx_u.write(0.0)
+    if vtx_p:
+        vtx_p.write(0.0)
+    vtx_stress.write(0.0)
 
-# Store old values (handling Array for Ta due to scifem/V1)
-problem.old_Ta = Ta.value.x.array.copy()
-problem.old_lv_volume = lv_volume.value.copy()
-problem.old_rv_volume = rv_volume.value.copy()
+    # Store old values (handling Array for Ta due to scifem/V1)
+    problem.old_Ta = Ta.value.x.array.copy()
+    problem.old_lv_volume = lv_volume.value.copy()
+    problem.old_rv_volume = rv_volume.value.copy()
+else:
+    # --- RESTART: Inflate normally, then ramp from ED to the restart state ---
+    # We can't skip inflation because the Lagrange multiplier (cavity pressure)
+    # needs to be established by the solver. After inflation, we ramp volumes
+    # and activation from ED to the restart state so the solver converges smoothly.
+    logger.info("RESTART: Inflating to ED (same as fresh run)...")
+    ramp_steps = 20
+    for i in range(ramp_steps):
+        factor = (i + 1) / ramp_steps
+        current_lvv = lvv_unloaded + factor * (lvv_target - lvv_unloaded)
+        current_rvv = rvv_unloaded + factor * (rvv_target - rvv_unloaded)
+        lv_volume.value = current_lvv
+        rv_volume.value = current_rvv
+        problem.solve()
+
+        plv = problem.cavity_pressures[0].x.array[0] * 1e-3
+        prv = problem.cavity_pressures[1].x.array[0] * 1e-3
+        if comm.rank == 0:
+            logger.info(f"Inflation Step {i + 1}/{ramp_steps}: pLV={plv:.2f} kPa, pRV={prv:.2f} kPa")
+
+    problem.old_Ta = Ta.value.x.array.copy()
+    problem.old_lv_volume = lv_volume.value.copy()
+    problem.old_rv_volume = rv_volume.value.copy()
+
+    # Now ramp from ED to the restart state (volumes + activation)
+    restart_lv_target = (last_V_LV_0D * ratio_LV) / volume2ml
+    restart_rv_target = (last_V_RV_0D * ratio_RV) / volume2ml
+    restart_Ta_target = old_Ta_solver_history[-1]
+    ed_lv = lv_volume.value.copy()
+    ed_rv = rv_volume.value.copy()
+    ed_Ta = Ta.value.x.array.copy()
+
+    # Only ramp if the restart state differs from ED
+    vol_diff = abs(restart_lv_target - ed_lv) * volume2ml
+    ta_diff = np.max(np.abs(restart_Ta_target - ed_Ta))
+    if vol_diff > 0.01 or ta_diff > 0.01:  # > 0.01 mL or 0.01 kPa
+        n_ramp = 20
+        logger.info(f"RESTART: Ramping from ED to restart state ({n_ramp} steps, "
+                     f"dV_LV={vol_diff:.2f}mL, dTa_max={ta_diff:.1f}kPa)...")
+        for ri in range(n_ramp):
+            frac = (ri + 1) / n_ramp
+            lv_volume.value = ed_lv + frac * (restart_lv_target - ed_lv)
+            rv_volume.value = ed_rv + frac * (restart_rv_target - ed_rv)
+            Ta.assign(ed_Ta + frac * (restart_Ta_target - ed_Ta))
+            problem.solve()
+        problem.old_lv_volume = lv_volume.value.copy()
+        problem.old_rv_volume = rv_volume.value.copy()
+        problem.old_Ta = Ta.value.x.array.copy()
+        logger.info(f"RESTART: Ramp complete. V_LV={lv_volume.value*volume2ml:.2f}mL, "
+                     f"Ta_max={np.max(Ta.value.x.array):.1f}")
+    else:
+        logger.info("RESTART: State at ED matches restart state, no ramp needed")
 
 # --- Multiscale Coupling Loop (Hybrid Logic) ---
 
@@ -829,28 +959,61 @@ def p_BiV_func(V_LV, V_RV, t):
 # --- Checkpointing and Callback ---
 
 checkpoint_file = solver_dir / "checkpoint.bp"
-if comm.rank == 0:
-    shutil.rmtree(checkpoint_file, ignore_errors=True)
-comm.barrier()
+restart_time_offset = 0.0
 
-adios4dolfinx.write_mesh(checkpoint_file, geometry.mesh)
-adios4dolfinx.write_meshtags(checkpoint_file, mesh=geometry.mesh, meshtags=geometry.facet_tags, meshtag_name="ffun")
-adios4dolfinx.write_meshtags(checkpoint_file, mesh=geometry.mesh, meshtags=geo.additional_data["markers_mt"], meshtag_name="cfun")
+if RESTART_MODE:
+    # --- RESTART: Load state from previous simulation ---
+    restart_checkpoint = RESTART_DIR / "solver" / "checkpoint.bp"
+    restart_history = np.load(RESTART_DIR / "circulation" / "history.npy", allow_pickle=True).item()
 
-# Write fiber fields into checkpoint file (MUST be same file as mesh for DOF ordering)
-adios4dolfinx.write_function(checkpoint_file, u=f0_quad, name="f0", time=0.0)
-adios4dolfinx.write_function(checkpoint_file, u=s0_quad, name="s0", time=0.0)
-if n0_quad is not None:
-    adios4dolfinx.write_function(checkpoint_file, u=n0_quad, name="n0", time=0.0)
-if l0_field is not None:
-    adios4dolfinx.write_function(checkpoint_file, u=l0_field, name="l0", time=0.0)
-logger.info("Checkpoint initialized: mesh + markers + fibers")
+    # 1. Determine time offset from old checkpoint
+    old_timestamps = adios4dolfinx.read_timestamps(restart_checkpoint, comm, "displacement")
+    restart_time_offset = float(old_timestamps[-1])
+    logger.info(f"RESTART: Continuing from t={restart_time_offset:.4f}s ({len(old_timestamps)} old steps)")
 
-Ta_history: list = []
-Ta_solver_history: list = []
-pressure_history: list = []  # Solver cavity pressures (mmHg) at each step
+    # 2. State restoration already done via inflation + ramp (above).
+    #    The solver found its own path to the restart state, so displacement
+    #    and Lagrange multipliers are internally consistent.
+
+    # 3. Load previous histories to prepend
+    Ta_history = np.load(RESTART_DIR / "solver" / "Ta_history.npy").tolist()
+    Ta_solver_history = np.load(RESTART_DIR / "solver" / "Ta_solver_history.npy").tolist()
+    pressure_history = np.load(RESTART_DIR / "solver" / "pressure_history.npy").tolist()
+    logger.info(f"RESTART: Loaded {len(Ta_history)} previous history steps")
+
+    # 4. Copy old checkpoint directory so we can append new steps to it
+    if comm.rank == 0:
+        shutil.rmtree(checkpoint_file, ignore_errors=True)
+        shutil.copytree(restart_checkpoint, checkpoint_file)
+        logger.info(f"RESTART: Copied checkpoint directory ({len(old_timestamps)} existing steps)")
+    comm.barrier()
+
+else:
+    # --- FRESH RUN: Initialize checkpoint from scratch ---
+    if comm.rank == 0:
+        shutil.rmtree(checkpoint_file, ignore_errors=True)
+    comm.barrier()
+
+    adios4dolfinx.write_mesh(checkpoint_file, geometry.mesh)
+    adios4dolfinx.write_meshtags(checkpoint_file, mesh=geometry.mesh, meshtags=geometry.facet_tags, meshtag_name="ffun")
+    adios4dolfinx.write_meshtags(checkpoint_file, mesh=geometry.mesh, meshtags=geo.additional_data["markers_mt"], meshtag_name="cfun")
+
+    adios4dolfinx.write_function(checkpoint_file, u=f0_quad, name="f0", time=0.0)
+    adios4dolfinx.write_function(checkpoint_file, u=s0_quad, name="s0", time=0.0)
+    if n0_quad is not None:
+        adios4dolfinx.write_function(checkpoint_file, u=n0_quad, name="n0", time=0.0)
+    if l0_field is not None:
+        adios4dolfinx.write_function(checkpoint_file, u=l0_field, name="l0", time=0.0)
+    logger.info("Checkpoint initialized: mesh + markers + fibers")
+
+    Ta_history: list = []
+    Ta_solver_history: list = []
+    pressure_history: list = []  # Solver cavity pressures (mmHg) at each step
 
 def callback(model, i: int, t: float, save=True):
+    # Apply time offset for restart continuations
+    t_abs = t + restart_time_offset
+
     # 1. Record activation for postprocessing
     raw_activation_vec = get_activation(t)
     Ta_history.append(raw_activation_vec)
@@ -870,17 +1033,58 @@ def callback(model, i: int, t: float, save=True):
     if comm.rank == 0 and (i % 10 == 0 or CI_MODE):
         lv_p_kPa = problem.cavity_pressures[0].x.array[0] * 1e-3
         v_lv_ml = float(lv_volume.value * volume2ml)
-        print(f"STEP {i:04d} | t={t:.3f} | Ta={max_ta_solver:.1f} | V_LV={v_lv_ml:.1f}mL")
+        print(f"STEP {i:04d} | t={t_abs:.3f} | Ta={max_ta_solver:.1f} | V_LV={v_lv_ml:.1f}mL")
 
     # 3. Save checkpoint data (displacement only — all metrics computed offline)
     if save:
         fiber_stress.interpolate(fiber_stress_expr)
         fiber_strain.interpolate(fiber_strain_expr)
-        vtx_u.write(t)
+        vtx_u.write(t_abs)
         if vtx_p:
-            vtx_p.write(t)
-        vtx_stress.write(t)
-        adios4dolfinx.write_function(checkpoint_file, u=problem.u, name="displacement", time=t)
+            vtx_p.write(t_abs)
+        vtx_stress.write(t_abs)
+        adios4dolfinx.write_function(checkpoint_file, u=problem.u, name="displacement", time=t_abs)
+
+    # 4. Periodically flush Ta/pressure to disk so data survives SIGKILL.
+    #    Without this, a SLURM timeout loses all Ta/pressure data (only in memory).
+    steps_per_beat = int(round(RR_INTERVAL / dt))
+    if comm.rank == 0 and i > 0 and i % steps_per_beat == 0:
+        np.save(solver_dir / "Ta_solver_history.npy", np.array(Ta_solver_history))
+        np.save(solver_dir / "pressure_history.npy", np.array(pressure_history))
+        np.save(solver_dir / "Ta_history.npy", np.array(Ta_history))
+
+# --- Save simulation_params.json EARLY (before solver loop) ---
+# This ensures material/activation params survive even if SIGKILL hits during the loop.
+if comm.rank == 0:
+    sim_params = {
+        "BPM": BPM,
+        "HR_HZ": HR_HZ,
+        "RR_INTERVAL": RR_INTERVAL,
+        "dt": 0.001,  # hardcoded here because dt variable is defined later
+        "mesh_unit": mesh_unit,
+        "volume2ml": volume2ml,
+        "incompressible": args.incompressible,
+        "alpha_epi": args.alpha_epi,
+        "alpha_base": args.alpha_base,
+        "one_sided_robin": args.one_sided_robin,
+        "material_params": {k: {"value": float(v.value), "unit": str(v.original_unit)} for k, v in material_params.items()},
+        "activation": {
+            "TC": TC_ACTIVATION,
+            "TR": TR_ACTIVATION,
+            "tC": tC_ACTIVATION,
+            "peak_kPa": 100.0,
+        },
+        "ratio_LV": ratio_LV,
+        "ratio_RV": ratio_RV,
+        "lvv_unloaded_m3": float(lvv_unloaded),
+        "rvv_unloaded_m3": float(rvv_unloaded),
+        "lvv_target_m3": float(lvv_target),
+        "rvv_target_m3": float(rvv_target),
+        "geo_scale": getattr(geo, '_geo_scale', 1.0),
+    }
+    with open(outdir / "simulation_params.json", "w") as f:
+        json.dump(sim_params, f, indent=2, default=custom_json)
+    logger.info("Saved simulation_params.json (early, before solver loop)")
 
 # --- Run Simulation ---
 
@@ -913,7 +1117,18 @@ else:
 try:
     coupled_history = circulation_model.solve(num_beats=num_beats, initial_state=circ_state, dt=dt, T=end_time)
     logger.info("Simulation complete.")
-    # Overwrite pre-run history with coupled history so postprocessing uses correct 0D data
+    # Merge old + new circulation history for restart continuations
+    if RESTART_MODE and comm.rank == 0:
+        old_hist = np.load(RESTART_DIR / "circulation" / "history.npy", allow_pickle=True).item()
+        merged = {}
+        for k in coupled_history:
+            old_arr = np.array(old_hist[k])
+            new_arr = np.array(coupled_history[k])
+            if k == "time":
+                new_arr = new_arr + restart_time_offset
+            merged[k] = np.concatenate([old_arr, new_arr])
+        coupled_history = merged
+        logger.info(f"RESTART: Merged circulation history ({len(merged['time'])} total points)")
     if comm.rank == 0:
         np.save(outdir / "history.npy", coupled_history, allow_pickle=True)
         logger.info(f"Saved coupled circulation history: {len(coupled_history['time'])} points")

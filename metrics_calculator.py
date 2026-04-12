@@ -9,7 +9,7 @@ import basix.ufl
 import pulse
 
 class MetricsCalculator:
-    def __init__(self, geometry, geo, fiber_field_map, problem, comm, cardiac_model, metrics_space_type=("DG", 1), alpha_epi=1e5, alpha_base=1e6, hydro_pressure=None, one_sided_robin=False):
+    def __init__(self, geometry, geo, fiber_field_map, problem, comm, cardiac_model, metrics_space_type=("DG", 1), alpha_epi=1e5, alpha_base=1e6, hydro_pressure=None, one_sided_robin=False, aha_tags=None):
         self.geometry = geometry
         self.geo = geo
         self.fiber_fields = fiber_field_map
@@ -95,11 +95,12 @@ class MetricsCalculator:
         self.V_LV_prev = None
         self.V_RV_prev = None
         
-        # Strain History for PS Loops (fiber/circumferential)
+        # Strain History for PS Loops — dict-based for extensibility to AHA regions
+        self._eps_prev = {}  # keyed by "{strain_component}_{region}", e.g. "E_ff_LV"
+        # Legacy attributes (kept for backward compat if anything reads them directly)
         self.eps_LV_prev = 0.0
         self.eps_RV_prev = 0.0
         self.eps_Septum_prev = 0.0
-        # Strain History for PS Loops (longitudinal)
         self.eps_ll_LV_prev = 0.0
         self.eps_ll_RV_prev = 0.0
         self.eps_ll_Septum_prev = 0.0
@@ -111,7 +112,10 @@ class MetricsCalculator:
         
         # Region Tags
         self.region_tags = geo.additional_data.get("markers_mt", None)
-        
+
+        # AHA sub-region tags (Basal/Mid split of LV/RV/Septum)
+        self.aha_tags = aha_tags
+
         # --- 4. Calculate Regional Wall Volumes for Unit Scaling ---
         # We need specific volumes for LV, RV, and Septum to scale the PS Indices correctly.
         self.region_volumes = {}
@@ -141,6 +145,23 @@ class MetricsCalculator:
             #      print(f"  LV Free: {self.region_volumes['LV']:.2e} m3")
             #      print(f"  RV Free: {self.region_volumes['RV']:.2e} m3")
             #      print(f"  Septum:  {self.region_volumes['Septum']:.2e} m3")
+
+            # AHA sub-region volumes
+            if self.aha_tags is not None:
+                def get_aha_vol(tags):
+                    dx_aha = ufl.Measure("dx", domain=self.mesh, subdomain_data=self.aha_tags, metadata={"quadrature_degree": self.quadrature_degree})
+                    val = 0.0
+                    for t in tags:
+                        val += dolfinx.fem.assemble_scalar(dolfinx.fem.form(dolfinx.fem.Constant(self.mesh, 1.0) * dx_aha(int(t))))
+                    return self.comm.allreduce(val, op=MPI.SUM)
+
+                aha_region_map = {
+                    "Basal_LV": [1], "Basal_RV": [2], "Basal_Septum": [3],
+                    "Mid_LV": [4], "Mid_RV": [5], "Mid_Septum": [6],
+                    "Apical": [0],
+                }
+                for name, tags in aha_region_map.items():
+                    self.region_volumes[name] = get_aha_vol(tags)
 
         except Exception as e:
             if self.rank == 0: print(f"MetricsCalculator Warning: Could not calc regional volumes ({e}). Using defaults.")
@@ -175,7 +196,7 @@ class MetricsCalculator:
                 else:
                     print(f"  OK: All cells assigned to regions 1/2/3.")
                 for rname, rvol in self.region_volumes.items():
-                    print(f"  Volume {rname:>8s}: {rvol:.4e} m^3")
+                    print(f"  Volume {rname:>14s}: {rvol:.4e} m^3")
                 print(f"{'='*60}\n")
 
         # --- 5. Pre-compile all integration forms (one-time JIT cost) ---
@@ -611,68 +632,64 @@ class MetricsCalculator:
     def _calculate_pressure_strain_work(self, current_state, mechanics_data):
         """
         Calculates Pressure-Strain Work Index (PSWI) with detailed Septal breakdown.
+        Handles both original (LV/RV/Septum) and AHA sub-regions generically.
         """
         data = {}
         # Convert to Pa
         p_LV = (current_state.get("p_LV", 0.0) or 0.0) * 133.322
         p_RV = (current_state.get("p_RV", 0.0) or 0.0) * 133.322
-        
-        # Get Mean Strains for each Region
-        eps_LV = mechanics_data.get("mean_E_ff_LV", 0.0)
-        eps_RV = mechanics_data.get("mean_E_ff_RV", 0.0)
-        eps_Septum = mechanics_data.get("mean_E_ff_Septum", 0.0)
-        
-        # Calculate Increments
-        dE_LV = eps_LV - self.eps_LV_prev
-        dE_RV = eps_RV - self.eps_RV_prev
-        dE_Septum = eps_Septum - self.eps_Septum_prev
-        
+
         # Trapezoidal Pressures (Pa)
         p_LV_avg = 0.5 * (p_LV + self.p_LV_prev)
         p_RV_avg = 0.5 * (p_RV + self.p_RV_prev)
 
-        # --- Apply Regional Volume Scaling ---
-        
-        # 1. LV Free Wall: P_LV × dE_ff (fiber strain = circumferential)
-        data["work_ps_ff_LV"] = (p_LV_avg * dE_LV) * self.region_volumes["LV"]
+        # Region classification: which pressure applies to which region
+        lv_regions = ["LV"]
+        rv_regions = ["RV"]
+        septum_regions = ["Septum"]
 
-        # 2. RV Free Wall: P_RV × dE_ff
-        data["work_ps_ff_RV"] = (p_RV_avg * dE_RV) * self.region_volumes["RV"]
+        if self.aha_tags is not None:
+            lv_regions += ["Basal_LV", "Mid_LV"]
+            rv_regions += ["Basal_RV", "Mid_RV"]
+            septum_regions += ["Basal_Septum", "Mid_Septum"]
 
-        # 3. Septum Proxies: different pressure choices × dE_ff
-        vol_S = self.region_volumes["Septum"]
+        for strain_key, suffix in [("E_ff", "ff"), ("E_ll", "ll")]:
+            # LV-type: P_LV × dE
+            for region in lv_regions:
+                eps = mechanics_data.get(f"mean_{strain_key}_{region}", 0.0)
+                eps_prev = self._eps_prev.get(f"{strain_key}_{region}", 0.0)
+                dE = eps - eps_prev
+                vol = self.region_volumes.get(region, 1.0)
+                data[f"work_ps_{suffix}_{region}"] = (p_LV_avg * dE) * vol
+                self._eps_prev[f"{strain_key}_{region}"] = eps
 
-        # Transmural pressure (P_LV - P_RV) — best physics for septum
-        data["work_ps_ff_Septum_Trans"] = ((p_LV_avg - p_RV_avg) * dE_Septum) * vol_S
+            # RV-type: P_RV × dE
+            for region in rv_regions:
+                eps = mechanics_data.get(f"mean_{strain_key}_{region}", 0.0)
+                eps_prev = self._eps_prev.get(f"{strain_key}_{region}", 0.0)
+                dE = eps - eps_prev
+                vol = self.region_volumes.get(region, 1.0)
+                data[f"work_ps_{suffix}_{region}"] = (p_RV_avg * dE) * vol
+                self._eps_prev[f"{strain_key}_{region}"] = eps
 
-        # LV pressure only — tests "septum as part of LV" hypothesis
-        data["work_ps_ff_Septum_PLV"] = (p_LV_avg * dE_Septum) * vol_S
+            # Septum-type: Trans/PLV/PRV variants
+            for region in septum_regions:
+                eps = mechanics_data.get(f"mean_{strain_key}_{region}", 0.0)
+                eps_prev = self._eps_prev.get(f"{strain_key}_{region}", 0.0)
+                dE = eps - eps_prev
+                vol = self.region_volumes.get(region, 1.0)
+                data[f"work_ps_{suffix}_{region}_Trans"] = ((p_LV_avg - p_RV_avg) * dE) * vol
+                data[f"work_ps_{suffix}_{region}_PLV"] = (p_LV_avg * dE) * vol
+                data[f"work_ps_{suffix}_{region}_PRV"] = (p_RV_avg * dE) * vol
+                self._eps_prev[f"{strain_key}_{region}"] = eps
 
-        # RV pressure only — baseline comparison
-        data["work_ps_ff_Septum_PRV"] = (p_RV_avg * dE_Septum) * vol_S
-        
-        # --- Longitudinal PS Proxy (P × dE_ll) — GLS analogue ---
-        eps_ll_LV = mechanics_data.get("mean_E_ll_LV", 0.0)
-        eps_ll_RV = mechanics_data.get("mean_E_ll_RV", 0.0)
-        eps_ll_Septum = mechanics_data.get("mean_E_ll_Septum", 0.0)
-
-        dE_ll_LV = eps_ll_LV - self.eps_ll_LV_prev
-        dE_ll_RV = eps_ll_RV - self.eps_ll_RV_prev
-        dE_ll_Septum = eps_ll_Septum - self.eps_ll_Septum_prev
-
-        data["work_ps_ll_LV"] = (p_LV_avg * dE_ll_LV) * self.region_volumes["LV"]
-        data["work_ps_ll_RV"] = (p_RV_avg * dE_ll_RV) * self.region_volumes["RV"]
-        data["work_ps_ll_Septum_Trans"] = ((p_LV_avg - p_RV_avg) * dE_ll_Septum) * vol_S
-        data["work_ps_ll_Septum_PLV"] = (p_LV_avg * dE_ll_Septum) * vol_S
-        data["work_ps_ll_Septum_PRV"] = (p_RV_avg * dE_ll_Septum) * vol_S
-
-        # Update History
-        self.eps_LV_prev = eps_LV
-        self.eps_RV_prev = eps_RV
-        self.eps_Septum_prev = eps_Septum
-        self.eps_ll_LV_prev = eps_ll_LV
-        self.eps_ll_RV_prev = eps_ll_RV
-        self.eps_ll_Septum_prev = eps_ll_Septum
+        # Keep legacy attributes in sync
+        self.eps_LV_prev = self._eps_prev.get("E_ff_LV", 0.0)
+        self.eps_RV_prev = self._eps_prev.get("E_ff_RV", 0.0)
+        self.eps_Septum_prev = self._eps_prev.get("E_ff_Septum", 0.0)
+        self.eps_ll_LV_prev = self._eps_prev.get("E_ll_LV", 0.0)
+        self.eps_ll_RV_prev = self._eps_prev.get("E_ll_RV", 0.0)
+        self.eps_ll_Septum_prev = self._eps_prev.get("E_ll_Septum", 0.0)
 
         return data
     
@@ -688,10 +705,17 @@ class MetricsCalculator:
     def _get_regions_to_integrate(self):
         regions = []
         if self.region_tags is not None:
-            regions.append(("LV", self.region_tags, [1])) 
+            regions.append(("LV", self.region_tags, [1]))
             regions.append(("RV", self.region_tags, [2]))
             regions.append(("Septum", self.region_tags, [3]))
             regions.append(("Whole", self.region_tags, [1, 2, 3])) #no 4
+        if self.aha_tags is not None:
+            regions.append(("Basal_LV", self.aha_tags, [1]))
+            regions.append(("Basal_RV", self.aha_tags, [2]))
+            regions.append(("Basal_Septum", self.aha_tags, [3]))
+            regions.append(("Mid_LV", self.aha_tags, [4]))
+            regions.append(("Mid_RV", self.aha_tags, [5]))
+            regions.append(("Mid_Septum", self.aha_tags, [6]))
         return regions
 
     def setup_csv_logging(self, file_path):
@@ -806,15 +830,25 @@ class MetricsCalculator:
             metrics["work_robin_epi"] = 0.0
             metrics["work_robin_base"] = 0.0
 
-            # PV/PS keys
+            # PV/PS keys — generate dynamically to cover AHA regions too
             metrics["work_proxy_pv_LV"] = 0.0
             metrics["work_proxy_pv_RV"] = 0.0
-            metrics["work_ps_ff_LV"] = 0.0
-            metrics["work_ps_ff_RV"] = 0.0
-            metrics["work_ps_ff_Septum_PLV"] = 0.0
-            metrics["work_ps_ll_LV"] = 0.0
-            metrics["work_ps_ll_RV"] = 0.0
-            metrics["work_ps_ll_Septum_PLV"] = 0.0
+
+            lv_regions = ["LV"]
+            rv_regions = ["RV"]
+            septum_regions = ["Septum"]
+            if self.aha_tags is not None:
+                lv_regions += ["Basal_LV", "Mid_LV"]
+                rv_regions += ["Basal_RV", "Mid_RV"]
+                septum_regions += ["Basal_Septum", "Mid_Septum"]
+
+            for suffix in ["ff", "ll"]:
+                for region in lv_regions + rv_regions:
+                    metrics[f"work_ps_{suffix}_{region}"] = 0.0
+                for region in septum_regions:
+                    metrics[f"work_ps_{suffix}_{region}_Trans"] = 0.0
+                    metrics[f"work_ps_{suffix}_{region}_PLV"] = 0.0
+                    metrics[f"work_ps_{suffix}_{region}_PRV"] = 0.0
             
             #exact work keys
             metrics["work_boundary_exact_LV"] = 0.0

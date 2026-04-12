@@ -1,4 +1,5 @@
 results/
+!results/bench/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
@@ -7,9 +8,17 @@ log/
 *.sbatch.err
 data/
 
+# Generated mesh variants (large, reproducible from scripts)
+warp_meshes/
+pca_meshes/
+thickness_meshes/
+thickness_variants/
+geometries/
+
 # Experimental artifacts (plots, analysis scripts)
 *.png
 *.jpg
 *.gif
 *.pdf
 *.out
+*.err

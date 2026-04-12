@@ -15,6 +15,9 @@ Required files in results_dir:
 Usage:
   python3 postprocess_metrics.py <results_directory>
   mpirun -n 4 python3 postprocess_metrics.py <results_directory>
+
+  # With manually edited septum tags (from septum_editor.py):
+  python3 postprocess_metrics.py <results_directory> --edited-tags edited_tags.npz
 """
 
 import json
@@ -35,11 +38,28 @@ import cardiac_geometries.geometry
 
 # ─── Parse Arguments ──────────────────────────────────────────────────────────
 
-if len(sys.argv) < 2:
-    print("Usage: python3 postprocess_metrics.py <results_directory>")
-    sys.exit(1)
+import argparse
 
-results_dir = Path(sys.argv[1]).resolve()
+_parser = argparse.ArgumentParser(description="Offline metrics from simulation checkpoint.")
+_parser.add_argument("results_dir", type=Path, help="Path to simulation results directory")
+_parser.add_argument(
+    "--edited-tags", type=Path, default=None, metavar="NPZ",
+    help="Path to edited_tags.npz from septum_editor. Overrides checkpoint "
+         "region markers (matched by cell centroid, no DOF-ordering dependency).",
+)
+_parser.add_argument(
+    "--last-beat", action="store_true", default=False,
+    help="Only process the last cardiac cycle (saves time for converged multi-beat sims).",
+)
+_parser.add_argument(
+    "--retag-septum", action="store_true", default=False,
+    help="Recompute LV/RV/Septum region tags using the geometric distance-based method "
+         "(ldrb geometric-septum-tagging). Overrides markers from checkpoint.",
+)
+_args = _parser.parse_args()
+
+results_dir = _args.results_dir.resolve()
+edited_tags_path = _args.edited_tags
 comm = MPI.COMM_WORLD
 rank = comm.rank
 
@@ -136,6 +156,152 @@ if rank == 0:
 ffun = adios4dolfinx.read_meshtags(checkpoint_path, mesh, meshtag_name="ffun")
 markers_mt = adios4dolfinx.read_meshtags(checkpoint_path, mesh, meshtag_name="cfun")
 
+# ─── Optional: Override region markers from edited_tags.npz ─────────────────
+# The septum_editor exports cell centroids + edited tags in a .npz file.
+# We match cells between the XDMF (editor) and .bp (checkpoint) meshes by
+# nearest centroid — no DOF-ordering dependency, fully safe.
+if edited_tags_path is not None:
+    from scipy.spatial import cKDTree
+
+    if rank == 0:
+        logger.info(f"Loading edited region tags from {edited_tags_path}")
+
+    edited = np.load(edited_tags_path)
+    edit_centroids = edited["centroids"]  # (n_edit, 3)
+    edit_tags = edited["tags"]            # (n_edit,)
+
+    # Compute centroids of the checkpoint mesh (local cells only)
+    mesh.topology.create_connectivity(3, 0)
+    imap_mt = mesh.topology.index_map(3)
+    n_local = imap_mt.size_local
+    local_cells = np.arange(n_local, dtype=np.int32)
+    bp_centroids = dolfinx.mesh.compute_midpoints(mesh, 3, local_cells)  # (n_local, 3)
+
+    # Build KDTree on the editor centroids, query with checkpoint centroids
+    tree = cKDTree(edit_centroids)
+    dists, indices = tree.query(bp_centroids)
+
+    max_dist = dists.max()
+    if rank == 0:
+        logger.info(f"  Centroid matching: max distance = {max_dist:.2e} m "
+                     f"({n_local} local cells matched)")
+    if max_dist > 1e-6:
+        logger.warning(f"  ⚠️  Large centroid mismatch ({max_dist:.2e} m) — "
+                        f"edited tags may not correspond to this mesh!")
+
+    # Build new MeshTags with edited values on the checkpoint mesh
+    new_values = edit_tags[indices].astype(np.int32)
+    old_values = markers_mt.values[:n_local]
+    n_changed = int((new_values != old_values).sum())
+
+    markers_mt = dolfinx.mesh.meshtags(
+        mesh, 3,
+        np.arange(imap_mt.size_local + imap_mt.num_ghosts, dtype=np.int32),
+        np.concatenate([new_values, markers_mt.values[n_local:]]),
+    )
+    markers_mt.name = "cfun"
+
+    if rank == 0:
+        n_lv = int((new_values == 1).sum())
+        n_rv = int((new_values == 2).sum())
+        n_sept = int((new_values == 3).sum())
+        logger.info(f"  Overridden: {n_changed} cells changed "
+                     f"(LV={n_lv}, RV={n_rv}, Septum={n_sept})")
+
+# ─── Optional: Geometric septum retagging ────────────────────────────────────
+# Recomputes LV/RV/Septum cell tags using distance-based geometry:
+#   Septum = max(dist_to_LV_endo, dist_to_RV_endo) < dist_to_EPI
+# All data (mesh, ffun, centroids) comes from checkpoint.bp — no DOF mismatch risk.
+if _args.retag_septum:
+    from scipy.spatial import cKDTree as _cKDTree
+
+    if rank == 0:
+        logger.info("Recomputing region tags with geometric distance-based septum tagging...")
+
+    # Log OLD tags for comparison
+    _imap = mesh.topology.index_map(3)
+    _n_local = _imap.size_local
+    _old_tags = markers_mt.values[:_n_local].copy()
+    _old_lv = comm.allreduce(int((_old_tags == 1).sum()))
+    _old_rv = comm.allreduce(int((_old_tags == 2).sum()))
+    _old_sept = comm.allreduce(int((_old_tags == 3).sum()))
+    if rank == 0:
+        logger.info(f"  OLD tags (global): LV={_old_lv}, RV={_old_rv}, Septum={_old_sept}")
+
+    # Read marker name→tag mapping from geometry folder (just a dict, no DOF dependency)
+    _geo_dir_tmp = results_dir / "geometry"
+    if rank == 0:
+        _geo_tmp = cardiac_geometries.geometry.Geometry.from_folder(MPI.COMM_SELF, _geo_dir_tmp)
+        _raw_markers = _geo_tmp.markers
+    else:
+        _raw_markers = None
+    _raw_markers = comm.bcast(_raw_markers, root=0)
+
+    # Build surface coordinate trees from facet tags (all from checkpoint.bp)
+    # IMPORTANT: gather surface coords from ALL ranks to build complete trees
+    mesh.topology.create_connectivity(2, 0)
+    _f2v = mesh.topology.connectivity(2, 0)
+
+    def _surface_coords_global(marker_tag_ids):
+        """Get surface vertex coordinates gathered across all MPI ranks."""
+        facets = np.hstack([ffun.find(t) for t in marker_tag_ids])
+        verts = set()
+        for f in facets:
+            verts.update(_f2v.links(f))
+        local_coords = mesh.geometry.x[np.array(sorted(verts), dtype=np.int64)] if verts else np.empty((0, 3))
+        # Gather all local coords to all ranks
+        all_coords = comm.allgather(local_coords)
+        return np.vstack(all_coords) if any(len(c) > 0 for c in all_coords) else np.empty((0, 3))
+
+    # Determine facet tag IDs (handle both naming conventions)
+    _lv_tags = [_raw_markers.get("LV", _raw_markers.get("ENDO_LV", [None]))[0]]
+    _rv_tags = [_raw_markers.get("RV", _raw_markers.get("ENDO_RV", [None]))[0]]
+    _epi_tags = [_raw_markers.get("EPI", [None])[0]]
+
+    _lv_coords = _surface_coords_global(_lv_tags)
+    _rv_coords = _surface_coords_global(_rv_tags)
+    _epi_coords = _surface_coords_global(_epi_tags)
+
+    if rank == 0:
+        logger.info(f"  Surface vertices (global): LV_endo={len(_lv_coords)}, "
+                     f"RV_endo={len(_rv_coords)}, EPI={len(_epi_coords)}")
+
+    _tree_lv = _cKDTree(_lv_coords)
+    _tree_rv = _cKDTree(_rv_coords)
+    _tree_epi = _cKDTree(_epi_coords)
+
+    # Compute distances at cell centroids (from the checkpoint mesh)
+    mesh.topology.create_connectivity(3, 0)
+    _centroids = dolfinx.mesh.compute_midpoints(mesh, 3, np.arange(_n_local, dtype=np.int32))
+
+    _d_lv, _ = _tree_lv.query(_centroids)
+    _d_rv, _ = _tree_rv.query(_centroids)
+    _d_epi, _ = _tree_epi.query(_centroids)
+
+    # Septum = closer to both endo surfaces than to epi
+    _is_septum = np.maximum(_d_lv, _d_rv) < _d_epi
+    _new_tags = np.where(_is_septum, 3,
+                np.where(_d_lv <= _d_rv, 1, 2)).astype(np.int32)
+
+    _n_changed = int((_new_tags != _old_tags).sum())
+
+    markers_mt = dolfinx.mesh.meshtags(
+        mesh, 3,
+        np.arange(_imap.size_local + _imap.num_ghosts, dtype=np.int32),
+        np.concatenate([_new_tags, markers_mt.values[_n_local:]]),
+    )
+    markers_mt.name = "cfun"
+
+    _new_lv = comm.allreduce(int((_new_tags == 1).sum()))
+    _new_rv = comm.allreduce(int((_new_tags == 2).sum()))
+    _new_sept = comm.allreduce(int((_new_tags == 3).sum()))
+    _n_changed = comm.allreduce(_n_changed)
+    if rank == 0:
+        logger.info(f"  NEW tags (global): LV={_new_lv}, RV={_new_rv}, Septum={_new_sept}")
+        logger.info(f"  Changed:  {_n_changed} cells "
+                     f"(LV: {_old_lv}→{_new_lv}, RV: {_old_rv}→{_new_rv}, "
+                     f"Septum: {_old_sept}→{_new_sept})")
+
 # Load geometry folder for marker name mapping only
 geo_dir = results_dir / "geometry"
 geo = cardiac_geometries.geometry.Geometry.from_folder(comm, geo_dir)
@@ -150,6 +316,33 @@ geometry = pulse.HeartGeometry(
 
 if rank == 0:
     logger.info("Geometry loaded successfully")
+
+# ─── 4b. Compute AHA Regions ─────────────────────────────────────────────────
+# Uses LDRB apex-to-base Laplace solution to split LV/RV/Septum into
+# Basal (1-3), Mid (4-6) sub-regions for reliable patch-level metrics.
+
+import ldrb.aha
+from cardiac_geometries.mesh import transform_markers
+
+ldrb_markers = transform_markers(geo.markers, clipped=True)
+aha_func = ldrb.aha.gernerate_aha_biv(
+    mesh=mesh, ffun=ffun, markers=ldrb_markers,
+    function_space="DG_0",
+)
+
+# Convert DG0 function to MeshTags
+imap = mesh.topology.index_map(3)
+_total_cells = imap.size_local + imap.num_ghosts
+aha_values = aha_func.x.array[:_total_cells].astype(np.int32)
+aha_mt = dolfinx.mesh.meshtags(mesh, 3, np.arange(_total_cells, dtype=np.int32), aha_values)
+
+if rank == 0:
+    aha_labels = {0: "Apical", 1: "Basal_LV", 2: "Basal_RV", 3: "Basal_Septum",
+                  4: "Mid_LV", 5: "Mid_RV", 6: "Mid_Septum"}
+    logger.info("AHA region counts:")
+    local_counts = np.bincount(aha_values, minlength=7)
+    for v in range(7):
+        logger.info(f"  {aha_labels[v]:>14s} (tag {v}): {local_counts[v]} cells")
 
 # ─── 5. Load Fiber Fields ────────────────────────────────────────────────────
 # Fibers were saved into checkpoint.bp by complete_cycle.py (same file = correct DOFs)
@@ -314,6 +507,7 @@ metrics_calc = MetricsCalculator(
     alpha_base=alpha_base,
     hydro_pressure=problem.p if sim_params["incompressible"] else None,
     one_sided_robin=sim_params.get("one_sided_robin", False),
+    aha_tags=aha_mt,
 )
 
 if rank == 0:
@@ -330,7 +524,16 @@ if rank == 0:
 
 # Circulation history has finer time resolution (0.1ms) than FEM checkpoints (1ms).
 # We need to interpolate pressures at exact checkpoint times.
+# FIX: If the circulation history was shifted to start at 0 (multi-beat extraction),
+# we must also shift the checkpoint timestamps to match, otherwise np.interp
+# extrapolates to a constant (the last value).
 circ_time = np.array(circ_history["time"])
+if len(timestamps) > 0 and timestamps[0] > circ_time[-1]:
+    # Checkpoint times are absolute (e.g. 7.2-8.0) but circ was shifted to 0-0.8
+    _time_offset = timestamps[0] - circ_time[0]
+    if rank == 0:
+        logger.info(f"Aligning checkpoint times to circulation: offset={_time_offset:.4f}s")
+    timestamps = timestamps - _time_offset
 circ_p_LV = np.array(circ_history["p_LV"])   # in mmHg (from 0D model)
 circ_p_RV = np.array(circ_history["p_RV"])
 circ_V_LV = np.array(circ_history["V_LV"])   # in mL (0D units)
@@ -397,7 +600,18 @@ if len(Ta_history) != n_steps:
                        f"Using min of both.")
     n_steps = min(n_steps, len(Ta_history))
 
-for i in range(n_steps):
+# --last-beat: skip to the last cardiac cycle
+start_step = 0
+if _args.last_beat:
+    cycle_length = sim_params.get("RR_INTERVAL", 60.0 / sim_params.get("BPM", 75))
+    last_beat_start_time = timestamps[-1] - cycle_length
+    # Find first timestep at or after last_beat_start_time
+    start_step = int(np.searchsorted(timestamps, last_beat_start_time - 1e-10))
+    if rank == 0:
+        logger.info(f"--last-beat: skipping to step {start_step}/{n_steps} "
+                    f"(t={timestamps[start_step]:.4f}s, last beat of {timestamps[-1]/cycle_length:.0f})")
+
+for i in range(start_step, n_steps):
     t = timestamps[i]
 
     # 1. Load displacement from checkpoint into problem.u
@@ -425,7 +639,7 @@ for i in range(n_steps):
     # Note: do NOT call update_state() before compute_regional_metrics at step 0.
     # That would set has_previous_state=True, causing V_LV_FEM (and other init keys)
     # to be skipped — resulting in 799 vs 800 length mismatch.
-    skip_work = (i == 0)
+    skip_work = (i == start_step)
 
     region_metrics = metrics_calc.compute_regional_metrics(
         timestep_idx=i, t=t,
@@ -438,8 +652,8 @@ for i in range(n_steps):
     region_metrics.update(current_state)
     region_metrics["Ta_Solver"] = float(np.max(Ta_history[i]))
 
-    # Store
-    metrics_calc.store_metrics(region_metrics, i, t, downsample_factor=1)
+    # Store using relative index so arrays start at 0
+    metrics_calc.store_metrics(region_metrics, i - start_step, t, downsample_factor=1)
     metrics_calc.update_state()
 
     # Progress

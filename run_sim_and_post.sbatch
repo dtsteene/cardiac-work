@@ -149,6 +149,39 @@ export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 export MPICH_HYDRA_LAUNCHER=fork
 
+# --- 6b. Safety check: verify circulation library has kE (nonlinear EDPVR) support ---
+# The JSONs in data/ukb_circ_v2/ contain kE parameters. If the installed
+# circulation library silently ignores them, we get wrong hemodynamics.
+# Fail fast rather than running a bad sim for hours.
+CIRC_CHECK=$($CONDA_PREFIX/bin/python -c "
+import sys
+try:
+    import circulation, inspect
+    from circulation.regazzoni2020 import Regazzoni2020
+    src = inspect.getsource(inspect.getmodule(Regazzoni2020))
+    has_kE = '_kE_LV' in src
+    has_nonlin = '(EB / kE) * (np.exp(kE' in src
+    loc = circulation.__file__
+    if has_kE and has_nonlin:
+        print(f'OK {loc}')
+    else:
+        print(f'MISSING_KE {loc} (kE_store={has_kE}, nonlin={has_nonlin})')
+        sys.exit(2)
+except Exception as e:
+    print(f'IMPORT_ERROR {e}')
+    sys.exit(3)
+")
+CIRC_STATUS=$?
+if [ $CIRC_STATUS -ne 0 ]; then
+    echo "FATAL: Circulation library check failed"
+    echo "  $CIRC_CHECK"
+    echo "  The installed circulation library does NOT have kE nonlinear EDPVR support."
+    echo "  Run: pip install -e /home/dtsteene/D1/circulation"
+    echo "  Refusing to run simulation — would produce wrong hemodynamics."
+    exit 1
+fi
+echo "Circulation lib check: $CIRC_CHECK"
+
 # --- 7. Execution ---
 cd ${WORK_DIR}
 echo "Running Simulation..."
@@ -158,51 +191,63 @@ echo "  Params:    ${CIRCULATION_PARAMS:-'Default (Internal)'}"
 echo "  Restart:   ${RESTART_FROM:-'None (fresh run)'}"
 echo "  Save Dir:  $RESULTS_DIR"
 
+# Trap EXIT so data transfer happens even on SIGTERM/timeout.
+# SLURM sends SIGTERM → 30s grace → SIGKILL. This trap runs on SIGTERM,
+# giving us time to copy results before SIGKILL arrives.
+transfer_and_cleanup() {
+    echo "--- Transferring data from scratch to results dir ---"
+    if [ -d "${WORK_DIR}" ]; then
+        cd ${WORK_DIR}
+        RESULTS_WORK=$(find . -maxdepth 1 -type d -name "results_*" | grep -v "geometry" | head -1)
+        if [ -d "$RESULTS_WORK" ]; then
+            cp -r "$RESULTS_WORK"/* ${RESULTS_DIR}/ 2>/dev/null || true
+            echo "Data saved to ${RESULTS_DIR}/"
+        else
+            echo "WARNING: No results directory found in scratch."
+        fi
+    else
+        echo "WARNING: Work directory ${WORK_DIR} not found (already cleaned?)."
+    fi
+    # Copy slurm logs
+    cp "${SIM_DIR}/slurm-${SLURM_JOB_ID}.out" ${RESULTS_DIR}/simulation.log 2>/dev/null
+    cp "${SIM_DIR}/slurm-${SLURM_JOB_ID}.err" ${RESULTS_DIR}/simulation.err 2>/dev/null
+    cp "${SIM_DIR}/slurm-${SLURM_JOB_ID}.out" ${LOG_FILE} 2>/dev/null
+    cp "${SIM_DIR}/slurm-${SLURM_JOB_ID}.err" ${ERR_FILE} 2>/dev/null
+    # Cleanup scratch AFTER transfer
+    rm -rf ${WORK_DIR} 2>/dev/null
+    echo "Scratch cleaned."
+}
+trap transfer_and_cleanup EXIT
+
 time $CONDA_PREFIX/bin/mpirun -n ${SLURM_NTASKS} -launcher fork $CONDA_PREFIX/bin/python ${SIM_DIR}/complete_cycle.py $BPM $ARGS_STR
 SIM_EXIT=$?
 
 if [ $SIM_EXIT -ne 0 ]; then
-    echo "SIMULATION FAILED (exit code $SIM_EXIT) — skipping post-processing"
-    rm -rf ${WORK_DIR}
-    exit $SIM_EXIT
+    echo "SIMULATION FAILED (exit code $SIM_EXIT) — data will still be transferred"
 fi
 
-echo "Simulation completed"
+echo "Simulation completed (exit code $SIM_EXIT)"
 
-# --- 8. Data Transfer ---
-echo "Transferring data..."
-RESULTS_WORK=$(find . -maxdepth 1 -type d -name "results_*" | grep -v "geometry" | head -1)
+# --- 8. Transfer data FIRST, then post-process ---
+# Must transfer before post-processing check, otherwise RESULTS_DIR is empty.
+# The EXIT trap is the safety net for timeouts/crashes; this is the normal path.
+transfer_and_cleanup
 
-if [ -d "$RESULTS_WORK" ]; then
-    cp -r "$RESULTS_WORK"/* ${RESULTS_DIR}/ 2>/dev/null || true
-    echo "Data saved to ${RESULTS_DIR}/"
-else
-    echo "CRITICAL WARNING: No results found in work folder."
+if [ $SIM_EXIT -eq 0 ]; then
+    echo "Running Offline Metrics Computation..."
+    cd ${RESULTS_DIR}
+
+    if [ -f "simulation_params.json" ] && [ -d "solver/checkpoint.bp" ]; then
+        $CONDA_PREFIX/bin/mpirun -n ${SLURM_NTASKS} -launcher fork $CONDA_PREFIX/bin/python ${SIM_DIR}/postprocess_metrics.py .
+        echo "Metrics computed"
+
+        python3 ${SIM_DIR}/run_postprocessing.py .
+        echo "Analysis complete"
+    else
+        echo "Skipping post-processing (missing checkpoint data)."
+    fi
 fi
 
-# --- 9. Post-Processing ---
-echo "Running Offline Metrics Computation..."
-cd ${RESULTS_DIR}
-
-if [ -f "simulation_params.json" ] && [ -d "solver/checkpoint.bp" ]; then
-    $CONDA_PREFIX/bin/mpirun -n ${SLURM_NTASKS} -launcher fork $CONDA_PREFIX/bin/python ${SIM_DIR}/postprocess_metrics.py .
-    echo "Metrics computed"
-
-    python3 ${SIM_DIR}/run_postprocessing.py .
-    echo "Analysis complete"
-else
-    echo "Skipping post-processing (missing checkpoint data)."
-fi
-
-# Copy slurm logs inside the results folder for easy access
-SLURM_OUT="${SIM_DIR}/slurm-${SLURM_JOB_ID}.out"
-SLURM_ERR="${SIM_DIR}/slurm-${SLURM_JOB_ID}.err"
-cp ${SLURM_OUT} ${RESULTS_DIR}/simulation.log 2>/dev/null
-cp ${SLURM_ERR} ${RESULTS_DIR}/simulation.err 2>/dev/null
-# Also copy to log dir
-cp ${SLURM_OUT} ${LOG_FILE} 2>/dev/null
-cp ${SLURM_ERR} ${ERR_FILE} 2>/dev/null
-
-rm -rf ${WORK_DIR}
+# Cleanup and data transfer handled by the EXIT trap (transfer_and_cleanup)
 echo "--- Job Finished ---"
 date
