@@ -345,38 +345,42 @@ class MetricsCalculator:
                 compile_regional(mag(self.sigma_passive), "sigma_mag_passive")
                 compile_regional(mag(self.sigma_comp), "sigma_mag_comp")
 
-        # --- Work forms (per region) ---
-        dE = self.E_cur - self.E_prev
-        wd_total = 0.5 * ufl.inner(self.S_tot_ufl + self.S_prev, dE)
-        wd_active = 0.5 * ufl.inner(self.S_act_ufl + self.S_active_prev, dE)
-        wd_passive = 0.5 * ufl.inner(self.S_pas_ufl + self.S_passive_prev, dE)
-        wd_comp = 0.5 * ufl.inner(self.S_cmp_ufl + self.S_comp_prev, dE)
+        # --- Work forms (per region) — gated by enable_regional_internal ---
+        # compute_per_cell.py is now the canonical source for these integrals.
+        # Skipping both form compilation AND per-timestep assembly saves
+        # 30+ form JITs and the matching assemble_scalar calls.
+        if self.enable_regional_internal:
+            dE = self.E_cur - self.E_prev
+            wd_total = 0.5 * ufl.inner(self.S_tot_ufl + self.S_prev, dE)
+            wd_active = 0.5 * ufl.inner(self.S_act_ufl + self.S_active_prev, dE)
+            wd_passive = 0.5 * ufl.inner(self.S_pas_ufl + self.S_passive_prev, dE)
+            wd_comp = 0.5 * ufl.inner(self.S_cmp_ufl + self.S_comp_prev, dE)
 
-        wd_fiber = 0.5 * (proj(self.S_tot_ufl, f0) + proj(self.S_prev, f0)) * proj(dE, f0)
-        wd_sheet = 0.5 * (proj(self.S_tot_ufl, s0) + proj(self.S_prev, s0)) * proj(dE, s0)
-        wd_normal = 0.5 * (proj(self.S_tot_ufl, n0) + proj(self.S_prev, n0)) * proj(dE, n0)
-        wd_shear = wd_total - (wd_fiber + wd_sheet + wd_normal)
-        wd_passive_fiber = 0.5 * (proj(self.S_pas_ufl, f0) + proj(self.S_passive_prev, f0)) * proj(dE, f0)
+            wd_fiber = 0.5 * (proj(self.S_tot_ufl, f0) + proj(self.S_prev, f0)) * proj(dE, f0)
+            wd_sheet = 0.5 * (proj(self.S_tot_ufl, s0) + proj(self.S_prev, s0)) * proj(dE, s0)
+            wd_normal = 0.5 * (proj(self.S_tot_ufl, n0) + proj(self.S_prev, n0)) * proj(dE, n0)
+            wd_shear = wd_total - (wd_fiber + wd_sheet + wd_normal)
+            wd_passive_fiber = 0.5 * (proj(self.S_pas_ufl, f0) + proj(self.S_passive_prev, f0)) * proj(dE, f0)
 
-        for region_name, cell_tags, region_markers in regions:
-            dx_sub = ufl.Measure("dx", domain=self.mesh, subdomain_data=cell_tags,
-                                 metadata={"quadrature_degree": self.quadrature_degree})
+            for region_name, cell_tags, region_markers in regions:
+                dx_sub = ufl.Measure("dx", domain=self.mesh, subdomain_data=cell_tags,
+                                     metadata={"quadrature_degree": self.quadrature_degree})
 
-            def compile_regional_work(expr, name):
-                forms = []
-                for m in region_markers:
-                    forms.append(dolfinx.fem.form(expr * dx_sub(int(m))))
-                self._compiled_forms[f"{name}_{region_name}"] = forms
+                def compile_regional_work(expr, name):
+                    forms = []
+                    for m in region_markers:
+                        forms.append(dolfinx.fem.form(expr * dx_sub(int(m))))
+                    self._compiled_forms[f"{name}_{region_name}"] = forms
 
-            compile_regional_work(wd_total, "wd_total")
-            compile_regional_work(wd_active, "wd_active")
-            compile_regional_work(wd_passive, "wd_passive")
-            compile_regional_work(wd_comp, "wd_comp")
-            compile_regional_work(wd_fiber, "wd_fiber")
-            compile_regional_work(wd_sheet, "wd_sheet")
-            compile_regional_work(wd_normal, "wd_normal")
-            compile_regional_work(wd_shear, "wd_shear")
-            compile_regional_work(wd_passive_fiber, "wd_passive_fiber")
+                compile_regional_work(wd_total, "wd_total")
+                compile_regional_work(wd_active, "wd_active")
+                compile_regional_work(wd_passive, "wd_passive")
+                compile_regional_work(wd_comp, "wd_comp")
+                compile_regional_work(wd_fiber, "wd_fiber")
+                compile_regional_work(wd_sheet, "wd_sheet")
+                compile_regional_work(wd_normal, "wd_normal")
+                compile_regional_work(wd_shear, "wd_shear")
+                compile_regional_work(wd_passive_fiber, "wd_passive_fiber")
 
         # --- Robin work forms ---
         N = ufl.FacetNormal(self.mesh)
@@ -595,7 +599,14 @@ class MetricsCalculator:
     def _calculate_incremental_work(self):
         """
         Calculates Work Densities (S : dE) using Trapezoidal Rule (0.5 * (S_new + S_old) : dE).
+
+        Gated by enable_regional_internal. When disabled, returns an empty
+        dict because compute_per_cell.py is the canonical source for these
+        quantities.
         """
+        if not self.enable_regional_internal:
+            return {}
+
         # S_passive and S_comp are already interpolated by _calculate_state_variables()
         # which is always called before this method.
 
@@ -882,12 +893,15 @@ class MetricsCalculator:
             # Safer approach: Manually define the expected keys based on regions.
             region_suffixes = [r[0] for r in self._get_regions_to_integrate()]
 
-            # Mechanics keys
-            prefixes = ["work_true", "work_active", "work_passive", "work_comp",
-                        "work_ff", "work_ss", "work_nn", "work_cross", "work_passive_ff"]
-            for r in region_suffixes:
-                for p in prefixes:
-                    metrics[f"{p}_{r}"] = 0.0
+            # Regional internal work keys — only reserved when the gate is on.
+            # When disabled, downstream consumers should read per-cell work
+            # from compute_per_cell.py's NPZ instead.
+            if self.enable_regional_internal:
+                prefixes = ["work_true", "work_active", "work_passive", "work_comp",
+                            "work_ff", "work_ss", "work_nn", "work_cross", "work_passive_ff"]
+                for r in region_suffixes:
+                    for p in prefixes:
+                        metrics[f"{p}_{r}"] = 0.0
 
             # Robin keys
             metrics["work_robin_epi"] = 0.0
