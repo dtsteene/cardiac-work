@@ -26,6 +26,11 @@ ONE_SIDED_ROBIN=${ONE_SIDED_ROBIN:-0}
 COMMENT=${COMMENT:-"No description provided"}
 GEOMETRY_DIR=${GEOMETRY_DIR:-""}
 RESTART_FROM=${RESTART_FROM:-""}
+# Canonical atlas geometry_fields.npz for compute_per_cell.py. When set,
+# per-cell tags are propagated from the shared atlas, giving identical cell
+# labels across every case in a spectrum. Leave empty to use per-case
+# tag-at-ED mode (anatomically meaningful but case-specific).
+GEOMETRY_FIELDS=${GEOMETRY_FIELDS:-""}
 
 # --- 2. Paths & Environment ---
 SIM_DIR="/home/dtsteene/D1/cardiac-work"
@@ -238,7 +243,35 @@ if [ $SIM_EXIT -eq 0 ]; then
     cd ${RESULTS_DIR}
 
     if [ -f "simulation_params.json" ] && [ -d "solver/checkpoint.bp" ]; then
-        $CONDA_PREFIX/bin/mpirun -n ${SLURM_NTASKS} -launcher fork $CONDA_PREFIX/bin/python ${SIM_DIR}/postprocess_metrics.py .
+        # --- A. CANONICAL regional work: compute_per_cell.py ---
+        # Replays the last beat and writes per_cell_data.npz with per-cell
+        # work density, transventricular coordinate, and region masks. This
+        # is the canonical source for all regional internal work downstream.
+        PER_CELL_ARGS="."
+        if [ -n "$GEOMETRY_FIELDS" ] && [ -f "$GEOMETRY_FIELDS" ]; then
+            echo "  Using canonical atlas geometry fields: $GEOMETRY_FIELDS"
+            PER_CELL_ARGS="$PER_CELL_ARGS --geometry-fields $GEOMETRY_FIELDS"
+        else
+            echo "  Using per-case tag-at-ED mode (no canonical atlas NPZ provided)"
+        fi
+        echo "Running compute_per_cell.py ..."
+        $CONDA_PREFIX/bin/mpirun -n ${SLURM_NTASKS} -launcher fork \
+            $CONDA_PREFIX/bin/python ${SIM_DIR}/compute_per_cell.py $PER_CELL_ARGS
+        PER_CELL_EXIT=$?
+        if [ $PER_CELL_EXIT -ne 0 ]; then
+            echo "WARNING: compute_per_cell.py exited with code $PER_CELL_EXIT"
+        else
+            echo "Per-cell work computed"
+        fi
+
+        # --- B. Boundary + loops: slim postprocess_metrics.py ---
+        # With the 2026-04-13 refactor, default flags skip the regional
+        # internal work and directional decomposition paths (compute_per_cell
+        # owns them). This call produces boundary work, Robin work, PV/PS/SS
+        # loop time-series, and the energy balance diagnostic only.
+        echo "Running postprocess_metrics.py (slim mode)..."
+        $CONDA_PREFIX/bin/mpirun -n ${SLURM_NTASKS} -launcher fork \
+            $CONDA_PREFIX/bin/python ${SIM_DIR}/postprocess_metrics.py .
         echo "Metrics computed"
 
         python3 ${SIM_DIR}/run_postprocessing.py .
