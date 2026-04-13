@@ -1,3 +1,36 @@
+"""
+metrics_calculator.py — FEM-level metric integration for the offline postprocessor.
+
+As of the 2026-04-13 refactor this module is organized into three buckets.
+Only the first is computed by default.
+
+    A. BOUNDARY + LOOPS (ALWAYS ON)
+       Boundary work via Nanson's formula on the LV/RV cavity surfaces,
+       Robin epi/base work, PV/PS/SS loop time-series (mean_E_ff, mean_S_ff,
+       mean_E_ll, mean_S_ll per LDRB region), energy balance diagnostics.
+       compute_per_cell.py does NOT produce these, so they stay here.
+
+    B. REGIONAL INTERNAL WORK  (gated by enable_regional_internal, default OFF)
+       Per-region S:dE totals and their active/passive/comp breakdown with
+       ff/ss/nn/cross directional decomposition. compute_per_cell.py is now
+       the canonical source for these quantities.
+
+    C. RESEARCH METRICS  (gated by enable_research, default OFF — reserved)
+       Fiber efficiency, dyssynchrony, work redistribution, and other
+       non-canonical research diagnostics. These currently live downstream
+       in compare_cases.py / eval_proxies.py. The flag is a stable entry
+       point for future migrations: new research metrics added to this
+       file should be gated by self.enable_research.
+
+In addition, enable_decomp gates the directional decomposition of mean
+state variables (mean_S/E_ss/nn and the full Cauchy-stress decomposition)
+which is distinct from regional internal work but equally expensive.
+
+The three flags are independent; enable_decomp can be on while
+enable_regional_internal is off (or vice-versa), though the production
+path is all three off.
+"""
+
 import numpy as np
 import csv
 from pathlib import Path
