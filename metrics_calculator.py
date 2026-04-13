@@ -262,49 +262,55 @@ class MetricsCalculator:
                     forms.append(dolfinx.fem.form(expr * dx_sub(int(m))))
                 self._compiled_forms[f"{name}_{region_name}"] = forms
 
-            # Volume
+            # Volume — always needed (PS loop denominators, boundary checks)
             compile_regional(one, "vol")
 
-            # Reference stresses/strains (2nd PK / Green-Lagrange)
+            # PS-loop essentials — ALWAYS compiled (boundary/loops bucket).
+            # mean_E_ff / mean_S_ff / (mean_E_ll / mean_S_ll when l0 exists)
+            # drive the pressure-strain loop time-series.
             compile_regional(proj(self.S_total, f0), "S_ff")
-            compile_regional(proj(self.S_total, s0), "S_ss")
-            compile_regional(proj(self.S_total, n0), "S_nn")
             compile_regional(proj(self.E_cur, f0), "E_ff")
-            compile_regional(proj(self.E_cur, s0), "E_ss")
-            compile_regional(proj(self.E_cur, n0), "E_nn")
-
-            # Longitudinal
             if l0 is not None:
                 compile_regional(proj(self.S_total, l0), "S_ll")
                 compile_regional(proj(self.E_cur, l0), "E_ll")
 
-            # Cauchy stresses - total
-            compile_regional(proj(self.sigma_total, f_cur), "sigma_ff")
-            compile_regional(proj(self.sigma_total, s_cur), "sigma_ss")
-            compile_regional(proj(self.sigma_total, n_cur), "sigma_nn")
-            if l_cur is not None:
-                compile_regional(proj(self.sigma_total, l_cur), "sigma_ll")
+            # Directional decomposition of state variables — gated.
+            # Everything below this point is ss/nn projections and Cauchy
+            # stress decomposition used for research diagnostics, not for
+            # any canonical energy balance or clinical proxy.
+            if self.enable_decomp:
+                compile_regional(proj(self.S_total, s0), "S_ss")
+                compile_regional(proj(self.S_total, n0), "S_nn")
+                compile_regional(proj(self.E_cur, s0), "E_ss")
+                compile_regional(proj(self.E_cur, n0), "E_nn")
 
-            # Cauchy - active
-            compile_regional(proj(self.sigma_active, f_cur), "sigma_ff_active")
-            compile_regional(proj(self.sigma_active, s_cur), "sigma_ss_active")
-            compile_regional(proj(self.sigma_active, n_cur), "sigma_nn_active")
+                # Cauchy stresses - total
+                compile_regional(proj(self.sigma_total, f_cur), "sigma_ff")
+                compile_regional(proj(self.sigma_total, s_cur), "sigma_ss")
+                compile_regional(proj(self.sigma_total, n_cur), "sigma_nn")
+                if l_cur is not None:
+                    compile_regional(proj(self.sigma_total, l_cur), "sigma_ll")
 
-            # Cauchy - passive
-            compile_regional(proj(self.sigma_passive, f_cur), "sigma_ff_passive")
-            compile_regional(proj(self.sigma_passive, s_cur), "sigma_ss_passive")
-            compile_regional(proj(self.sigma_passive, n_cur), "sigma_nn_passive")
+                # Cauchy - active
+                compile_regional(proj(self.sigma_active, f_cur), "sigma_ff_active")
+                compile_regional(proj(self.sigma_active, s_cur), "sigma_ss_active")
+                compile_regional(proj(self.sigma_active, n_cur), "sigma_nn_active")
 
-            # Cauchy - comp
-            compile_regional(proj(self.sigma_comp, f_cur), "sigma_ff_comp")
-            compile_regional(proj(self.sigma_comp, s_cur), "sigma_ss_comp")
-            compile_regional(proj(self.sigma_comp, n_cur), "sigma_nn_comp")
+                # Cauchy - passive
+                compile_regional(proj(self.sigma_passive, f_cur), "sigma_ff_passive")
+                compile_regional(proj(self.sigma_passive, s_cur), "sigma_ss_passive")
+                compile_regional(proj(self.sigma_passive, n_cur), "sigma_nn_passive")
 
-            # Cauchy magnitudes
-            compile_regional(mag(self.sigma_total), "sigma_mag")
-            compile_regional(mag(self.sigma_active), "sigma_mag_active")
-            compile_regional(mag(self.sigma_passive), "sigma_mag_passive")
-            compile_regional(mag(self.sigma_comp), "sigma_mag_comp")
+                # Cauchy - comp
+                compile_regional(proj(self.sigma_comp, f_cur), "sigma_ff_comp")
+                compile_regional(proj(self.sigma_comp, s_cur), "sigma_ss_comp")
+                compile_regional(proj(self.sigma_comp, n_cur), "sigma_nn_comp")
+
+                # Cauchy magnitudes
+                compile_regional(mag(self.sigma_total), "sigma_mag")
+                compile_regional(mag(self.sigma_active), "sigma_mag_active")
+                compile_regional(mag(self.sigma_passive), "sigma_mag_passive")
+                compile_regional(mag(self.sigma_comp), "sigma_mag_comp")
 
         # --- Work forms (per region) ---
         dE = self.E_cur - self.E_prev
@@ -466,16 +472,27 @@ class MetricsCalculator:
         Uses pre-compiled forms for fast assembly.
         """
         # --- A. Interpolate Physics ---
+        # E_cur and S_total are needed by every path (PS loops, boundary work
+        # via shared _u_prev, regional work).
         self.E_cur.interpolate(self.expr_E)
         self.S_total.interpolate(self.expr_S_total)
-        self.S_active.interpolate(self.expr_S_active)
-        self.S_passive.interpolate(self.expr_S_passive)
-        self.S_comp.interpolate(self.expr_S_comp)
 
-        self.sigma_total.interpolate(self.expr_sigma_total)
-        self.sigma_active.interpolate(self.expr_sigma_active)
-        self.sigma_passive.interpolate(self.expr_sigma_passive)
-        self.sigma_comp.interpolate(self.expr_sigma_comp)
+        # S_active / S_passive / S_comp are needed by _calculate_incremental_work
+        # (regional internal work). Cauchy stresses are only needed by the
+        # directional decomposition of state variables.
+        if self.enable_regional_internal:
+            self.S_active.interpolate(self.expr_S_active)
+            self.S_passive.interpolate(self.expr_S_passive)
+            self.S_comp.interpolate(self.expr_S_comp)
+
+        if self.enable_decomp:
+            # Cauchy push-forwards: only used by mean_sigma_* assemble below.
+            # Interpolating these tensor functions is expensive; skip entirely
+            # when the decomp forms do not exist.
+            self.sigma_total.interpolate(self.expr_sigma_total)
+            self.sigma_active.interpolate(self.expr_sigma_active)
+            self.sigma_passive.interpolate(self.expr_sigma_passive)
+            self.sigma_comp.interpolate(self.expr_sigma_comp)
 
         # --- B. Integration using pre-compiled forms ---
         data = {}
@@ -493,46 +510,52 @@ class MetricsCalculator:
             vol = self._assemble_compiled(f"vol_{region_name}")
 
             if vol > 1e-12:
+                # PS-loop essentials — always computed.
                 data[f"mean_S_ff_{region_name}"] = self._assemble_compiled(f"S_ff_{region_name}") / vol
-                data[f"mean_S_ss_{region_name}"] = self._assemble_compiled(f"S_ss_{region_name}") / vol
-                data[f"mean_S_nn_{region_name}"] = self._assemble_compiled(f"S_nn_{region_name}") / vol
                 data[f"mean_E_ff_{region_name}"] = self._assemble_compiled(f"E_ff_{region_name}") / vol
-                data[f"mean_E_ss_{region_name}"] = self._assemble_compiled(f"E_ss_{region_name}") / vol
-                data[f"mean_E_nn_{region_name}"] = self._assemble_compiled(f"E_nn_{region_name}") / vol
-
                 if l0_available:
                     data[f"mean_S_ll_{region_name}"] = self._assemble_compiled(f"S_ll_{region_name}") / vol
                     data[f"mean_E_ll_{region_name}"] = self._assemble_compiled(f"E_ll_{region_name}") / vol
 
-                data[f"mean_sigma_ff_{region_name}"] = self._assemble_compiled(f"sigma_ff_{region_name}") / vol
-                data[f"mean_sigma_ss_{region_name}"] = self._assemble_compiled(f"sigma_ss_{region_name}") / vol
-                data[f"mean_sigma_nn_{region_name}"] = self._assemble_compiled(f"sigma_nn_{region_name}") / vol
-                if l0_available:
-                    data[f"mean_sigma_ll_{region_name}"] = self._assemble_compiled(f"sigma_ll_{region_name}") / vol
+                # Directional decomposition — gated. Skip assembly AND
+                # dict entries so consumers that rely on presence know the
+                # flag is off.
+                if self.enable_decomp:
+                    data[f"mean_S_ss_{region_name}"] = self._assemble_compiled(f"S_ss_{region_name}") / vol
+                    data[f"mean_S_nn_{region_name}"] = self._assemble_compiled(f"S_nn_{region_name}") / vol
+                    data[f"mean_E_ss_{region_name}"] = self._assemble_compiled(f"E_ss_{region_name}") / vol
+                    data[f"mean_E_nn_{region_name}"] = self._assemble_compiled(f"E_nn_{region_name}") / vol
 
-                data[f"mean_sigma_ff_active_{region_name}"] = self._assemble_compiled(f"sigma_ff_active_{region_name}") / vol
-                data[f"mean_sigma_ss_active_{region_name}"] = self._assemble_compiled(f"sigma_ss_active_{region_name}") / vol
-                data[f"mean_sigma_nn_active_{region_name}"] = self._assemble_compiled(f"sigma_nn_active_{region_name}") / vol
+                    data[f"mean_sigma_ff_{region_name}"] = self._assemble_compiled(f"sigma_ff_{region_name}") / vol
+                    data[f"mean_sigma_ss_{region_name}"] = self._assemble_compiled(f"sigma_ss_{region_name}") / vol
+                    data[f"mean_sigma_nn_{region_name}"] = self._assemble_compiled(f"sigma_nn_{region_name}") / vol
+                    if l0_available:
+                        data[f"mean_sigma_ll_{region_name}"] = self._assemble_compiled(f"sigma_ll_{region_name}") / vol
 
-                data[f"mean_sigma_ff_passive_{region_name}"] = self._assemble_compiled(f"sigma_ff_passive_{region_name}") / vol
-                data[f"mean_sigma_ss_passive_{region_name}"] = self._assemble_compiled(f"sigma_ss_passive_{region_name}") / vol
-                data[f"mean_sigma_nn_passive_{region_name}"] = self._assemble_compiled(f"sigma_nn_passive_{region_name}") / vol
+                    data[f"mean_sigma_ff_active_{region_name}"] = self._assemble_compiled(f"sigma_ff_active_{region_name}") / vol
+                    data[f"mean_sigma_ss_active_{region_name}"] = self._assemble_compiled(f"sigma_ss_active_{region_name}") / vol
+                    data[f"mean_sigma_nn_active_{region_name}"] = self._assemble_compiled(f"sigma_nn_active_{region_name}") / vol
 
-                data[f"mean_sigma_ff_comp_{region_name}"] = self._assemble_compiled(f"sigma_ff_comp_{region_name}") / vol
-                data[f"mean_sigma_ss_comp_{region_name}"] = self._assemble_compiled(f"sigma_ss_comp_{region_name}") / vol
-                data[f"mean_sigma_nn_comp_{region_name}"] = self._assemble_compiled(f"sigma_nn_comp_{region_name}") / vol
+                    data[f"mean_sigma_ff_passive_{region_name}"] = self._assemble_compiled(f"sigma_ff_passive_{region_name}") / vol
+                    data[f"mean_sigma_ss_passive_{region_name}"] = self._assemble_compiled(f"sigma_ss_passive_{region_name}") / vol
+                    data[f"mean_sigma_nn_passive_{region_name}"] = self._assemble_compiled(f"sigma_nn_passive_{region_name}") / vol
 
-                data[f"mean_sigma_mag_{region_name}"] = self._assemble_compiled(f"sigma_mag_{region_name}") / vol
-                data[f"mean_sigma_mag_active_{region_name}"] = self._assemble_compiled(f"sigma_mag_active_{region_name}") / vol
-                data[f"mean_sigma_mag_passive_{region_name}"] = self._assemble_compiled(f"sigma_mag_passive_{region_name}") / vol
-                data[f"mean_sigma_mag_comp_{region_name}"] = self._assemble_compiled(f"sigma_mag_comp_{region_name}") / vol
+                    data[f"mean_sigma_ff_comp_{region_name}"] = self._assemble_compiled(f"sigma_ff_comp_{region_name}") / vol
+                    data[f"mean_sigma_ss_comp_{region_name}"] = self._assemble_compiled(f"sigma_ss_comp_{region_name}") / vol
+                    data[f"mean_sigma_nn_comp_{region_name}"] = self._assemble_compiled(f"sigma_nn_comp_{region_name}") / vol
+
+                    data[f"mean_sigma_mag_{region_name}"] = self._assemble_compiled(f"sigma_mag_{region_name}") / vol
+                    data[f"mean_sigma_mag_active_{region_name}"] = self._assemble_compiled(f"sigma_mag_active_{region_name}") / vol
+                    data[f"mean_sigma_mag_passive_{region_name}"] = self._assemble_compiled(f"sigma_mag_passive_{region_name}") / vol
+                    data[f"mean_sigma_mag_comp_{region_name}"] = self._assemble_compiled(f"sigma_mag_comp_{region_name}") / vol
             else:
                 data[f"mean_S_ff_{region_name}"] = 0.0
-                data[f"mean_S_ss_{region_name}"] = 0.0
-                data[f"mean_S_nn_{region_name}"] = 0.0
                 data[f"mean_E_ff_{region_name}"] = 0.0
-                data[f"mean_E_ss_{region_name}"] = 0.0
-                data[f"mean_E_nn_{region_name}"] = 0.0
+                if self.enable_decomp:
+                    data[f"mean_S_ss_{region_name}"] = 0.0
+                    data[f"mean_S_nn_{region_name}"] = 0.0
+                    data[f"mean_E_ss_{region_name}"] = 0.0
+                    data[f"mean_E_nn_{region_name}"] = 0.0
 
         return data
 
