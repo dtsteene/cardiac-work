@@ -544,7 +544,9 @@ ratio_RV = sim_params["ratio_RV"]
 
 # Load solver cavity pressures if available (exact Lagrange multiplier — much more
 # accurate than 0D model pressures for boundary work computation)
-solver_pressure_path = solver_dir / "pressure_history.npy"
+solver_pressure_path = solver_dir / "solver_cavity_pressure_mmHg.npy"
+if not solver_pressure_path.exists():
+    solver_pressure_path = solver_dir / "pressure_history.npy"  # backwards compat
 solver_pressures = None
 if solver_pressure_path.exists():
     solver_pressures = np.load(solver_pressure_path)  # [N, 2] = [p_LV_mmHg, p_RV_mmHg]

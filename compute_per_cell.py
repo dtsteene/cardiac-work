@@ -52,19 +52,53 @@ _parser = argparse.ArgumentParser(description="Per-cell work from checkpoint.")
 _parser.add_argument("results_dir", type=Path)
 _parser.add_argument("--retag-septum", action="store_true", default=False)
 _parser.add_argument("--geometry-fields", type=Path, default=None,
-                     help="Path to precomputed geometry_fields.npz (from "
-                          "precompute_geometry_fields.py). If provided, tau/distances/"
-                          "envelope/entry_t are loaded from this file instead of "
-                          "recomputed — guaranteeing identical values across all cases "
-                          "that share the same mesh.")
+                     help="CANONICAL atlas mode: load canonical septum tags from "
+                          "a precomputed geometry_fields.npz (produced by "
+                          "precompute_geometry_fields.py on the shared geometry.bp). "
+                          "Tags are propagated to this case via the u_pre permutation. "
+                          "Gives identical cell labels across all cases in a spectrum. "
+                          "RECOMMENDED for sweep analyses. Mutually exclusive with "
+                          "--tag-at-unloaded.")
+_parser.add_argument("--tag-at-unloaded", action="store_true",
+                     help="LEGACY mode: compute septum tags on this case's unloaded "
+                          "stress-free reference mesh (checkpoint mesh at u=0). This "
+                          "is anatomically meaningless — the unloaded state never "
+                          "occurs in vivo. Kept only for reproducibility of old runs. "
+                          "See session update 2026-04-13 in transmural_work_profiles.md.")
 _parser.add_argument("--d-sum-max-mm", type=float, default=22.0,
-                     help="Envelope upper bound on d_sum (mm). Only used if "
-                          "--geometry-fields is not provided.")
+                     help="Envelope upper bound on d_sum (mm).")
 _parser.add_argument("--d-sum-min-mm", type=float, default=4.0,
-                     help="Envelope lower bound on d_sum (mm).")
+                     help="Envelope lower bound on d_sum (mm). (Ignored — kept for "
+                          "argparse backwards compatibility. See session update.)")
 _parser.add_argument("--d-epi-min-mm", type=float, default=2.0,
-                     help="Envelope minimum d_epi (mm).")
+                     help="Envelope minimum d_epi (mm). (Ignored — kept for "
+                          "argparse backwards compatibility. See session update.)")
+_parser.add_argument("--beat", type=int, default=None,
+                     help="Replay a specific beat (0-indexed) instead of the last beat. "
+                          "Useful for per-beat convergence analysis. Output is written "
+                          "to per_cell_data_beat{N}.npz instead of per_cell_data.npz.")
+_parser.add_argument("--all-beats", action="store_true",
+                     help="Replay EVERY beat in the checkpoint and save one per_cell_data_beat{N}.npz "
+                          "per beat. Amortizes the mesh/fiber/form setup cost across all beats. "
+                          "Mutually exclusive with --beat.")
 _args = _parser.parse_args()
+
+if _args.beat is not None and _args.all_beats:
+    _parser.error("--beat and --all-beats are mutually exclusive")
+
+# Determine tagging mode. Default is tag-at-ED: compute distances on the case's
+# deformed mesh at the start of the last beat (≈ end-diastole, the clinically
+# relevant reference frame). This is case-specific but anatomically meaningful.
+#
+# Three modes total:
+#   --geometry-fields PATH  → canonical atlas (same cells for every case)
+#   (default, no flags)     → per-case at end-diastole (deformed mesh at t_start_last_beat)
+#   --tag-at-unloaded       → per-case at unloaded (legacy, not clinically meaningful)
+if _args.geometry_fields is not None and _args.tag_at_unloaded:
+    _parser.error("--geometry-fields and --tag-at-unloaded are mutually exclusive")
+_mode_canonical = _args.geometry_fields is not None
+_mode_unloaded = _args.tag_at_unloaded
+_mode_ed = not _mode_canonical and not _mode_unloaded
 
 results_dir = _args.results_dir.resolve()
 comm = MPI.COMM_WORLD
@@ -92,23 +126,20 @@ Ta_history = np.load(solver_dir / "Ta_solver_history.npy")
 if rank == 0:
     logger.info(f"Ta history: {Ta_history.shape}")
 
-# ── Load Circulation History ─────────────────────────────────────────────────
-circ_path = results_dir / "circulation" / "history.npy"
-circ_history = np.load(circ_path, allow_pickle=True).item()
+# ── Load Solver Cavity Pressure (Lagrange multiplier, mmHg) ─────────────────
+# This is the pressure actually applied as the FEM boundary condition at each
+# timestep. NOT the 0D ODE output (which leads by 1 step due to staggered
+# coupling). Shape: [n_steps, 2] with columns [LV, RV].
+solver_pres_path = solver_dir / "solver_cavity_pressure_mmHg.npy"
+if not solver_pres_path.exists():
+    # Backwards compat: old runs saved as pressure_history.npy
+    solver_pres_path = solver_dir / "pressure_history.npy"
+solver_cavity_pressure_mmHg = np.load(solver_pres_path)
+if rank == 0:
+    logger.info(f"Solver cavity pressure: {solver_cavity_pressure_mmHg.shape} from {solver_pres_path.name}")
 
-circ_time_arr = np.array(circ_history["time"])
 HR_Hz = sim_params["BPM"] / 60.0
 cycle_length = 1.0 / HR_Hz
-circ_duration = circ_time_arr[-1] - circ_time_arr[0]
-
-if circ_duration > cycle_length * 1.5:
-    last_beat_start = circ_time_arr[-1] - cycle_length
-    mask = circ_time_arr >= last_beat_start - 1e-10
-    for key in circ_history:
-        arr = np.array(circ_history[key])
-        if len(arr) == len(circ_time_arr):
-            circ_history[key] = arr[mask]
-    circ_history["time"] = np.array(circ_history["time"]) - last_beat_start
 
 # ── Load Mesh from Checkpoint ────────────────────────────────────────────────
 mesh = adios4dolfinx.read_mesh(checkpoint_path, comm)
@@ -339,8 +370,17 @@ form_deps_ll = dolfinx.fem.form(deps_ll * v_dg0 * dx_q) if deps_ll is not None e
 # Cell volume form (assemble once)
 form_vol = dolfinx.fem.form(dolfinx.fem.Constant(mesh, 1.0) * v_dg0 * dx_q)
 
+# ── Scalar cross-validation forms ───────────────────────────────────────────
+# These compute the same quantities as the DG0 forms above but via scalar
+# integration (assemble_scalar). At each timestep, we can verify that
+#   sum(assemble_vector(wd_total * v_dg0 * dx)) == assemble_scalar(wd_total * dx)
+# This is a machine-precision sanity check proving the DG0 test-function trick
+# is equivalent to direct integration. See validate_canonical_tagging TEST 6.
+form_w_total_scalar = dolfinx.fem.form(wd_total * dx_q)
+form_w_ff_scalar = dolfinx.fem.form(wd_fiber * dx_q)
+
 if rank == 0:
-    logger.info("Per-cell DG0 forms compiled")
+    logger.info("Per-cell DG0 forms compiled (with scalar cross-check forms)")
 
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 3: Tau + Study Region
@@ -383,6 +423,231 @@ epi_surf = _surface_coords_global(_epi_tags)
 
 centroids = dolfinx.mesh.compute_midpoints(mesh, 3, local_cells)
 
+# ── ED-deformation for tag-at-ED mode ────────────────────────────────────────
+# When the default mode (tag at end-diastole) is active, we shift the centroids
+# and surface vertex positions used for distance computation by u(t_ED), where
+# t_ED is the first timestep of the last beat. The FEM mesh object itself is
+# NOT modified — the deformation only affects the positions passed to pyvista's
+# distance queries. Work forms continue to compute on the Lagrangian reference
+# with u(t) as the deformation field, unaffected by this tag-time choice.
+#
+# We need:
+#   1. u at cell centroids  (for centroids_ED = centroids + u_at_centroids)
+#   2. u at mesh vertex positions  (for surface_ED = surface + u_at_vertices)
+#
+# Option (1) uses DG0 vector interpolation (same trick as canonical u_pre path).
+# Option (2) uses u.eval(points, cells) via the bounding box tree.
+if _mode_ed:
+    if rank == 0:
+        logger.info("Tag-at-ED mode: loading u at start of last beat")
+
+    # Figure out the target time (start of last beat ≈ ED by periodicity)
+    _timestamps = adios4dolfinx.read_timestamps(checkpoint_path, comm, "displacement")
+    _n_steps = len(_timestamps)
+    _steps_per_beat = int(round(cycle_length / sim_params["dt"]))
+    _start_step = max(0, _n_steps - _steps_per_beat)
+    _t_ED = float(_timestamps[_start_step])
+    if rank == 0:
+        logger.info(f"  ED time: {_t_ED:.4f} s (step {_start_step} of {_n_steps})")
+
+    # Load u at t_ED into a temporary Function (DOES NOT corrupt problem.u —
+    # the replay loop later re-loads at each timestep anyway)
+    _V_u = problem.u.function_space
+    _u_ED = dolfinx.fem.Function(_V_u)
+    adios4dolfinx.read_function(checkpoint_path, _u_ED, time=_t_ED, name="displacement")
+
+    # (1) u at cell centroids via DG0 vector interpolation
+    _V_DG0v = dolfinx.fem.functionspace(mesh, ("DG", 0, (3,)))
+    _u_ED_dg0 = dolfinx.fem.Function(_V_DG0v)
+    _u_ED_dg0.interpolate(_u_ED)
+    _u_at_centroids = _u_ED_dg0.x.array.reshape(-1, 3)[:n_local_cells]
+    centroids = centroids + _u_at_centroids  # ED-deformed centroid positions
+
+    # (2) u at mesh vertex positions via u.eval over the bounding-box tree.
+    # _surface_coords_global gave us a GLOBAL array of vertex coords — we need
+    # to add u(vertex) to each of these. Since all ranks allgather the surface
+    # coordinates before building the polydata, each rank can evaluate u on its
+    # OWN local vertices and contribute. Simpler approach: each rank evaluates
+    # u on the entire GLOBAL surface via the local bounding box tree, accepting
+    # that vertices outside the local partition will return NaN; we then reduce.
+    #
+    # Even simpler: deform the local mesh.geometry.x before surface extraction,
+    # so _surface_coords_global picks up the already-deformed positions. This is
+    # only safe if we DO NOT use mesh.geometry.x for any other purpose after.
+    # To keep the mesh intact, we instead save a copy and restore after surface
+    # extraction.
+    import dolfinx.geometry as _geo
+    _bb_tree = _geo.bb_tree(mesh, mesh.topology.dim)
+    _local_vertex_x = mesh.geometry.x.copy()  # save unloaded positions
+    _cands = _geo.compute_collisions_points(_bb_tree, _local_vertex_x)
+    _colls = _geo.compute_colliding_cells(mesh, _cands, _local_vertex_x)
+    # For each vertex, pick the first containing cell (there's always at least one)
+    _first_cells = np.array(
+        [_colls.links(i)[0] if len(_colls.links(i)) > 0 else -1
+         for i in range(len(_local_vertex_x))],
+        dtype=np.int32,
+    )
+    _valid_mask = _first_cells >= 0
+    _u_at_verts = np.zeros_like(_local_vertex_x)
+    if _valid_mask.any():
+        _u_at_verts[_valid_mask] = _u_ED.eval(
+            _local_vertex_x[_valid_mask], _first_cells[_valid_mask]
+        )
+
+    # Temporarily deform mesh.geometry.x to ED positions so surface extraction
+    # picks up the deformed vertex coordinates. Restored immediately after.
+    mesh.geometry.x[:] = _local_vertex_x + _u_at_verts
+    lv_surf = _surface_coords_global(_lv_tags)
+    rv_surf = _surface_coords_global(_rv_tags)
+    epi_surf = _surface_coords_global(_epi_tags)
+    mesh.geometry.x[:] = _local_vertex_x  # restore unloaded positions
+
+    if rank == 0:
+        max_disp = float(np.linalg.norm(_u_at_verts, axis=1).max())
+        logger.info(f"  Max vertex displacement at t_ED: {max_disp*1000:.2f} mm")
+        logger.info("  Centroids and surfaces deformed to ED for distance computation")
+        logger.info("  (mesh.geometry.x restored to unloaded state; FEM forms unaffected)")
+
+elif _mode_unloaded:
+    if rank == 0:
+        logger.warning("=" * 70)
+        logger.warning("LEGACY mode: tagging at unloaded reference (u=0).")
+        logger.warning("This is anatomically meaningless — the unloaded state never occurs")
+        logger.warning("in vivo. Kept only for reproducibility of old runs. Consider")
+        logger.warning("omitting the flag to use the default tag-at-ED mode instead.")
+        logger.warning("=" * 70)
+# If _mode_canonical, centroids and surfaces will be superseded by canonical
+# fields below. We keep centroids as computed so that if canonical loading
+# fails, we fall through to the per-case path.
+
+# ── Canonical anatomical tagging via u_pre permutation ──────────────────────
+# If --geometry-fields is provided, load canonical distances and tags from a
+# precomputed reference (computed on the zero-strain shared mesh, in cg cell
+# ordering). The cg → checkpoint cell permutation is found by:
+#   1. Load cg mesh via cardiac_geometries (same as geometry object)
+#   2. Read u_pre from this case's prestress_inverse.bp onto the cg mesh
+#      (written via write_function_on_input_mesh, so it round-trips cleanly)
+#   3. cg_centroids + u_pre ≈ checkpoint_centroids (to ~1 mm DG0 interp error)
+#   4. Nearest-neighbor match gives a bijection cg → ckpt
+#
+# Verified empirically on 8 spectrum cases: drift 0.3-1.1 mm (well below
+# inter-cell spacing ~3.5 mm), bijection holds on 6/8 cases and has at most
+# 1 duplicate on the other 2. Canonical geometric count stays 333 across all
+# cases, compared to 164-373 variance with per-case tagging.
+#
+# IMPORTANT: the nearest-centroid matching approach without u_pre (older
+# version) was BROKEN — prestress drift was same order as inter-cell spacing,
+# giving ambiguous matches. u_pre is the missing piece.
+_canonical_permutation = None  # cg → ckpt cell index map
+if _mode_canonical and rank == 0:
+    logger.info("=" * 70)
+    logger.info("Canonical anatomical tagging mode (via u_pre permutation)")
+    logger.info("Fields loaded once from canonical reference, applied to all cases")
+    logger.info("via cg → checkpoint cell bijection. Guaranteed consistent across")
+    logger.info("the spectrum by construction.")
+    logger.info("=" * 70)
+if _mode_canonical:
+    if rank == 0:
+        logger.info(f"Loading canonical reference fields from {_args.geometry_fields}")
+    _gf = np.load(_args.geometry_fields)
+
+    # Step 1: Load the canonical shared geometry (same file used by cardiac_geometries
+    # in line 168's geometry loading). This mesh has THE canonical cell ordering
+    # that matches the centroids stored in _gf["centroids"].
+    _canon_geo_dir = Path(_args.geometry_fields).parent
+    import cardiac_geometries as _cg_mod
+    _cg_geo = _cg_mod.geometry.Geometry.from_folder(MPI.COMM_SELF, _canon_geo_dir)
+    _cg_mesh = _cg_geo.mesh
+    _n_cg = _cg_mesh.topology.index_map(3).size_local
+    _cg_cells = np.arange(_n_cg, dtype=np.int32)
+    _cg_centroids = dolfinx.mesh.compute_midpoints(_cg_mesh, 3, _cg_cells)
+
+    # Sanity: cg mesh centroids must match the npz centroids exactly
+    _cg_drift = np.abs(_cg_centroids - _gf["centroids"]).max()
+    if _cg_drift > 1e-10:
+        raise RuntimeError(
+            f"cg mesh centroids differ from npz by {_cg_drift:.3e} — "
+            f"mesh does not match geometry_fields.npz source"
+        )
+
+    # Step 2: Read u_pre from this case's prestress_inverse.bp onto the cg mesh.
+    # complete_cycle.py wrote it via adios4dolfinx.write_function_on_input_mesh,
+    # so it round-trips cleanly to the cg mesh ordering.
+    _pres_path = solver_dir / "prestress_inverse.bp"
+    _V_cg_L2 = dolfinx.fem.functionspace(_cg_mesh, ("Lagrange", 2, (3,)))
+    _u_pre_cg = dolfinx.fem.Function(_V_cg_L2)
+    adios4dolfinx.read_function(_pres_path, _u_pre_cg, time=0.0, name="u_pre")
+
+    # Interpolate u_pre to cg cell centroids via DG0
+    _V_cg_DG0v = dolfinx.fem.functionspace(_cg_mesh, ("DG", 0, (3,)))
+    _u_pre_cg_dg0 = dolfinx.fem.Function(_V_cg_DG0v)
+    _u_pre_cg_dg0.interpolate(_u_pre_cg)
+    _u_pre_per_cell = _u_pre_cg_dg0.x.array.reshape(-1, 3)[:_n_cg]
+
+    # Step 3: Compute prestressed cg centroids. These should match the checkpoint
+    # centroids to ~1 mm (DG0 interpolation error, << inter-cell spacing).
+    _cg_centroids_prestressed = _cg_centroids + _u_pre_per_cell
+
+    # Step 4: For each LOCAL checkpoint cell, find its canonical cg counterpart.
+    # This is a nearest-neighbor query in prestressed space, unambiguous because
+    # drift (~0.5-1 mm) << inter-cell spacing (~3.5 mm).
+    _tree_cg_prestressed = cKDTree(_cg_centroids_prestressed)
+    _dists, _ckpt_to_cg_idx = _tree_cg_prestressed.query(centroids)
+    _max_drift_local = float(_dists.max()) if len(_dists) > 0 else 0.0
+    _max_drift_global = comm.allreduce(_max_drift_local, op=MPI.MAX)
+    if rank == 0:
+        logger.info(f"  u_pre permutation match: max drift = {_max_drift_global:.3e} m")
+        # Inter-cell spacing estimate (simple rough check)
+        _spacing_est = (_cg_centroids.max(0) - _cg_centroids.min(0)).max() / (_n_cg ** (1/3))
+        if _max_drift_global > 0.5 * _spacing_est:
+            logger.warning(f"  drift exceeds 50% of cell spacing ({_spacing_est:.3e}) — check mesh correspondence!")
+        else:
+            logger.info(f"  Drift is within {_max_drift_global/_spacing_est*100:.1f}% of inter-cell spacing — safe")
+
+    # Step 5: Apply the permutation to pull canonical fields into ckpt ordering
+    d_lv = _gf["d_lv"][_ckpt_to_cg_idx]
+    d_rv = _gf["d_rv"][_ckpt_to_cg_idx]
+    d_epi = _gf["d_epi"][_ckpt_to_cg_idx]
+    d_sum = _gf["d_sum"][_ckpt_to_cg_idx]
+    tau = _gf["tau"][_ckpt_to_cg_idx]
+    entry_t = _gf["entry_t"][_ckpt_to_cg_idx]
+    is_geometric_septum = _gf["is_geometric_septum"][_ckpt_to_cg_idx]
+    is_ldrb_septum = _gf["is_ldrb_septum"][_ckpt_to_cg_idx]
+    touches_epi = _gf["touches_epi"][_ckpt_to_cg_idx]
+    lvrv_vals = _gf["lv_rv_scalar"][_ckpt_to_cg_idx] if "lv_rv_scalar" in _gf.files else np.zeros(len(_ckpt_to_cg_idx))
+    epi_vals = _gf["epi_scalar_dg0"][_ckpt_to_cg_idx] if "epi_scalar_dg0" in _gf.files else np.zeros(len(_ckpt_to_cg_idx))
+
+    # Step 6: Reconstruct the corrected envelope (d_sum_max only + ~touches_epi)
+    _d_sum_max_mm_canonical = float(_gf.get("d_sum_max_mm", 22.0))
+    if len(d_sum) > 0 and d_sum.max() < 0.1:
+        mesh_scale_to_mm = 1000.0
+    else:
+        mesh_scale_to_mm = 1.0
+    d_sum_max = _d_sum_max_mm_canonical / mesh_scale_to_mm
+    d_sum_min = 0.0
+    d_epi_min = 0.0
+    envelope = (d_sum <= d_sum_max) & ~touches_epi
+    study_region = (is_geometric_septum | is_ldrb_septum) & (d_sum < d_sum_max)
+
+    # Consistency check: n_geo and n_ldrb should match the canonical counts
+    # (modulo a ~1-cell non-bijection tolerance)
+    if rank == 0:
+        _n_geo_ckpt = comm.allreduce(int(is_geometric_septum.sum()))
+        _n_ldrb_ckpt = comm.allreduce(int(is_ldrb_septum.sum()))
+        _n_env_ckpt = comm.allreduce(int(envelope.sum()))
+        _n_geo_canon = int(_gf["is_geometric_septum"].sum())
+        _n_ldrb_canon = int(_gf["is_ldrb_septum"].sum())
+        logger.info(f"  Canonical geometric: {_n_geo_canon} (ckpt gives {_n_geo_ckpt})")
+        logger.info(f"  Canonical LDRB:      {_n_ldrb_canon} (ckpt gives {_n_ldrb_ckpt})")
+        logger.info(f"  Corrected envelope:  {_n_env_ckpt} cells")
+        if abs(_n_geo_ckpt - _n_geo_canon) > 3:
+            logger.warning(f"  Geometric count mismatch > 3 cells — check permutation")
+    else:
+        comm.allreduce(int(is_geometric_septum.sum()))
+        comm.allreduce(int(is_ldrb_septum.sum()))
+        comm.allreduce(int(envelope.sum()))
+
+# Per-case computation path (original behavior — used if --geometry-fields is NOT given).
 # Per-cell distances. Prefer point-to-facet distance (via pyvista/VTK) which
 # is mesh-resolution-independent. Fall back to nearest-vertex (cKDTree) if
 # pyvista is unavailable. On coarse meshes (char_length ~ 10 mm) the two
@@ -429,142 +694,126 @@ def _build_surface_polydata_global(tag_ids):
 
     return pv.PolyData(points, faces=faces_flat)
 
-if _HAS_PYVISTA:
-    if rank == 0:
-        logger.info("Computing d_lv, d_rv, d_epi via point-to-facet distance "
-                     "(pyvista, GLOBAL surface)")
-    lv_poly = _build_surface_polydata_global(_lv_tags)
-    rv_poly = _build_surface_polydata_global(_rv_tags)
-    epi_poly = _build_surface_polydata_global(_epi_tags)
-    if lv_poly is None or rv_poly is None or epi_poly is None:
+if not _mode_canonical:
+    if _HAS_PYVISTA:
         if rank == 0:
-            logger.warning("No facets found for one of LV/RV/EPI — "
-                           "falling back to nearest-vertex.")
-        d_lv = cKDTree(lv_surf).query(centroids)[0] if len(lv_surf) else np.full(len(centroids), np.inf)
-        d_rv = cKDTree(rv_surf).query(centroids)[0] if len(rv_surf) else np.full(len(centroids), np.inf)
-        d_epi = cKDTree(epi_surf).query(centroids)[0] if len(epi_surf) else np.full(len(centroids), np.inf)
+            logger.info("Computing d_lv, d_rv, d_epi via point-to-facet distance "
+                         "(pyvista, GLOBAL surface)")
+        lv_poly = _build_surface_polydata_global(_lv_tags)
+        rv_poly = _build_surface_polydata_global(_rv_tags)
+        epi_poly = _build_surface_polydata_global(_epi_tags)
+        if lv_poly is None or rv_poly is None or epi_poly is None:
+            if rank == 0:
+                logger.warning("No facets found for one of LV/RV/EPI — "
+                               "falling back to nearest-vertex.")
+            d_lv = cKDTree(lv_surf).query(centroids)[0] if len(lv_surf) else np.full(len(centroids), np.inf)
+            d_rv = cKDTree(rv_surf).query(centroids)[0] if len(rv_surf) else np.full(len(centroids), np.inf)
+            d_epi = cKDTree(epi_surf).query(centroids)[0] if len(epi_surf) else np.full(len(centroids), np.inf)
+        else:
+            if rank == 0:
+                logger.info(f"  Global surfaces: LV={lv_poly.n_faces_strict} tri, "
+                             f"RV={rv_poly.n_faces_strict} tri, EPI={epi_poly.n_faces_strict} tri")
+            centroids_poly = pv.PolyData(centroids.astype(np.float64))
+            d_lv = np.abs(centroids_poly.compute_implicit_distance(lv_poly)["implicit_distance"])
+            d_rv = np.abs(centroids_poly.compute_implicit_distance(rv_poly)["implicit_distance"])
+            d_epi = np.abs(centroids_poly.compute_implicit_distance(epi_poly)["implicit_distance"])
     else:
         if rank == 0:
-            logger.info(f"  Global surfaces: LV={lv_poly.n_faces_strict} tri, "
-                         f"RV={rv_poly.n_faces_strict} tri, EPI={epi_poly.n_faces_strict} tri")
-        centroids_poly = pv.PolyData(centroids.astype(np.float64))
-        d_lv = np.abs(centroids_poly.compute_implicit_distance(lv_poly)["implicit_distance"])
-        d_rv = np.abs(centroids_poly.compute_implicit_distance(rv_poly)["implicit_distance"])
-        d_epi = np.abs(centroids_poly.compute_implicit_distance(epi_poly)["implicit_distance"])
-else:
+            logger.warning("pyvista not available — falling back to nearest-vertex distance. "
+                           "Envelope d_epi threshold may not reliably exclude surface cells.")
+        d_lv = cKDTree(lv_surf).query(centroids)[0]
+        d_rv = cKDTree(rv_surf).query(centroids)[0]
+        d_epi = cKDTree(epi_surf).query(centroids)[0]
+
+    d_sum = d_lv + d_rv
+
+    # Euclidean tau
+    tau = d_lv / (d_lv + d_rv)
+
+    # Geometric septum (lower bound)
+    is_geometric_septum = np.maximum(d_lv, d_rv) < d_epi
+
+    # LDRB scalar-field septum (upper bound) — solve 2 Laplace equations
     if rank == 0:
-        logger.warning("pyvista not available — falling back to nearest-vertex distance. "
-                       "Envelope d_epi threshold may not reliably exclude surface cells.")
-    d_lv = cKDTree(lv_surf).query(centroids)[0]
-    d_rv = cKDTree(rv_surf).query(centroids)[0]
-    d_epi = cKDTree(epi_surf).query(centroids)[0]
+        logger.info("Solving Laplace equations for LDRB septum definition...")
 
-d_sum = d_lv + d_rv
+    V_CG1 = dolfinx.fem.functionspace(mesh, ("CG", 1))
+    u_trial = ufl.TrialFunction(V_CG1)
+    v_test = ufl.TestFunction(V_CG1)
+    a_laplace = ufl.dot(ufl.grad(u_trial), ufl.grad(v_test)) * ufl.dx
+    L_zero = dolfinx.fem.Constant(mesh, 0.0) * v_test * ufl.dx
 
-# Euclidean tau
-tau = d_lv / (d_lv + d_rv)
+    lv_facets = ffun.find(_lv_tags[0])
+    rv_facets = ffun.find(_rv_tags[0])
+    epi_facets = ffun.find(_epi_tags[0])
 
-# Geometric septum (lower bound)
-is_geometric_septum = np.maximum(d_lv, d_rv) < d_epi
+    lv_dofs = dolfinx.fem.locate_dofs_topological(V_CG1, 2, lv_facets)
+    rv_dofs = dolfinx.fem.locate_dofs_topological(V_CG1, 2, rv_facets)
+    epi_dofs = dolfinx.fem.locate_dofs_topological(V_CG1, 2, epi_facets)
 
-# LDRB scalar-field septum (upper bound) — solve 2 Laplace equations
-if rank == 0:
-    logger.info("Solving Laplace equations for LDRB septum definition...")
+    prob_lvrv = dolfinx.fem.petsc.LinearProblem(
+        a_laplace, L_zero,
+        bcs=[dolfinx.fem.dirichletbc(PETSc.ScalarType(1.0), lv_dofs, V_CG1),
+             dolfinx.fem.dirichletbc(PETSc.ScalarType(0.0), rv_dofs, V_CG1)],
+        petsc_options={"ksp_type": "preonly", "pc_type": "lu"},
+        petsc_options_prefix="percell_lvrv",
+    )
+    lv_rv_scalar = prob_lvrv.solve()
 
-V_CG1 = dolfinx.fem.functionspace(mesh, ("CG", 1))
-u_trial = ufl.TrialFunction(V_CG1)
-v_test = ufl.TestFunction(V_CG1)
-a_laplace = ufl.dot(ufl.grad(u_trial), ufl.grad(v_test)) * ufl.dx
-L_zero = dolfinx.fem.Constant(mesh, 0.0) * v_test * ufl.dx
+    prob_epi = dolfinx.fem.petsc.LinearProblem(
+        a_laplace, L_zero,
+        bcs=[dolfinx.fem.dirichletbc(PETSc.ScalarType(1.0), epi_dofs, V_CG1),
+             dolfinx.fem.dirichletbc(PETSc.ScalarType(0.0), lv_dofs, V_CG1),
+             dolfinx.fem.dirichletbc(PETSc.ScalarType(0.0), rv_dofs, V_CG1)],
+        petsc_options={"ksp_type": "preonly", "pc_type": "lu"},
+        petsc_options_prefix="percell_epi",
+    )
+    epi_scalar = prob_epi.solve()
 
-# lv_rv_scalar: u=1 on LV, u=0 on RV
-lv_facets = ffun.find(_lv_tags[0])
-rv_facets = ffun.find(_rv_tags[0])
-epi_facets = ffun.find(_epi_tags[0])
+    lvrv_dg0 = dolfinx.fem.Function(V_DG0)
+    lvrv_dg0.interpolate(lv_rv_scalar)
+    lvrv_vals = lvrv_dg0.x.array[:n_local_cells].copy()
 
-lv_dofs = dolfinx.fem.locate_dofs_topological(V_CG1, 2, lv_facets)
-rv_dofs = dolfinx.fem.locate_dofs_topological(V_CG1, 2, rv_facets)
-epi_dofs = dolfinx.fem.locate_dofs_topological(V_CG1, 2, epi_facets)
+    epi_dg0 = dolfinx.fem.Function(V_DG0)
+    epi_dg0.interpolate(epi_scalar)
+    epi_vals = epi_dg0.x.array[:n_local_cells].copy()
 
-prob_lvrv = dolfinx.fem.petsc.LinearProblem(
-    a_laplace, L_zero,
-    bcs=[dolfinx.fem.dirichletbc(PETSc.ScalarType(1.0), lv_dofs, V_CG1),
-         dolfinx.fem.dirichletbc(PETSc.ScalarType(0.0), rv_dofs, V_CG1)],
-    petsc_options={"ksp_type": "preonly", "pc_type": "lu"},
-    petsc_options_prefix="percell_lvrv",
-)
-lv_rv_scalar = prob_lvrv.solve()
+    is_ldrb_septum = (epi_vals <= 0.5) & (lvrv_vals > 0.1) & (lvrv_vals < 0.9)
 
-# epi_scalar: u=1 on EPI, u=0 on LV+RV
-prob_epi = dolfinx.fem.petsc.LinearProblem(
-    a_laplace, L_zero,
-    bcs=[dolfinx.fem.dirichletbc(PETSc.ScalarType(1.0), epi_dofs, V_CG1),
-         dolfinx.fem.dirichletbc(PETSc.ScalarType(0.0), lv_dofs, V_CG1),
-         dolfinx.fem.dirichletbc(PETSc.ScalarType(0.0), rv_dofs, V_CG1)],
-    petsc_options={"ksp_type": "preonly", "pc_type": "lu"},
-    petsc_options_prefix="percell_epi",
-)
-epi_scalar = prob_epi.solve()
+    # Auto-detect mesh units for envelope thresholds
+    all_d_sums = d_sum[is_geometric_septum | is_ldrb_septum]
+    if len(all_d_sums) > 0 and all_d_sums.max() < 0.1:
+        mesh_scale_to_mm = 1000.0
+    else:
+        mesh_scale_to_mm = 1.0
 
-# Interpolate CG1 → DG0 for per-cell values
-lvrv_dg0 = dolfinx.fem.Function(V_DG0)
-lvrv_dg0.interpolate(lv_rv_scalar)
-lvrv_vals = lvrv_dg0.x.array[:n_local_cells].copy()
+    d_sum_max = _args.d_sum_max_mm / mesh_scale_to_mm
+    d_sum_min = _args.d_sum_min_mm / mesh_scale_to_mm
+    d_epi_min = _args.d_epi_min_mm / mesh_scale_to_mm
 
-epi_dg0 = dolfinx.fem.Function(V_DG0)
-epi_dg0.interpolate(epi_scalar)
-epi_vals = epi_dg0.x.array[:n_local_cells].copy()
+    study_region = (is_geometric_septum | is_ldrb_septum) & (d_sum < d_sum_max)
 
-# LDRB septum: epi_scalar <= 0.5 AND 0.1 < lv_rv_scalar < 0.9
-is_ldrb_septum = (epi_vals <= 0.5) & (lvrv_vals > 0.1) & (lvrv_vals < 0.9)
+    # Topological epi exclusion
+    mesh.topology.create_connectivity(3, 2)
+    c2f = mesh.topology.connectivity(3, 2)
+    epi_facets_local_set = set(ffun.find(_epi_tags[0]).tolist())
+    touches_epi = np.zeros(n_local_cells, dtype=bool)
+    for cell_i in range(n_local_cells):
+        for facet in c2f.links(cell_i):
+            if facet in epi_facets_local_set:
+                touches_epi[cell_i] = True
+                break
 
-# Auto-detect mesh units for envelope thresholds. The mesh might be in mm
-# (UKB synthetic) or m (patient-specific). Detect via d_sum magnitude.
-all_d_sums = d_sum[is_geometric_septum | is_ldrb_septum]
-if len(all_d_sums) > 0 and all_d_sums.max() < 0.1:
-    mesh_scale_to_mm = 1000.0  # mesh is in m
-else:
-    mesh_scale_to_mm = 1.0     # mesh is in mm
+    # Sweep scalar: entry_t = max(d_lv, d_rv) - d_epi
+    entry_t = np.maximum(d_lv, d_rv) - d_epi
 
-d_sum_max = _args.d_sum_max_mm / mesh_scale_to_mm
-d_sum_min = _args.d_sum_min_mm / mesh_scale_to_mm
-d_epi_min = _args.d_epi_min_mm / mesh_scale_to_mm
+    # Envelope: minimal (d_sum ≤ d_sum_max AND ~touches_epi).
+    # We intentionally do NOT impose d_epi_min or d_sum_min — those excluded
+    # 50-60% of geometric septum cells (apex/thin regions) and broke the
+    # invariant that sweep(t=0) == geometric.
+    envelope = ((d_sum <= d_sum_max) & ~touches_epi)
 
-# Study region = union of geometric and LDRB, with a generous d_sum safety cut
-study_region = (is_geometric_septum | is_ldrb_septum) & (d_sum < d_sum_max)
-
-# ── Topological epi exclusion ────────────────────────────────────────────────
-# A cell that has any face in the epi facet set is "touching the epi". Those
-# cells must never be in the envelope (the sweep would pull them in as the
-# threshold widens, which is visually and anatomically wrong). This uses mesh
-# topology so it's exact — no distance threshold tuning needed.
-mesh.topology.create_connectivity(3, 2)
-c2f = mesh.topology.connectivity(3, 2)
-epi_facets_local_set = set(ffun.find(_epi_tags[0]).tolist())
-touches_epi = np.zeros(n_local_cells, dtype=bool)
-for cell_i in range(n_local_cells):
-    for facet in c2f.links(cell_i):
-        if facet in epi_facets_local_set:
-            touches_epi[cell_i] = True
-            break
-
-# ── Sweep scalar: entry_t (t at which a cell first joins the sweep set) ──────
-#   cell ∈ septum(t)  iff  entry_t(cell) < t
-#   t = 0: exactly the geometric septum (by construction, entry_t < 0 ⇔ geometric)
-#   t > 0: widens outward (cells with d_epi close to max(d_lv,d_rv))
-#   t < 0: tightens inward (only the deepest septum cells)
-#
-# Measured in mesh units (same as d_lv etc.). Users convert to mm if needed.
-entry_t = np.maximum(d_lv, d_rv) - d_epi
-
-# ── Envelope: anatomical bound the sweep must stay within ───────────────────
-# Combines distance thresholds + topological epi exclusion.
-envelope = ((d_epi >= d_epi_min)
-            & (d_sum >= d_sum_min)
-            & (d_sum <= d_sum_max)
-            & ~touches_epi)
-
-# Region tags from marker
+# Region tags from marker (always needed, outside the _mode_canonical branch)
 region_tags = markers_mt.values[:n_local_cells]
 
 if rank == 0:
@@ -585,264 +834,338 @@ else:
 timestamps = adios4dolfinx.read_timestamps(checkpoint_path, comm, "displacement")
 n_steps = len(timestamps)
 steps_per_beat = int(round(cycle_length / sim_params["dt"]))
-start_step = max(0, n_steps - steps_per_beat)
+n_beats_in_ckpt = n_steps // steps_per_beat
 
-if rank == 0:
-    logger.info(f"Replaying last beat: steps {start_step}–{n_steps-1} "
-                f"({n_steps - start_step} steps, cycle={cycle_length:.3f}s)")
-
-# Pressure interpolation from circulation history
-circ_time = np.array(circ_history["time"])
-
-# Conversion factor: 1 mmHg = 133.322 Pa
-# Circulation pressures are in mmHg; we convert to Pa so the proxy work
-# (P × dE × vol) is in the same units as the true work (S × dE × vol) which is in Pa.
-MMHG_TO_PA = 133.322
-
-def get_pressure_at_time(t):
-    """Get LV and RV pressure (Pa) at time t by interpolation."""
-    # Align checkpoint time to circulation time
-    t_circ = t - timestamps[start_step]
-    if t_circ < circ_time[0]:
-        t_circ = circ_time[0]
-    if t_circ > circ_time[-1]:
-        t_circ = circ_time[-1]
-    p_lv_mmHg = np.interp(t_circ, circ_time, circ_history["p_LV"])
-    p_rv_mmHg = np.interp(t_circ, circ_time, circ_history["p_RV"])
-    return p_lv_mmHg * MMHG_TO_PA, p_rv_mmHg * MMHG_TO_PA
-
-# Accumulation arrays (local cells only)
-n = n_local_cells
-cum_w_total = np.zeros(n)
-cum_w_ff = np.zeros(n)
-cum_w_ss = np.zeros(n)
-cum_w_nn = np.zeros(n)
-# Proxy: accumulate P * deps_ff per cell (pressure in Pa, strain dimensionless,
-# volume in m³ → units of Pa·m³ = J, same as w_true)
-cum_proxy_PLV_ff = np.zeros(n)
-cum_proxy_PRV_ff = np.zeros(n)
-cum_proxy_Trans_ff = np.zeros(n)
-cum_proxy_PLV_ll = np.zeros(n)
-cum_proxy_PRV_ll = np.zeros(n)
-cum_proxy_Trans_ll = np.zeros(n)
-
-# Cell volumes (reuse the form_vol compiled above)
-cell_vols_vec = dolfinx.fem.assemble_vector(form_vol)
-cell_volumes = cell_vols_vec.array[:n].copy()
-
-has_previous = False
-p_LV_prev = 0.0
-p_RV_prev = 0.0
-
-for i in range(start_step, n_steps):
-    t = timestamps[i]
-
-    # Load displacement
-    adios4dolfinx.read_function(checkpoint_path, problem.u, time=t, name="displacement")
-
-    # Set active tension
-    Ta.assign(Ta_history[i])
-    cardiac_model.active.activation.value.x.array[:] = Ta.value.x.array[:]
-
-    # Interpolate state variables
-    E_cur.interpolate(expr_E)
-    # S fields are evaluated symbolically through S_tot_ufl in the forms
-
-    if has_previous:
-        # Assemble per-cell work increments
-        w_total_vec = dolfinx.fem.assemble_vector(form_w_total)
-        w_ff_vec = dolfinx.fem.assemble_vector(form_w_ff)
-        w_ss_vec = dolfinx.fem.assemble_vector(form_w_ss)
-
-        cum_w_total += w_total_vec.array[:n]
-        cum_w_ff += w_ff_vec.array[:n]
-        cum_w_ss += w_ss_vec.array[:n]
-
-        if form_w_nn is not None:
-            w_nn_vec = dolfinx.fem.assemble_vector(form_w_nn)
-            cum_w_nn += w_nn_vec.array[:n]
-
-        # Proxy work: P_avg * deps_ff per cell
-        p_LV, p_RV = get_pressure_at_time(t)
-        p_LV_avg = 0.5 * (p_LV + p_LV_prev)
-        p_RV_avg = 0.5 * (p_RV + p_RV_prev)
-
-        deps_ff_vec = dolfinx.fem.assemble_vector(form_deps_ff)
-        deps_ff_arr = deps_ff_vec.array[:n]
-
-        cum_proxy_PLV_ff += p_LV_avg * deps_ff_arr
-        cum_proxy_PRV_ff += p_RV_avg * deps_ff_arr
-        cum_proxy_Trans_ff += (p_LV_avg - p_RV_avg) * deps_ff_arr
-
-        if form_deps_ll is not None:
-            deps_ll_vec = dolfinx.fem.assemble_vector(form_deps_ll)
-            deps_ll_arr = deps_ll_vec.array[:n]
-            cum_proxy_PLV_ll += p_LV_avg * deps_ll_arr
-            cum_proxy_PRV_ll += p_RV_avg * deps_ll_arr
-            cum_proxy_Trans_ll += (p_LV_avg - p_RV_avg) * deps_ll_arr
-
-        p_LV_prev, p_RV_prev = p_LV, p_RV
-    else:
-        p_LV_prev, p_RV_prev = get_pressure_at_time(t)
-
-    # Shift state: current → previous (for next step's trapezoidal average)
-    E_prev.x.array[:] = E_cur.x.array[:]
-    S_prev.interpolate(expr_S_total)
-    has_previous = True
-
-    if rank == 0 and (i % 50 == 0 or i == n_steps - 1):
-        logger.info(f"  Step {i:04d}/{n_steps} | t={t:.4f}s | cum_W_total={cum_w_total.sum():.4e}")
-
-# Cross-fiber = total - (ff + ss + nn); computed once after accumulation.
-# If n0 is missing, cum_w_nn stays zero, so cross absorbs the nn contribution
-# (flagged via the warning below).
-cum_w_cross = cum_w_total - (cum_w_ff + cum_w_ss + cum_w_nn)
-if form_w_nn is None and rank == 0:
-    logger.warning("n0 not loaded — cum_w_cross includes the sheet-normal component "
-                   "in addition to true cross-fiber work.")
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 5: Validation
-# ════════════════════════════════════════════════════════════════════════════
-
-if rank == 0:
-    logger.info("\n=== VALIDATION ===")
-
-# Load regional metrics for comparison
-metrics_dir = results_dir / "metrics"
-metrics_file = metrics_dir / "metrics_downsample_1.npy"
-if metrics_file.exists():
-    regional = np.load(metrics_file, allow_pickle=True).item()
-
-    # Sum per-cell work over last beat and compare to regional totals
-    # Regional metrics store per-timestep increments for ALL beats.
-    # We only computed per-cell for the LAST beat, so sum only the last beat's
-    # worth of regional increments.
-    n_regional_steps = len(regional.get("work_true_Whole", [0]))
-    # steps_per_beat was computed earlier from cycle_length / dt
-    last_beat_regional = max(0, n_regional_steps - steps_per_beat)
-    work_true_LV_regional = np.sum(regional.get("work_true_LV", [0])[last_beat_regional:])
-    work_true_RV_regional = np.sum(regional.get("work_true_RV", [0])[last_beat_regional:])
-    work_true_Sept_regional = np.sum(regional.get("work_true_Septum", [0])[last_beat_regional:])
-    work_true_Whole_regional = np.sum(regional.get("work_true_Whole", [0])[last_beat_regional:])
-
-    # Sum per-cell by region tag
-    lv_mask = region_tags == 1
-    rv_mask = region_tags == 2
-    sept_mask = region_tags == 3
-
-    w_lv_percell = comm.allreduce(cum_w_total[lv_mask].sum())
-    w_rv_percell = comm.allreduce(cum_w_total[rv_mask].sum())
-    w_sept_percell = comm.allreduce(cum_w_total[sept_mask].sum())
-    w_whole_percell = comm.allreduce(cum_w_total.sum())
-
-    if rank == 0:
-        logger.info(f"  Per-cell sum:  LV={w_lv_percell:.6e}  RV={w_rv_percell:.6e}  "
-                     f"Sept={w_sept_percell:.6e}  Whole={w_whole_percell:.6e}")
-        logger.info(f"  Regional sum:  LV={work_true_LV_regional:.6e}  RV={work_true_RV_regional:.6e}  "
-                     f"Sept={work_true_Sept_regional:.6e}  Whole={work_true_Whole_regional:.6e}")
-
-        for name, pc, reg in [("LV", w_lv_percell, work_true_LV_regional),
-                               ("RV", w_rv_percell, work_true_RV_regional),
-                               ("Septum", w_sept_percell, work_true_Sept_regional),
-                               ("Whole", w_whole_percell, work_true_Whole_regional)]:
-            if abs(reg) > 1e-15:
-                rel_err = abs(pc - reg) / abs(reg) * 100
-                status = "✓" if rel_err < 1.0 else "✗"
-                logger.info(f"    {name}: {status} rel_error={rel_err:.4f}%")
-            else:
-                logger.info(f"    {name}: regional=0 (skip check)")
+# Decide which beat(s) to replay.
+#   --all-beats    → all 0..n_beats_in_ckpt-1
+#   --beat N       → just beat N
+#   (default)      → last beat
+if _args.all_beats:
+    beats_to_process = list(range(n_beats_in_ckpt))
+elif _args.beat is not None:
+    if _args.beat < 0 or _args.beat >= n_beats_in_ckpt:
+        raise ValueError(
+            f"--beat {_args.beat} out of range [0, {n_beats_in_ckpt-1}] "
+            f"(checkpoint has {n_beats_in_ckpt} beats)"
+        )
+    beats_to_process = [_args.beat]
 else:
-    if rank == 0:
-        logger.warning("No regional metrics found — skipping validation")
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 6: Gather across MPI ranks and save
-# ════════════════════════════════════════════════════════════════════════════
-#
-# Each rank holds a local slice of the mesh (n_local_cells cells). To write a
-# complete per_cell_data.npz we must gather all local arrays to rank 0 and
-# concatenate. The global ordering is arbitrary (rank0 cells, then rank1, ...)
-# since downstream analysis indexes cells as a flat set, not by spatial order.
-
-def gather_to_root(local_arr):
-    """Gather a local per-cell array to rank 0 and concatenate."""
-    gathered = comm.gather(np.ascontiguousarray(local_arr), root=0)
-    if rank == 0:
-        return np.concatenate(gathered)
-    return None
-
-# Gather all per-cell arrays
-g_tau = gather_to_root(tau)
-g_d_lv = gather_to_root(d_lv)
-g_d_rv = gather_to_root(d_rv)
-g_d_epi = gather_to_root(d_epi)
-g_d_sum = gather_to_root(d_sum)
-g_is_geometric_septum = gather_to_root(is_geometric_septum)
-g_is_ldrb_septum = gather_to_root(is_ldrb_septum)
-g_study_region = gather_to_root(study_region)
-g_region_tags = gather_to_root(region_tags)
-g_w_total = gather_to_root(cum_w_total)
-g_w_ff = gather_to_root(cum_w_ff)
-g_w_ss = gather_to_root(cum_w_ss)
-g_w_nn = gather_to_root(cum_w_nn)
-g_w_cross = gather_to_root(cum_w_cross)
-g_proxy_PLV_ff = gather_to_root(cum_proxy_PLV_ff)
-g_proxy_PRV_ff = gather_to_root(cum_proxy_PRV_ff)
-g_proxy_Trans_ff = gather_to_root(cum_proxy_Trans_ff)
-g_proxy_PLV_ll = gather_to_root(cum_proxy_PLV_ll)
-g_proxy_PRV_ll = gather_to_root(cum_proxy_PRV_ll)
-g_proxy_Trans_ll = gather_to_root(cum_proxy_Trans_ll)
-g_cell_volumes = gather_to_root(cell_volumes)
-g_centroids = gather_to_root(centroids)
-g_lvrv_vals = gather_to_root(lvrv_vals)
-g_epi_vals = gather_to_root(epi_vals)
-# New: envelope and entry_t for the threshold-relaxation sweep
-g_envelope = gather_to_root(envelope)
-g_entry_t = gather_to_root(entry_t)
-g_touches_epi = gather_to_root(touches_epi)
+    beats_to_process = [n_beats_in_ckpt - 1]
 
 if rank == 0:
-    output_path = results_dir / "per_cell_data.npz"
-    np.savez(output_path,
-             tau=g_tau,
-             d_lv=g_d_lv,
-             d_rv=g_d_rv,
-             d_epi=g_d_epi,
-             d_sum=g_d_sum,
-             is_geometric_septum=g_is_geometric_septum,
-             is_ldrb_septum=g_is_ldrb_septum,
-             study_region=g_study_region,
-             region_tags=g_region_tags,
-             # Threshold-relaxation sweep fields (Question A)
-             envelope=g_envelope,
-             entry_t=g_entry_t,
-             touches_epi=g_touches_epi,
-             # Per-cell work
-             w_total=g_w_total,
-             w_ff=g_w_ff,
-             w_ss=g_w_ss,
-             w_nn=g_w_nn,
-             w_cross=g_w_cross,
-             proxy_PLV_ff=g_proxy_PLV_ff,
-             proxy_PRV_ff=g_proxy_PRV_ff,
-             proxy_Trans_ff=g_proxy_Trans_ff,
-             proxy_PLV_ll=g_proxy_PLV_ll,
-             proxy_PRV_ll=g_proxy_PRV_ll,
-             proxy_Trans_ll=g_proxy_Trans_ll,
-             cell_volumes=g_cell_volumes,
-             centroids=g_centroids,
-             lv_rv_scalar=g_lvrv_vals,
-             epi_scalar_dg0=g_epi_vals,
-             # Envelope parameters used (for provenance)
-             envelope_d_epi_min_mm=_args.d_epi_min_mm,
-             envelope_d_sum_min_mm=_args.d_sum_min_mm,
-             envelope_d_sum_max_mm=_args.d_sum_max_mm,
-    )
-    logger.info(f"Saved per-cell data to {output_path}")
-    logger.info(f"  Global cells: {len(g_tau)}")
-    logger.info(f"  Envelope cells: {int(g_envelope.sum())}")
-    logger.info(f"  Geometric septum: {int(g_is_geometric_septum.sum())}")
-    logger.info(f"  entry_t range in envelope: [{g_entry_t[g_envelope].min():.4f}, "
-                f"{g_entry_t[g_envelope].max():.4f}]")
-    logger.info("Done.")
+    logger.info(f"Beats to process: {beats_to_process} "
+                f"(checkpoint has {n_beats_in_ckpt} beats)")
+
+# ┌─────────────────────────────────────────────────────────────────────────┐
+# │ BEAT LOOP: everything below this is repeated once per beat.             │
+# │ Setup (mesh, fibers, forms, canonical tagging) was done ONCE above.     │
+# │ Each iteration re-initialises accumulators and saves its own npz.        │
+# └─────────────────────────────────────────────────────────────────────────┘
+for _current_beat_idx in beats_to_process:
+    start_step = _current_beat_idx * steps_per_beat
+    end_step = (_current_beat_idx + 1) * steps_per_beat
+    _beat_label = f"beat {_current_beat_idx}"
+    if rank == 0:
+        logger.info(f"\n━━━ Replaying {_beat_label}: steps {start_step}–{end_step-1} "
+                        f"({end_step - start_step} steps, cycle={cycle_length:.3f}s) ━━━")
+
+    # Conversion factor: 1 mmHg = 133.322 Pa
+    # Solver pressures are in mmHg; convert to Pa so proxy work (P × dE × vol)
+    # has the same units as true work (S × dE × vol), both in Pa.
+    MMHG_TO_PA = 133.322
+
+    def get_pressure_at_step(step_idx):
+        """Get LV and RV solver cavity pressure (Pa) at a given timestep index.
+
+        Uses the Lagrange multiplier pressure (the actual FEM boundary traction),
+        not the 0D ODE pressure.  Indexed directly — no interpolation needed.
+        """
+        p_lv_mmHg = float(solver_cavity_pressure_mmHg[step_idx, 0])
+        p_rv_mmHg = float(solver_cavity_pressure_mmHg[step_idx, 1])
+        return p_lv_mmHg * MMHG_TO_PA, p_rv_mmHg * MMHG_TO_PA
+
+    # Accumulation arrays (local cells only)
+    n = n_local_cells
+    cum_w_total = np.zeros(n)
+    cum_w_ff = np.zeros(n)
+    cum_w_ss = np.zeros(n)
+    cum_w_nn = np.zeros(n)
+    # Scalar cross-check accumulators (sum over the whole domain via scalar
+    # integration — should equal sum(cum_w_total) to machine precision, proving
+    # the DG0 test-function trick is exact).
+    cum_w_total_scalar = 0.0
+    cum_w_ff_scalar = 0.0
+    # Proxy: accumulate P * deps_ff per cell (pressure in Pa, strain dimensionless,
+    # volume in m³ → units of Pa·m³ = J, same as w_true)
+    cum_proxy_PLV_ff = np.zeros(n)
+    cum_proxy_PRV_ff = np.zeros(n)
+    cum_proxy_Trans_ff = np.zeros(n)
+    cum_proxy_PLV_ll = np.zeros(n)
+    cum_proxy_PRV_ll = np.zeros(n)
+    cum_proxy_Trans_ll = np.zeros(n)
+
+    # Cell volumes (reuse the form_vol compiled above)
+    cell_vols_vec = dolfinx.fem.assemble_vector(form_vol)
+    cell_volumes = cell_vols_vec.array[:n].copy()
+
+    has_previous = False
+    p_LV_prev = 0.0
+    p_RV_prev = 0.0
+
+    for i in range(start_step, end_step):
+        t = timestamps[i]
+
+        # Load displacement
+        adios4dolfinx.read_function(checkpoint_path, problem.u, time=t, name="displacement")
+
+        # Set active tension
+        Ta.assign(Ta_history[i])
+        cardiac_model.active.activation.value.x.array[:] = Ta.value.x.array[:]
+
+        # Interpolate state variables
+        E_cur.interpolate(expr_E)
+        # S fields are evaluated symbolically through S_tot_ufl in the forms
+
+        if has_previous:
+            # Assemble per-cell work increments
+            w_total_vec = dolfinx.fem.assemble_vector(form_w_total)
+            w_ff_vec = dolfinx.fem.assemble_vector(form_w_ff)
+            w_ss_vec = dolfinx.fem.assemble_vector(form_w_ss)
+
+            cum_w_total += w_total_vec.array[:n]
+            cum_w_ff += w_ff_vec.array[:n]
+            cum_w_ss += w_ss_vec.array[:n]
+
+            # Scalar cross-check: independent integration of the same integrand
+            w_total_s = dolfinx.fem.assemble_scalar(form_w_total_scalar)
+            w_ff_s = dolfinx.fem.assemble_scalar(form_w_ff_scalar)
+            cum_w_total_scalar += w_total_s
+            cum_w_ff_scalar += w_ff_s
+
+            if form_w_nn is not None:
+                w_nn_vec = dolfinx.fem.assemble_vector(form_w_nn)
+                cum_w_nn += w_nn_vec.array[:n]
+
+            # Proxy work: P_avg * deps_ff per cell (trapezoidal rule)
+            p_LV, p_RV = get_pressure_at_step(i)
+            p_LV_avg = 0.5 * (p_LV + p_LV_prev)
+            p_RV_avg = 0.5 * (p_RV + p_RV_prev)
+
+            deps_ff_vec = dolfinx.fem.assemble_vector(form_deps_ff)
+            deps_ff_arr = deps_ff_vec.array[:n]
+
+            cum_proxy_PLV_ff += p_LV_avg * deps_ff_arr
+            cum_proxy_PRV_ff += p_RV_avg * deps_ff_arr
+            cum_proxy_Trans_ff += (p_LV_avg - p_RV_avg) * deps_ff_arr
+
+            if form_deps_ll is not None:
+                deps_ll_vec = dolfinx.fem.assemble_vector(form_deps_ll)
+                deps_ll_arr = deps_ll_vec.array[:n]
+                cum_proxy_PLV_ll += p_LV_avg * deps_ll_arr
+                cum_proxy_PRV_ll += p_RV_avg * deps_ll_arr
+                cum_proxy_Trans_ll += (p_LV_avg - p_RV_avg) * deps_ll_arr
+
+            p_LV_prev, p_RV_prev = p_LV, p_RV
+        else:
+            p_LV_prev, p_RV_prev = get_pressure_at_step(i)
+
+        # Shift state: current → previous (for next step's trapezoidal average)
+        E_prev.x.array[:] = E_cur.x.array[:]
+        S_prev.interpolate(expr_S_total)
+        has_previous = True
+
+        if rank == 0 and (i % 50 == 0 or i == end_step - 1):
+            logger.info(f"  Step {i:04d}/{end_step} | t={t:.4f}s | cum_W_total={cum_w_total.sum():.4e}")
+
+    # Cross-fiber = total - (ff + ss + nn); computed once after accumulation.
+    # If n0 is missing, cum_w_nn stays zero, so cross absorbs the nn contribution
+    # (flagged via the warning below).
+    cum_w_cross = cum_w_total - (cum_w_ff + cum_w_ss + cum_w_nn)
+    if form_w_nn is None and rank == 0:
+        logger.warning("n0 not loaded — cum_w_cross includes the sheet-normal component "
+                       "in addition to true cross-fiber work.")
+
+    # ════════════════════════════════════════════════════════════════════════════
+    # SECTION 5: Validation
+    # ════════════════════════════════════════════════════════════════════════════
+
+    if rank == 0:
+        logger.info("\n=== VALIDATION ===")
+
+    # ── DG0 vs scalar integration cross-check ──────────────────────────────────
+    # The DG0 test-function trick says:
+    #   sum_i ∫_{cell_i} f dx  ==  ∫_Ω f dx
+    # where the LHS is assemble_vector(form(f * v_dg0 * dx)) summed cell-by-cell
+    # and the RHS is assemble_scalar(form(f * dx)). Both use the same quadrature
+    # points. This should hold to machine precision. Failure means the per-cell
+    # accumulation has an indexing bug or the DG0 trick is being used incorrectly.
+    w_total_dg0_sum_global = comm.allreduce(cum_w_total.sum())
+    w_total_scalar_global = comm.allreduce(cum_w_total_scalar)
+    w_ff_dg0_sum_global = comm.allreduce(cum_w_ff.sum())
+    w_ff_scalar_global = comm.allreduce(cum_w_ff_scalar)
+    if rank == 0:
+        def _rel(a, b):
+            if abs(b) < 1e-30: return float("nan")
+            return abs(a - b) / abs(b)
+        rel_total = _rel(w_total_dg0_sum_global, w_total_scalar_global)
+        rel_ff = _rel(w_ff_dg0_sum_global, w_ff_scalar_global)
+        logger.info("  DG0 vs scalar integration (machine-precision check):")
+        logger.info(f"    w_total: DG0_sum={w_total_dg0_sum_global:.6e}  scalar={w_total_scalar_global:.6e}  rel={rel_total:.2e}")
+        logger.info(f"    w_ff:    DG0_sum={w_ff_dg0_sum_global:.6e}  scalar={w_ff_scalar_global:.6e}  rel={rel_ff:.2e}")
+        if rel_total > 1e-10 or rel_ff > 1e-10:
+            logger.error("    !! DG0/scalar mismatch exceeds 1e-10 — DG0 trick is NOT producing "
+                         "the same result as direct integration. This is a BUG.")
+        else:
+            logger.info("    ✓ DG0 per-cell integration matches scalar domain integration to machine precision")
+
+    # Load regional metrics for comparison
+    metrics_dir = results_dir / "metrics"
+    metrics_file = metrics_dir / "metrics_downsample_1.npy"
+    if metrics_file.exists():
+        regional = np.load(metrics_file, allow_pickle=True).item()
+
+        # Sum per-cell work over last beat and compare to regional totals
+        # Regional metrics store per-timestep increments for ALL beats.
+        # We only computed per-cell for the LAST beat, so sum only the last beat's
+        # worth of regional increments.
+        n_regional_steps = len(regional.get("work_true_Whole", [0]))
+        # steps_per_beat was computed earlier from cycle_length / dt
+        last_beat_regional = max(0, n_regional_steps - steps_per_beat)
+        work_true_LV_regional = np.sum(regional.get("work_true_LV", [0])[last_beat_regional:])
+        work_true_RV_regional = np.sum(regional.get("work_true_RV", [0])[last_beat_regional:])
+        work_true_Sept_regional = np.sum(regional.get("work_true_Septum", [0])[last_beat_regional:])
+        work_true_Whole_regional = np.sum(regional.get("work_true_Whole", [0])[last_beat_regional:])
+
+        # Sum per-cell by region tag
+        lv_mask = region_tags == 1
+        rv_mask = region_tags == 2
+        sept_mask = region_tags == 3
+
+        w_lv_percell = comm.allreduce(cum_w_total[lv_mask].sum())
+        w_rv_percell = comm.allreduce(cum_w_total[rv_mask].sum())
+        w_sept_percell = comm.allreduce(cum_w_total[sept_mask].sum())
+        w_whole_percell = comm.allreduce(cum_w_total.sum())
+
+        if rank == 0:
+            logger.info(f"  Per-cell sum:  LV={w_lv_percell:.6e}  RV={w_rv_percell:.6e}  "
+                         f"Sept={w_sept_percell:.6e}  Whole={w_whole_percell:.6e}")
+            logger.info(f"  Regional sum:  LV={work_true_LV_regional:.6e}  RV={work_true_RV_regional:.6e}  "
+                         f"Sept={work_true_Sept_regional:.6e}  Whole={work_true_Whole_regional:.6e}")
+
+            for name, pc, reg in [("LV", w_lv_percell, work_true_LV_regional),
+                                   ("RV", w_rv_percell, work_true_RV_regional),
+                                   ("Septum", w_sept_percell, work_true_Sept_regional),
+                                   ("Whole", w_whole_percell, work_true_Whole_regional)]:
+                if abs(reg) > 1e-15:
+                    rel_err = abs(pc - reg) / abs(reg) * 100
+                    status = "✓" if rel_err < 1.0 else "✗"
+                    logger.info(f"    {name}: {status} rel_error={rel_err:.4f}%")
+                else:
+                    logger.info(f"    {name}: regional=0 (skip check)")
+    else:
+        if rank == 0:
+            logger.warning("No regional metrics found — skipping validation")
+
+    # ════════════════════════════════════════════════════════════════════════════
+    # SECTION 6: Gather across MPI ranks and save
+    # ════════════════════════════════════════════════════════════════════════════
+    #
+    # Each rank holds a local slice of the mesh (n_local_cells cells). To write a
+    # complete per_cell_data.npz we must gather all local arrays to rank 0 and
+    # concatenate. The global ordering is arbitrary (rank0 cells, then rank1, ...)
+    # since downstream analysis indexes cells as a flat set, not by spatial order.
+
+    def gather_to_root(local_arr):
+        """Gather a local per-cell array to rank 0 and concatenate."""
+        gathered = comm.gather(np.ascontiguousarray(local_arr), root=0)
+        if rank == 0:
+            return np.concatenate(gathered)
+        return None
+
+    # Gather all per-cell arrays
+    g_tau = gather_to_root(tau)
+    g_d_lv = gather_to_root(d_lv)
+    g_d_rv = gather_to_root(d_rv)
+    g_d_epi = gather_to_root(d_epi)
+    g_d_sum = gather_to_root(d_sum)
+    g_is_geometric_septum = gather_to_root(is_geometric_septum)
+    g_is_ldrb_septum = gather_to_root(is_ldrb_septum)
+    g_study_region = gather_to_root(study_region)
+    g_region_tags = gather_to_root(region_tags)
+    g_w_total = gather_to_root(cum_w_total)
+    g_w_ff = gather_to_root(cum_w_ff)
+    g_w_ss = gather_to_root(cum_w_ss)
+    g_w_nn = gather_to_root(cum_w_nn)
+    g_w_cross = gather_to_root(cum_w_cross)
+    g_proxy_PLV_ff = gather_to_root(cum_proxy_PLV_ff)
+    g_proxy_PRV_ff = gather_to_root(cum_proxy_PRV_ff)
+    g_proxy_Trans_ff = gather_to_root(cum_proxy_Trans_ff)
+    g_proxy_PLV_ll = gather_to_root(cum_proxy_PLV_ll)
+    g_proxy_PRV_ll = gather_to_root(cum_proxy_PRV_ll)
+    g_proxy_Trans_ll = gather_to_root(cum_proxy_Trans_ll)
+    g_cell_volumes = gather_to_root(cell_volumes)
+    g_centroids = gather_to_root(centroids)
+    g_lvrv_vals = gather_to_root(lvrv_vals)
+    g_epi_vals = gather_to_root(epi_vals)
+    # New: envelope and entry_t for the threshold-relaxation sweep
+    g_envelope = gather_to_root(envelope)
+    g_entry_t = gather_to_root(entry_t)
+    g_touches_epi = gather_to_root(touches_epi)
+
+    if rank == 0:
+        # Filename: if we're processing a specific beat (via --beat or --all-beats),
+        # tag the output with the beat index. Otherwise (default: last beat only),
+        # use the unversioned filename.
+        if _args.all_beats or _args.beat is not None:
+            output_path = results_dir / f"per_cell_data_beat{_current_beat_idx}.npz"
+        else:
+            output_path = results_dir / "per_cell_data.npz"
+        np.savez(output_path,
+                 tau=g_tau,
+                 d_lv=g_d_lv,
+                 d_rv=g_d_rv,
+                 d_epi=g_d_epi,
+                 d_sum=g_d_sum,
+                 is_geometric_septum=g_is_geometric_septum,
+                 is_ldrb_septum=g_is_ldrb_septum,
+                 study_region=g_study_region,
+                 region_tags=g_region_tags,
+                 # Threshold-relaxation sweep fields (Question A)
+                 envelope=g_envelope,
+                 entry_t=g_entry_t,
+                 touches_epi=g_touches_epi,
+                 # Per-cell work
+                 w_total=g_w_total,
+                 w_ff=g_w_ff,
+                 w_ss=g_w_ss,
+                 w_nn=g_w_nn,
+                 w_cross=g_w_cross,
+                 proxy_PLV_ff=g_proxy_PLV_ff,
+                 proxy_PRV_ff=g_proxy_PRV_ff,
+                 proxy_Trans_ff=g_proxy_Trans_ff,
+                 proxy_PLV_ll=g_proxy_PLV_ll,
+                 proxy_PRV_ll=g_proxy_PRV_ll,
+                 proxy_Trans_ll=g_proxy_Trans_ll,
+                 cell_volumes=g_cell_volumes,
+                 centroids=g_centroids,
+                 lv_rv_scalar=g_lvrv_vals,
+                 epi_scalar_dg0=g_epi_vals,
+                 # DG0 vs scalar integration cross-check (machine-precision invariant)
+                 w_total_scalar_integral=w_total_scalar_global,
+                 w_ff_scalar_integral=w_ff_scalar_global,
+                 # Tagging mode used (for provenance)
+                 tagging_mode=np.array(
+                     "canonical" if _mode_canonical else ("tag_at_ed" if _mode_ed else "tag_at_unloaded")
+                 ),
+                 # Envelope parameters used (for provenance)
+                 envelope_d_epi_min_mm=_args.d_epi_min_mm,
+                 envelope_d_sum_min_mm=_args.d_sum_min_mm,
+                 envelope_d_sum_max_mm=_args.d_sum_max_mm,
+        )
+        logger.info(f"Saved per-cell data to {output_path}")
+        logger.info(f"  Global cells: {len(g_tau)}")
+        logger.info(f"  Envelope cells: {int(g_envelope.sum())}")
+        logger.info(f"  Geometric septum: {int(g_is_geometric_septum.sum())}")
+        logger.info(f"  entry_t range in envelope: [{g_entry_t[g_envelope].min():.4f}, "
+                    f"{g_entry_t[g_envelope].max():.4f}]")
+        logger.info("Done.")

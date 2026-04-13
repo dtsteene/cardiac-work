@@ -1,5 +1,6 @@
 results/
 !results/bench/
+!results/docs/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/

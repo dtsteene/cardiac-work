@@ -2,268 +2,195 @@
 """
 eval_proxies.py
 
-Quantitatively compares True Internal Work vs. Clinical Proxies.
-Generates:
-1. 'proxy_validation.png': Bar charts of Total Work and Regression plots of Power.
-2. Console Report: Exact Error % and Correlation Coefficients.
+Per-simulation proxy validation: how well do clinical pressure-strain proxies
+track the FEM ground truth (total internal work S:dE)?
+
+Two proxy strain types:
+  - Longitudinal (ll): the clinical proxy — measurable via speckle tracking (GLS)
+  - Fiber (ff): computational reference — requires known fiber orientation
+
+For the septum, each strain type is evaluated with three pressure definitions:
+  Trans (P_LV - P_RV), P_LV only, P_RV only.
+
+Outputs:
+  proxy_validation.png  — regression scatter (true vs proxy power)
+  proxy_stats.json      — R², slope, ratio per region/proxy
 
 Usage:
   python3 eval_proxies.py <results_folder>
 """
 
-import sys
 import argparse
 import json
+import sys
+
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
 from pathlib import Path
 from scipy.stats import pearsonr
 
-def load_metrics(results_dir):
-    path = Path(results_dir)
-    if path.suffix == ".npy": fpath = path
-    else:
-        # Prefer full resolution or downsample 1 for accuracy
-        candidates = sorted(list(path.glob("metrics_downsample_*.npy")), key=lambda p: len(p.name))
-        if not candidates: return None
-        fpath = candidates[0]
-    
-    print(f"📂 Loading: {fpath.name}")
-    return np.load(fpath, allow_pickle=True).item()
+from plot_utils import setup_style, load_metrics, REGION_COLORS, save_fig
 
-def get_data(metrics, key):
-    return np.array(metrics.get(key, [])) if key in metrics else None
 
-def calculate_stats(true_power, proxy_power):
-    """Calculates quantitative agreement metrics."""
-    if true_power is None or proxy_power is None: return None
-    if len(true_power) != len(proxy_power):
-        min_len = min(len(true_power), len(proxy_power))
-        true_power = true_power[:min_len]
-        proxy_power = proxy_power[:min_len]
+# ─── Statistics ───────────────────────────────────────────────────────────────
 
-    # 1. Total Work (Integral) - Joules
-    # Assuming uniform dt (sum is proportional to integral)
-    W_true = np.sum(true_power)
-    W_proxy = np.sum(proxy_power)
-    
-    # Avoid div by zero
-    if abs(W_true) < 1e-9: ratio = 0.0
-    else: ratio = W_proxy / W_true
-    
-    pct_error = (W_proxy - W_true) / W_true * 100.0
-
-    # 2. Temporal Correlation (Pearson R)
-    r_val, _ = pearsonr(true_power, proxy_power)
-    
+def _stats(truth, proxy):
+    """R², linear slope, and work ratio between two timeseries."""
+    if truth is None or proxy is None:
+        return None
+    n = min(len(truth), len(proxy))
+    t, p = truth[:n], proxy[:n]
+    W_true, W_proxy = float(np.sum(t)), float(np.sum(p))
+    ratio = W_proxy / W_true if abs(W_true) > 1e-12 else 0.0
+    r, _ = pearsonr(t, p)
+    slope = np.polyfit(t, p, 1)[0]
     return {
-        "W_true": W_true,
-        "W_proxy": W_proxy,
-        "Ratio": ratio,
-        "Error_Pct": pct_error,
-        "R_squared": r_val**2
+        "W_true": W_true, "W_proxy": W_proxy,
+        "Ratio": ratio, "R_squared": r**2, "Slope": slope,
     }
 
-def analyze_proxies(metrics, outdir, truth_type="total"):
-    # --- PROXY CONFIGURATION (Total vs Fiber) ---
-    if truth_type == "fiber":
-        print("🔍 ANALYSIS MODE: Fiber Work (Projected)")
-        key_lv = "work_ff_LV"
-        key_rv = "work_ff_RV"
-        key_sep = "work_ff_Septum" 
-        title_suffix = "(Fiber Work)"
-    else:
-        print("🔍 ANALYSIS MODE: Total Work (Tensor S:dE)")
-        key_lv = "work_true_LV"
-        key_rv = "work_true_RV"
-        key_sep = "work_true_Septum"
-        title_suffix = "(Total Stress-Strain)"
 
-    # --- DATA PREP ---
-    # True Work Powers (Watts/step)
-    tru_lv = get_data(metrics, key_lv)
-    tru_sep = get_data(metrics, key_sep)
-    tru_rv = get_data(metrics, key_rv)
+def _get(m, key):
+    return np.array(m[key]) if key in m else None
 
-    # Proxies - LV
-    # 1. PV Loop Proxy (P*dV)
-    prx_pv_lv = get_data(metrics, "work_proxy_pv_LV")
-    # 2. PS Loop Proxy (P*dE*V)
-    prx_ps_lv = get_data(metrics, "work_ps_ff_LV")
 
-    # Proxies - Septum (The Investigation)
-    prx_sep_trans = get_data(metrics, "work_ps_ff_Septum_Trans") # P_LV - P_RV
-    prx_sep_plv   = get_data(metrics, "work_ps_ff_Septum_PLV")   # P_LV
-    prx_sep_prv   = get_data(metrics, "work_ps_ff_Septum_PRV")   # P_RV
+# ─── Figure ───────────────────────────────────────────────────────────────────
 
-    # Proxies - RV
-    prx_pv_rv = get_data(metrics, "work_proxy_pv_RV")
-    prx_ps_rv = get_data(metrics, "work_ps_ff_RV")
+def _plot_regression(ax, truth, proxy, label, color):
+    """Scatter + linear fit. Returns slope."""
+    if truth is None or proxy is None:
+        return None
+    n = min(len(truth), len(proxy))
+    x, y = truth[:n], proxy[:n]
+    ax.scatter(x, y, alpha=0.25, s=8, color=color, label=label)
+    m, b = np.polyfit(x, y, 1)
+    ax.plot(x, m * x + b, color=color, lw=1.5)
+    return m
 
-    # --- FIGURE SETUP ---
-    fig = plt.figure(figsize=(18, 10))
-    gs = gridspec.GridSpec(2, 3, figure=fig, height_ratios=[1, 1.2])
-    fig.suptitle(f"True Work vs. Proxies {title_suffix}", fontsize=16, fontweight='bold')
 
-    # --- ROW 1: TOTAL CYCLE ENERGY COMPARISON (Bar Charts) ---
-    
-    # 1. LV Comparison
-    ax_lv = fig.add_subplot(gs[0, 0])
-    stats_lv_pv = calculate_stats(tru_lv, prx_pv_lv)
-    stats_lv_ps = calculate_stats(tru_lv, prx_ps_lv)
-    
-    vals = [stats_lv_pv["W_true"], stats_lv_pv["W_proxy"], stats_lv_ps["W_proxy"]]
-    labels = ["True (S:E)", "PV (P·dV)", "PS (P·dE)"]
-    colors = ['black', 'tab:blue', 'tab:cyan']
-    
-    bars = ax_lv.bar(labels, vals, color=colors, alpha=0.7)
-    ax_lv.bar_label(bars, fmt='%.1e', padding=3)
-    ax_lv.set_title("Left Ventricle: Total Work", fontweight='bold')
-    ax_lv.set_ylabel("Work (Arbitrary Units / Joules)")
-    
-    # 2. Septum Comparison (The Big Question)
-    ax_sep = fig.add_subplot(gs[0, 1])
-    
-    # Stats for Septum variants
-    s_trans = calculate_stats(tru_sep, prx_sep_trans)
-    s_plv   = calculate_stats(tru_sep, prx_sep_plv)
-    s_prv   = calculate_stats(tru_sep, prx_sep_prv)
+def analyze_proxies(metrics, outdir):
+    setup_style()
+    outdir = Path(outdir)
 
-    sep_vals = [s_trans["W_true"], s_trans["W_proxy"], s_plv["W_proxy"], s_prv["W_proxy"]]
-    sep_lbls = ["True", "Trans\n(LV-RV)", "P_LV", "P_RV"]
-    sep_cols = ['black', 'tab:green', 'tab:blue', 'tab:red']
-    
-    bars_sep = ax_sep.bar(sep_lbls, sep_vals, color=sep_cols, alpha=0.7)
-    ax_sep.bar_label(bars_sep, fmt='%.1e', padding=3)
-    ax_sep.set_title("Septum: Which Pressure Fits?", fontweight='bold')
+    # Ground truth
+    tru = {r: _get(metrics, f"work_true_{r}") for r in ["LV", "RV", "Septum"]}
 
-    # 3. RV Comparison
-    ax_rv = fig.add_subplot(gs[0, 2])
-    stats_rv_pv = calculate_stats(tru_rv, prx_pv_rv)
-    stats_rv_ps = calculate_stats(tru_rv, prx_ps_rv)
-    
-    rv_vals = [stats_rv_pv["W_true"], stats_rv_pv["W_proxy"], stats_rv_ps["W_proxy"]]
-    rv_lbls = ["True", "PV", "PS"]
-    rv_cols = ['black', 'tab:red', 'tab:orange']
-    
-    bars_rv = ax_rv.bar(rv_lbls, rv_vals, color=rv_cols, alpha=0.7)
-    ax_rv.bar_label(bars_rv, fmt='%.1e', padding=3)
-    ax_rv.set_title("Right Ventricle: Total Work", fontweight='bold')
+    # Proxies: ll (clinical) and ff (computational reference)
+    proxy = {}
+    for strain in ["ll", "ff"]:
+        proxy[(strain, "LV")] = _get(metrics, f"work_ps_{strain}_LV")
+        proxy[(strain, "RV")] = _get(metrics, f"work_ps_{strain}_RV")
+        for pdef in ["Trans", "PLV", "PRV"]:
+            proxy[(strain, "Septum", pdef)] = _get(metrics, f"work_ps_{strain}_Septum_{pdef}")
 
-    # --- ROW 2: INSTANTANEOUS POWER REGRESSION (Scatter) ---
-    # Plot True Power (X) vs Proxy Power (Y). Ideal is y=x line.
-    
-    def plot_regression(ax, true_p, proxy_p, label, color):
-        if true_p is None or proxy_p is None: return
-        min_l = min(len(true_p), len(proxy_p))
-        x = true_p[:min_l]
-        y = proxy_p[:min_l]
-        
-        # Scatter
-        ax.scatter(x, y, alpha=0.3, s=10, color=color, label=label)
-        
-        # Fit Line
-        m, b = np.polyfit(x, y, 1)
-        ax.plot(x, m*x + b, color=color, linewidth=1.5, linestyle='-')
-        
-        return m, b
+    # ── Figure: 2 rows (ll, ff) × 3 cols (LV, Septum, RV) ──
+    fig, axes = plt.subplots(2, 3, figsize=(14, 8))
+    strain_labels = {"ll": "Longitudinal (clinical)", "ff": "Fiber (computational)"}
+    sep_colors = {"Trans": "tab:green", "PLV": REGION_COLORS["LV"], "PRV": REGION_COLORS["RV"]}
 
-    # 4. LV Power Regression
-    ax_reg_lv = fig.add_subplot(gs[1, 0])
-    ax_reg_lv.plot([min(tru_lv), max(tru_lv)], [min(tru_lv), max(tru_lv)], 'k--', alpha=0.5, label="Ideal (y=x)")
-    
-    m_pv, _ = plot_regression(ax_reg_lv, tru_lv, prx_pv_lv, "PV Proxy", "tab:blue")
-    m_ps, _ = plot_regression(ax_reg_lv, tru_lv, prx_ps_lv, "PS Proxy", "tab:cyan")
-    
-    ax_reg_lv.set_title(f"LV Power Correlation\nSlope PV={m_pv:.2f}, PS={m_ps:.2f}")
-    ax_reg_lv.set_xlabel("True Power (S:E)")
-    ax_reg_lv.set_ylabel("Proxy Power")
-    ax_reg_lv.legend()
-    ax_reg_lv.grid(True, alpha=0.3)
+    all_stats = {}
 
-    # 5. Septum Power Regression
-    ax_reg_sep = fig.add_subplot(gs[1, 1])
-    ax_reg_sep.plot([min(tru_sep), max(tru_sep)], [min(tru_sep), max(tru_sep)], 'k--', alpha=0.5)
-    
-    m_trans, _ = plot_regression(ax_reg_sep, tru_sep, prx_sep_trans, "Trans (LV-RV)", "tab:green")
-    m_plv, _   = plot_regression(ax_reg_sep, tru_sep, prx_sep_plv, "P_LV Only", "tab:blue")
-    
-    ax_reg_sep.set_title(f"Septum Correlation\nSlope Trans={m_trans:.2f}, LV={m_plv:.2f}")
-    ax_reg_sep.set_xlabel("True Power (S:E)")
-    ax_reg_sep.legend()
-    ax_reg_sep.grid(True, alpha=0.3)
+    for row, strain in enumerate(["ll", "ff"]):
+        all_stats[strain] = {}
 
-    # 6. RV Power Regression
-    ax_reg_rv = fig.add_subplot(gs[1, 2])
-    ax_reg_rv.plot([min(tru_rv), max(tru_rv)], [min(tru_rv), max(tru_rv)], 'k--', alpha=0.5)
-    
-    m_rv_pv, _ = plot_regression(ax_reg_rv, tru_rv, prx_pv_rv, "PV Proxy", "tab:red")
-    
-    ax_reg_rv.set_title(f"RV Correlation\nSlope PV={m_rv_pv:.2f}")
-    ax_reg_rv.set_xlabel("True Power (S:E)")
-    ax_reg_rv.grid(True, alpha=0.3)
+        # LV
+        ax = axes[row, 0]
+        t = tru["LV"]
+        p = proxy[(strain, "LV")]
+        if t is not None:
+            ax.plot([t.min(), t.max()], [t.min(), t.max()], "k--", alpha=0.4, lw=0.8)
+        s = _stats(t, p)
+        _plot_regression(ax, t, p, "PS proxy", REGION_COLORS["LV"])
+        all_stats[strain]["LV"] = s
+        ax.set_title(f"LV — {strain_labels[strain]}")
+        if s:
+            ax.text(0.05, 0.92, f"R²={s['R_squared']:.3f}  slope={s['Slope']:.3f}",
+                    transform=ax.transAxes, fontsize=8, va="top")
+        if row == 1:
+            ax.set_xlabel("True work rate (S:dE)")
+        ax.set_ylabel("Proxy work rate")
 
-    plt.tight_layout()
-    outpath = Path(outdir) / "proxy_validation.png"
-    plt.savefig(outpath, dpi=150)
-    print(f"✅ Saved plot: {outpath}")
-    
-    # --- PRINT TEXT REPORT ---
-    print("\n" + "="*60)
-    print(f"{'PROXY EVALUATION REPORT':^60}")
-    print("="*60)
-    print(f"{'Region / Proxy':<25} | {'Error %':>10} | {'Ratio':>8} | {'R² (Timing)':>10}")
-    print("-" * 60)
-    
-    def pr(name, s):
-        print(f"{name:<25} | {s['Error_Pct']:>10.1f}% | {s['Ratio']:>8.2f} | {s['R_squared']:>10.3f}")
+        # Septum
+        ax = axes[row, 1]
+        t = tru["Septum"]
+        if t is not None:
+            ax.plot([t.min(), t.max()], [t.min(), t.max()], "k--", alpha=0.4, lw=0.8)
+        all_stats[strain]["Septum"] = {}
+        y_offset = 0.92
+        for pdef in ["Trans", "PLV", "PRV"]:
+            p = proxy[(strain, "Septum", pdef)]
+            label = {"Trans": "ΔP (LV−RV)", "PLV": "P_LV", "PRV": "P_RV"}[pdef]
+            _plot_regression(ax, t, p, label, sep_colors[pdef])
+            s = _stats(t, p)
+            all_stats[strain]["Septum"][pdef] = s
+            if s:
+                ax.text(0.05, y_offset, f"{label}: R²={s['R_squared']:.3f}  slope={s['Slope']:.3f}",
+                        transform=ax.transAxes, fontsize=7, va="top", color=sep_colors[pdef])
+                y_offset -= 0.09
+        ax.set_title(f"Septum — {strain_labels[strain]}")
+        ax.legend(fontsize=7, loc="lower right")
+        if row == 1:
+            ax.set_xlabel("True work rate (S:dE)")
 
-    pr("LV: PV (P*dV)", stats_lv_pv)
-    pr("LV: PS (P*dE)", stats_lv_ps)
-    print("-" * 60)
-    pr("Septum: Trans (LV-RV)", s_trans)
-    pr("Septum: P_LV Only", s_plv)
-    pr("Septum: P_RV Only", s_prv)
-    print("-" * 60)
-    pr("RV: PV (P*dV)", stats_rv_pv)
-    pr("RV: PS (P*dE)", stats_rv_ps)
-    print("="*60)
+        # RV
+        ax = axes[row, 2]
+        t = tru["RV"]
+        p = proxy[(strain, "RV")]
+        if t is not None:
+            ax.plot([t.min(), t.max()], [t.min(), t.max()], "k--", alpha=0.4, lw=0.8)
+        s = _stats(t, p)
+        _plot_regression(ax, t, p, "PS proxy", REGION_COLORS["RV"])
+        all_stats[strain]["RV"] = s
+        ax.set_title(f"RV — {strain_labels[strain]}")
+        if s:
+            ax.text(0.05, 0.92, f"R²={s['R_squared']:.3f}  slope={s['Slope']:.3f}",
+                    transform=ax.transAxes, fontsize=8, va="top")
+        if row == 1:
+            ax.set_xlabel("True work rate (S:dE)")
 
-    # --- SAVE STATS TO JSON ---
-    stats_out = {
-        "metadata": {"truth_type": truth_type},
-        "LV": {
-            "PV": stats_lv_pv, "PS": stats_lv_ps,
-            "Correlation_Slope_PV": m_pv, "Correlation_Slope_PS": m_ps
-        },
-        "Septum": {
-            "Trans": s_trans, "PLV": s_plv, "PRV": s_prv,
-            "Correlation_Slope_Trans": m_trans, "Correlation_Slope_PLV": m_plv
-        },
-        "RV": {
-            "PV": stats_rv_pv, "PS": stats_rv_ps,
-            "Correlation_Slope_PV": m_rv_pv
-        }
-    }
-    json_path = Path(outdir) / "proxy_stats.json"
-    with open(json_path, 'w') as f:
-        json.dump(stats_out, f, indent=4)
-    print(f"✅ Saved stats JSON: {json_path.name}")
+    fig.suptitle("Proxy vs True Internal Work (S:dE)", fontsize=13, y=0.98)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    save_fig(fig, outdir, "proxy_validation.png")
+
+    # ── Console report ──
+    print("\n" + "=" * 72)
+    print(f"{'PROXY EVALUATION REPORT':^72}")
+    print("=" * 72)
+    print(f"{'Strain':<8} {'Region / Pressure':<25} {'Ratio':>8} {'R²':>8} {'Slope':>8}")
+    print("-" * 72)
+    for strain in ["ll", "ff"]:
+        tag = "ε_ll" if strain == "ll" else "ε_ff"
+        for region in ["LV", "RV"]:
+            s = all_stats[strain].get(region)
+            if s:
+                print(f"{tag:<8} {region:<25} {s['Ratio']:>8.3f} {s['R_squared']:>8.3f} {s['Slope']:>8.3f}")
+        for pdef in ["Trans", "PLV", "PRV"]:
+            s = all_stats[strain]["Septum"].get(pdef)
+            plabel = {"Trans": "Septum ΔP(LV-RV)", "PLV": "Septum P_LV", "PRV": "Septum P_RV"}[pdef]
+            if s:
+                print(f"{tag:<8} {plabel:<25} {s['Ratio']:>8.3f} {s['R_squared']:>8.3f} {s['Slope']:>8.3f}")
+        print("-" * 72)
+    print("=" * 72)
+
+    # ── JSON ──
+    json_path = outdir / "proxy_stats.json"
+    with open(json_path, "w") as f:
+        json.dump(all_stats, f, indent=2)
+    print(f"  Saved: {json_path}")
+
+
+# ─── CLI ──────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Evaluate Clinical Work Proxies against FEM Ground Truth")
-    parser.add_argument("results_folder", type=str, help="Path to the simulation results folder")
-    parser.add_argument("--truth", type=str, choices=["total", "fiber"], default="total", 
-                        help="Definition of Ground Truth: 'total' (Tensor S:dE) or 'fiber' (Fiber Projected)")
-    
+    parser = argparse.ArgumentParser(description="Evaluate pressure-strain proxies against FEM ground truth")
+    parser.add_argument("results_folder", type=str)
     args = parser.parse_args()
-    
+
     res_dir = Path(args.results_folder)
     if not res_dir.exists():
-        print(f"Error: Folder not found: {res_dir}")
+        print(f"Error: {res_dir} not found")
         sys.exit(1)
 
     metrics = load_metrics(res_dir)
     if metrics:
-        analyze_proxies(metrics, res_dir, truth_type=args.truth)
+        analyze_proxies(metrics, res_dir)

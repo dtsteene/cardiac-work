@@ -27,22 +27,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from pathlib import Path
 
-# --- 1. Data Loading ---
-def load_metrics(results_dir):
-    path = Path(results_dir)
-    # Smart find for the .npy file
-    if path.suffix == ".npy":
-        fpath = path
-    else:
-        # Try downsample 1 first, then others
-        candidates = sorted(list(path.glob("metrics_downsample_*.npy")), key=lambda p: len(p.name))
-        if not candidates:
-            print(f"❌ No metrics_downsample_*.npy found in {path}")
-            sys.exit(1)
-        fpath = candidates[0]
-
-    print(f"📂 Loading: {fpath.name}")
-    return np.load(fpath, allow_pickle=True).item()
+from plot_utils import load_metrics
 
 def get_arr(metrics, keys, min_len=None):
     """Helper to safely get array from list of possible keys"""

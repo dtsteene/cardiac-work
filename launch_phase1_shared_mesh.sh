@@ -21,9 +21,9 @@ if [ ! -d "$SHARED_GEOM/geometry.bp" ]; then
 fi
 
 CIRC_DIR="data/ukb_circ_v2"
-BEATS=${BEATS:-3}
+BEATS=${BEATS:-6}
 BPM=75
-PARTITION=${PARTITION:-rome16q}
+PARTITION=${PARTITION:-mi50q}
 
 echo "=== Phase 1 (shared mesh): 8 disease severities ==="
 echo "Shared mesh: $SHARED_GEOM"

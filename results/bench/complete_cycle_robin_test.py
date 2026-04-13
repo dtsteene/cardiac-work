@@ -622,7 +622,7 @@ neumann_lv = pulse.NeumannBC(traction=pressure_lv, marker=lv_marker_id)
 neumann_rv = pulse.NeumannBC(traction=pressure_rv, marker=rv_marker_id)
 
 bcs_prestress = pulse.BoundaryConditions(
-    robin=robin, dirichlet=(dirichlet_bc,), neumann=(neumann_lv, neumann_rv),
+    robin=robin, neumann=(neumann_lv, neumann_rv),
 )
 
 solver_dir = outdir / "solver"
@@ -720,7 +720,7 @@ cavities = [
     pulse.problem.Cavity(marker=rv_marker, volume=rv_volume),
 ]
 
-bcs_forward = pulse.BoundaryConditions(robin=robin, dirichlet=(dirichlet_bc,))
+bcs_forward = pulse.BoundaryConditions(robin=robin)
 
 problem = pulse.problem.StaticProblem(
     model=model,
