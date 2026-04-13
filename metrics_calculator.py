@@ -9,11 +9,18 @@ import basix.ufl
 import pulse
 
 class MetricsCalculator:
-    def __init__(self, geometry, geo, fiber_field_map, problem, comm, cardiac_model, metrics_space_type=("DG", 1), alpha_epi=1e5, alpha_base=1e6, hydro_pressure=None, one_sided_robin=False, aha_tags=None):
+    def __init__(self, geometry, geo, fiber_field_map, problem, comm, cardiac_model, metrics_space_type=("DG", 1), alpha_epi=1e5, alpha_base=1e6, hydro_pressure=None, one_sided_robin=False, aha_tags=None, enable_decomp=False, enable_research=False, enable_regional_internal=False):
         self.geometry = geometry
         self.geo = geo
         self.fiber_fields = fiber_field_map
         self.cardiac_model = cardiac_model
+
+        # Refactor 2026-04-13: canonical regional work lives in compute_per_cell.py.
+        # These flags gate the legacy regional + decomposition paths. Defaults are
+        # OFF; the caller (postprocess_metrics.py) re-enables them via --no-skip-*.
+        self.enable_decomp = enable_decomp
+        self.enable_research = enable_research
+        self.enable_regional_internal = enable_regional_internal
         
         # Register pressure for stress calculations if incompressible
         if hydro_pressure is not None:
