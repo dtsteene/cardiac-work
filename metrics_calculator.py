@@ -538,7 +538,12 @@ class MetricsCalculator:
             data["debug_Ta_internal_max"] = np.max(self.cardiac_model.active.activation.value.x.array)
         except Exception:
             data["debug_Ta_internal_max"] = 0.0
-        data["debug_S_active_max"] = np.max(self.S_active.x.array)
+        # debug_S_active_max reads the S_active tensor function, which is only
+        # interpolated when enable_regional_internal is on. In slim mode the
+        # array keeps its initial (zero) value, so suppress the key entirely
+        # to avoid reporting a stale 0.0.
+        if self.enable_regional_internal:
+            data["debug_S_active_max"] = np.max(self.S_active.x.array)
 
         l0_available = self.fiber_fields.get('l0', None) is not None
         regions = self._get_regions_to_integrate()
