@@ -538,7 +538,7 @@ elif _mode_unloaded:
 # IMPORTANT: the nearest-centroid matching approach without u_pre (older
 # version) was BROKEN — prestress drift was same order as inter-cell spacing,
 # giving ambiguous matches. u_pre is the missing piece.
-_canonical_permutation = None  # cg → ckpt cell index map
+_ckpt_to_cg_idx_global = None  # cg → ckpt cell index map
 if _mode_canonical and rank == 0:
     logger.info("=" * 70)
     logger.info("Canonical anatomical tagging mode (via u_pre permutation)")
@@ -588,21 +588,73 @@ if _mode_canonical:
     # centroids to ~1 mm (DG0 interpolation error, << inter-cell spacing).
     _cg_centroids_prestressed = _cg_centroids + _u_pre_per_cell
 
-    # Step 4: For each LOCAL checkpoint cell, find its canonical cg counterpart.
-    # This is a nearest-neighbor query in prestressed space, unambiguous because
-    # drift (~0.5-1 mm) << inter-cell spacing (~3.5 mm).
-    _tree_cg_prestressed = cKDTree(_cg_centroids_prestressed)
-    _dists, _ckpt_to_cg_idx = _tree_cg_prestressed.query(centroids)
-    _max_drift_local = float(_dists.max()) if len(_dists) > 0 else 0.0
+    # Step 4: Match each LOCAL checkpoint cell to its canonical cg counterpart.
+    #
+    # We use a GLOBAL linear sum assignment (Hungarian algorithm) instead of
+    # naive nearest-neighbor. This guarantees a true bijection: every cg cell
+    # is used exactly once, no duplicates, no orphans. The cost is one square
+    # assignment of ~n_global cells (~2153 for UKB) computed on each rank in
+    # ~10-20s, which is negligible vs the rest of the computation.
+    #
+    # History: earlier versions used cKDTree nearest-neighbor per rank. This
+    # failed on severe/end_stage (bijection 2152/2153 due to adjacent cells
+    # tilting toward the same cg centroid under large prestress drift). The
+    # linear_sum_assignment formulation eliminates this by construction.
+    from scipy.optimize import linear_sum_assignment
+    from scipy.spatial.distance import cdist
+
+    # Gather all local ckpt centroids to every rank. The resulting array is in
+    # MPI-rank order: [rank0's local cells, rank1's local cells, ...]. Total
+    # length equals n_global_cells (sum of size_local across ranks, ignoring
+    # ghosts because compute_midpoints was called with local_cells only).
+    _all_centroids_list = comm.allgather(centroids)
+    _all_ckpt_centroids = np.vstack(_all_centroids_list)
+    _local_sizes = [len(c) for c in _all_centroids_list]
+    _rank_offset = sum(_local_sizes[:rank])
+    _n_total = sum(_local_sizes)
+
+    if _n_total != _n_cg:
+        raise RuntimeError(
+            f"Total ckpt cells ({_n_total}) != n_cg ({_n_cg}). "
+            f"Mesh correspondence is broken — check that the checkpoint was "
+            f"generated from the same shared mesh as the canonical geometry."
+        )
+
+    # Build the square cost matrix and run linear_sum_assignment on every rank
+    # (deterministic; result is identical across ranks). Each rank then pulls
+    # its local slice of the global permutation.
+    _cost = cdist(_all_ckpt_centroids, _cg_centroids_prestressed)
+    _row_ind, _col_ind = linear_sum_assignment(_cost)
+    # row_ind == arange(n_total) for square inputs; col_ind is the full
+    # global permutation: global_ckpt_idx → cg_idx
+    _global_ckpt_to_cg_idx = _col_ind  # shape (n_total,)
+    _ckpt_to_cg_idx = _global_ckpt_to_cg_idx[_rank_offset:_rank_offset + n_local_cells]
+    # Expose the global permutation so the save block can write it into the
+    # per_cell_data.npz. Downstream scripts (especially visualization) can
+    # then invert it without re-running the u_pre + linear_sum_assignment dance.
+    _ckpt_to_cg_idx_global = _global_ckpt_to_cg_idx
+
+    # Sanity / diagnostics: compute the assignment drift on this rank's slice
+    _assigned_distances = _cost[np.arange(_rank_offset, _rank_offset + n_local_cells),
+                                _ckpt_to_cg_idx]
+    _max_drift_local = float(_assigned_distances.max()) if len(_assigned_distances) > 0 else 0.0
     _max_drift_global = comm.allreduce(_max_drift_local, op=MPI.MAX)
+
+    # Bijection check (should always pass with linear_sum_assignment on a square cost)
+    _n_unique_global = len(np.unique(_global_ckpt_to_cg_idx))
     if rank == 0:
-        logger.info(f"  u_pre permutation match: max drift = {_max_drift_global:.3e} m")
-        # Inter-cell spacing estimate (simple rough check)
         _spacing_est = (_cg_centroids.max(0) - _cg_centroids.min(0)).max() / (_n_cg ** (1/3))
-        if _max_drift_global > 0.5 * _spacing_est:
-            logger.warning(f"  drift exceeds 50% of cell spacing ({_spacing_est:.3e}) — check mesh correspondence!")
+        logger.info(f"  u_pre permutation (linear_sum_assignment): "
+                    f"max drift = {_max_drift_global:.3e} m")
+        logger.info(f"  Drift is within {_max_drift_global/_spacing_est*100:.1f}% "
+                    f"of inter-cell spacing (~{_spacing_est:.3e} m)")
+        if _n_unique_global != _n_cg:
+            logger.error(
+                f"  !! BIJECTION FAILED: {_n_unique_global}/{_n_cg} unique targets. "
+                f"This should not happen with linear_sum_assignment on a square cost."
+            )
         else:
-            logger.info(f"  Drift is within {_max_drift_global/_spacing_est*100:.1f}% of inter-cell spacing — safe")
+            logger.info(f"  ✓ Exact bijection: {_n_unique_global}/{_n_cg} cells mapped")
 
     # Step 5: Apply the permutation to pull canonical fields into ckpt ordering
     d_lv = _gf["d_lv"][_ckpt_to_cg_idx]
@@ -1156,6 +1208,14 @@ for _current_beat_idx in beats_to_process:
                  # Tagging mode used (for provenance)
                  tagging_mode=np.array(
                      "canonical" if _mode_canonical else ("tag_at_ed" if _mode_ed else "tag_at_unloaded")
+                 ),
+                 # Canonical mode permutation: global_ckpt_idx → cg_idx.
+                 # Only populated in --geometry-fields mode; empty otherwise.
+                 # Downstream visualization uses this to map per-cell fields
+                 # onto the cg atlas mesh without recomputing u_pre.
+                 ckpt_to_cg_idx=(
+                     _ckpt_to_cg_idx_global if _ckpt_to_cg_idx_global is not None
+                     else np.array([], dtype=np.int64)
                  ),
                  # Envelope parameters used (for provenance)
                  envelope_d_epi_min_mm=_args.d_epi_min_mm,
