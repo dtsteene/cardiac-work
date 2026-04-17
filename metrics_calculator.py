@@ -156,6 +156,30 @@ class MetricsCalculator:
         # AHA sub-region tags (Basal/Mid split of LV/RV/Septum)
         self.aha_tags = aha_tags
 
+        # Tau-based LV/RV split — TWO independent definitions computed for
+        # the simplification-cascade pedagogy and as a robustness check on
+        # the region split definition. Every wall cell is classified into
+        # LV territory or RV territory under each definition; no cell is
+        # excluded. Each territory is loaded by an unambiguous cavity
+        # pressure (P_LV or P_RV), which is the point of the split.
+        #
+        # (a) Euclidean:  tau_eu = d_LV / (d_LV + d_RV),
+        #                 LV iff tau_eu < 0.5. Deterministic geometric
+        #                 definition — "which endocardium is this cell
+        #                 closer to?" — uses nearest-vertex Euclidean
+        #                 distances to the two endocardial surfaces.
+        #
+        # (b) Laplace:    tau_lap solves ∇²u = 0 with u=0 on LV endo,
+        #                 u=1 on RV endo. LV iff tau_lap < 0.5. Smooth
+        #                 harmonic interpolation between the two cavities;
+        #                 the 0.5 isosurface is the electrostatic
+        #                 equipotential between them. Matches the LDRB
+        #                 algorithm's own internal tau field.
+        #
+        # Tag values: 11 = LV_tau_* (tau < 0.5), 12 = RV_tau_* (tau >= 0.5).
+        self.tau_tags_eu = self._build_tau_tags_euclid(geo)
+        self.tau_tags_lap = self._build_tau_tags_laplace(geo)
+
         # --- 4. Calculate Regional Wall Volumes for Unit Scaling ---
         # We need specific volumes for LV, RV, and Septum to scale the PS Indices correctly.
         self.region_volumes = {}
@@ -173,6 +197,24 @@ class MetricsCalculator:
                 self.region_volumes["RV"] = get_vol([2])      # RV Free Wall
                 self.region_volumes["Septum"] = get_vol([3])  # Septum
                 self.region_volumes["Whole"] = get_vol([1, 2, 3, 4]) # Whole Mesh
+
+            def get_tau_vol(tau_mt, tag_val):
+                if tau_mt is None:
+                    return 0.0
+                dx_tau = ufl.Measure("dx", domain=self.mesh,
+                                      subdomain_data=tau_mt,
+                                      metadata={"quadrature_degree": self.quadrature_degree})
+                val = dolfinx.fem.assemble_scalar(
+                    dolfinx.fem.form(dolfinx.fem.Constant(self.mesh, 1.0)
+                                      * dx_tau(int(tag_val))))
+                return self.comm.allreduce(val, op=MPI.SUM)
+
+            if self.tau_tags_eu is not None:
+                self.region_volumes["LV_tau_eu"] = get_tau_vol(self.tau_tags_eu, 11)
+                self.region_volumes["RV_tau_eu"] = get_tau_vol(self.tau_tags_eu, 12)
+            if self.tau_tags_lap is not None:
+                self.region_volumes["LV_tau_lap"] = get_tau_vol(self.tau_tags_lap, 11)
+                self.region_volumes["RV_tau_lap"] = get_tau_vol(self.tau_tags_lap, 12)
             else:
                  # Fallback if no tags
                  self.region_volumes["LV"] = 1.0
@@ -781,6 +823,152 @@ class MetricsCalculator:
         wd_base = self._assemble_compiled("robin_base")
         return {"work_robin_epi": wd_epi, "work_robin_base": wd_base}
 
+    def _resolve_lv_rv_tags(self, geo):
+        """Return (lv_facet_tag, rv_facet_tag, ffun) or (None, None, None)."""
+        markers = getattr(geo, "markers", None) or {}
+        lv_names = ("ENDO_LV", "LV")
+        rv_names = ("ENDO_RV", "RV")
+        lv_tag = next((markers[n][0] for n in lv_names if n in markers), None)
+        rv_tag = next((markers[n][0] for n in rv_names if n in markers), None)
+        ffun = getattr(geo, "ffun", None)
+        if lv_tag is None or rv_tag is None or ffun is None:
+            return None, None, None
+        return int(lv_tag), int(rv_tag), ffun
+
+    def _local_centroids(self):
+        """Return (n_local, 3) array of local cell centroids."""
+        n_local = self.mesh.topology.index_map(3).size_local
+        self.mesh.topology.create_connectivity(3, 0)
+        c2v = self.mesh.topology.connectivity(3, 0)
+        centroids = np.zeros((n_local, 3), dtype=np.float64)
+        for c in range(n_local):
+            vlist = c2v.links(c)
+            centroids[c] = self.mesh.geometry.x[vlist].mean(axis=0)
+        return centroids, n_local
+
+    def _cells_to_meshtags(self, values, n_local):
+        """Wrap a per-local-cell int32 array into a MeshTags on the mesh."""
+        indices = np.arange(n_local, dtype=np.int32)
+        return dolfinx.mesh.meshtags(self.mesh, 3, indices,
+                                      values.astype(np.int32))
+
+    def _build_tau_tags_euclid(self, geo):
+        """(a) Euclidean tau = d_LV / (d_LV + d_RV), LV iff tau < 0.5."""
+        try:
+            from scipy.spatial import cKDTree
+        except ImportError:
+            if self.rank == 0:
+                print("MetricsCalculator: scipy not available; tau_tags_eu disabled")
+            return None
+
+        lv_tag, rv_tag, ffun = self._resolve_lv_rv_tags(geo)
+        if ffun is None:
+            if self.rank == 0:
+                print("MetricsCalculator: tau_tags_eu disabled — LV/RV endo "
+                      "markers missing")
+            return None
+
+        # Gather LV / RV endo vertex coordinates (global across ranks)
+        self.mesh.topology.create_connectivity(2, 0)
+        f2v = self.mesh.topology.connectivity(2, 0)
+
+        def surface_vertices(tag):
+            facets = ffun.find(int(tag))
+            coords = [self.mesh.geometry.x[v]
+                      for f in facets for v in f2v.links(f)]
+            return (np.asarray(coords, dtype=np.float64)
+                    if coords else np.empty((0, 3), dtype=np.float64))
+
+        lv_local = surface_vertices(lv_tag)
+        rv_local = surface_vertices(rv_tag)
+        all_lv = self.comm.allgather(lv_local)
+        all_rv = self.comm.allgather(rv_local)
+        lv_global = (np.concatenate([a for a in all_lv if len(a)])
+                     if any(len(a) for a in all_lv) else np.empty((0, 3)))
+        rv_global = (np.concatenate([a for a in all_rv if len(a)])
+                     if any(len(a) for a in all_rv) else np.empty((0, 3)))
+        if len(lv_global) == 0 or len(rv_global) == 0:
+            if self.rank == 0:
+                print("MetricsCalculator: tau_tags_eu disabled — empty LV or RV surface")
+            return None
+
+        centroids, n_local = self._local_centroids()
+        d_lv = cKDTree(lv_global).query(centroids)[0]
+        d_rv = cKDTree(rv_global).query(centroids)[0]
+        tau = d_lv / (d_lv + d_rv + 1e-18)
+        values = np.where(tau < 0.5, 11, 12).astype(np.int32)
+        tau_mt = self._cells_to_meshtags(values, n_local)
+
+        n_lv_g = self.comm.allreduce(int((values == 11).sum()), op=MPI.SUM)
+        n_rv_g = self.comm.allreduce(int((values == 12).sum()), op=MPI.SUM)
+        if self.rank == 0:
+            print(f"MetricsCalculator: tau_tags_eu (Euclidean d_LV/(d_LV+d_RV)<0.5) — "
+                  f"LV_tau_eu={n_lv_g} cells, RV_tau_eu={n_rv_g} cells")
+        return tau_mt
+
+    def _build_tau_tags_laplace(self, geo):
+        """(b) Laplace tau: solve ∇²u = 0 with u=0 on LV endo, u=1 on RV endo.
+        LV iff tau_lap < 0.5."""
+        try:
+            from petsc4py import PETSc
+        except ImportError:
+            if self.rank == 0:
+                print("MetricsCalculator: petsc4py not available; tau_tags_lap disabled")
+            return None
+
+        lv_tag, rv_tag, ffun = self._resolve_lv_rv_tags(geo)
+        if ffun is None:
+            if self.rank == 0:
+                print("MetricsCalculator: tau_tags_lap disabled — LV/RV endo markers missing")
+            return None
+
+        V_CG1 = dolfinx.fem.functionspace(self.mesh, ("CG", 1))
+        u_tri = ufl.TrialFunction(V_CG1)
+        v_tst = ufl.TestFunction(V_CG1)
+        a_lap = ufl.dot(ufl.grad(u_tri), ufl.grad(v_tst)) * ufl.dx
+        L_zero = dolfinx.fem.Constant(self.mesh, 0.0) * v_tst * ufl.dx
+
+        self.mesh.topology.create_connectivity(2, 0)
+        lv_facets = ffun.find(lv_tag)
+        rv_facets = ffun.find(rv_tag)
+        lv_dofs = dolfinx.fem.locate_dofs_topological(V_CG1, 2, lv_facets)
+        rv_dofs = dolfinx.fem.locate_dofs_topological(V_CG1, 2, rv_facets)
+
+        # LV endo → 0, RV endo → 1 (so LV_tau_lap: tau_lap < 0.5, matching
+        # the Euclidean convention that LV cells are on the "small tau" side).
+        try:
+            problem = dolfinx.fem.petsc.LinearProblem(
+                a_lap, L_zero,
+                bcs=[
+                    dolfinx.fem.dirichletbc(PETSc.ScalarType(0.0), lv_dofs, V_CG1),
+                    dolfinx.fem.dirichletbc(PETSc.ScalarType(1.0), rv_dofs, V_CG1),
+                ],
+                petsc_options={"ksp_type": "preonly", "pc_type": "lu"},
+                petsc_options_prefix="metrics_tau_lap",
+            )
+            tau_cg1 = problem.solve()
+        except Exception as e:
+            if self.rank == 0:
+                print(f"MetricsCalculator: tau_tags_lap disabled — Laplace "
+                      f"solve failed: {e}")
+            return None
+
+        # Interpolate to DG0 (one value per cell)
+        V_DG0 = dolfinx.fem.functionspace(self.mesh, ("DG", 0))
+        tau_dg0 = dolfinx.fem.Function(V_DG0)
+        tau_dg0.interpolate(tau_cg1)
+        n_local = self.mesh.topology.index_map(3).size_local
+        tau_vals = tau_dg0.x.array[:n_local].copy()
+        values = np.where(tau_vals < 0.5, 11, 12).astype(np.int32)
+        tau_mt = self._cells_to_meshtags(values, n_local)
+
+        n_lv_g = self.comm.allreduce(int((values == 11).sum()), op=MPI.SUM)
+        n_rv_g = self.comm.allreduce(int((values == 12).sum()), op=MPI.SUM)
+        if self.rank == 0:
+            print(f"MetricsCalculator: tau_tags_lap (Laplace u<0.5, u=0 LV u=1 RV) — "
+                  f"LV_tau_lap={n_lv_g} cells, RV_tau_lap={n_rv_g} cells")
+        return tau_mt
+
     def _get_regions_to_integrate(self):
         regions = []
         if self.region_tags is not None:
@@ -788,6 +976,12 @@ class MetricsCalculator:
             regions.append(("RV", self.region_tags, [2]))
             regions.append(("Septum", self.region_tags, [3]))
             regions.append(("Whole", self.region_tags, [1, 2, 3])) #no 4
+        if self.tau_tags_eu is not None:
+            regions.append(("LV_tau_eu", self.tau_tags_eu, [11]))
+            regions.append(("RV_tau_eu", self.tau_tags_eu, [12]))
+        if self.tau_tags_lap is not None:
+            regions.append(("LV_tau_lap", self.tau_tags_lap, [11]))
+            regions.append(("RV_tau_lap", self.tau_tags_lap, [12]))
         if self.aha_tags is not None:
             regions.append(("Basal_LV", self.aha_tags, [1]))
             regions.append(("Basal_RV", self.aha_tags, [2]))

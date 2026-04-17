@@ -1,7 +1,7 @@
 #!/bin/bash
 # Phase 4: Thickness variants (collaborator request)
 #
-# Uses pre-built warp meshes in warp_meshes/thickness_study/
+# Uses pre-built warp meshes in thickness/warp_meshes/thickness_study/
 # Each variant = different RV/global wall thickening on the UKB baseline.
 # All variants use the same "severe" PAH circulation (RV_ESP=72 mmHg)
 # to isolate the effect of wall thickness on proxy accuracy.
@@ -36,7 +36,8 @@ VARIANTS=(
 )
 
 for VARIANT in "${VARIANTS[@]}"; do
-    GEOMETRY_DIR="${PWD}/warp_meshes/thickness_study/${VARIANT}/ukb/geometry"
+    GEOMETRY_DIR="${PWD}/thickness/warp_meshes/thickness_cl10/${VARIANT}/ukb/geometry"
+    GEOM_FIELDS="${GEOMETRY_DIR}/geometry_fields.npz"
 
     if [ ! -d "$GEOMETRY_DIR" ]; then
         echo "SKIP ${VARIANT} — geometry not found: $GEOMETRY_DIR"
@@ -46,14 +47,19 @@ for VARIANT in "${VARIANTS[@]}"; do
         echo "SKIP ${VARIANT} — geometry.bp missing in: $GEOMETRY_DIR"
         continue
     fi
+    if [ ! -f "$GEOM_FIELDS" ]; then
+        echo "SKIP ${VARIANT} — geometry_fields.npz missing: $GEOM_FIELDS"
+        echo "  Run: python3 precompute_geometry_fields.py $GEOMETRY_DIR"
+        continue
+    fi
 
     echo "Submitting: ${VARIANT} -> ${GEOMETRY_DIR}"
 
     JOB_ID=$(sbatch \
         --job-name="thick_${VARIANT}" \
         --partition=habanaq \
-        --time=12:00:00 \
-        --export=ALL,MESH=UKB,BPM=$BPM,BEATS=$BEATS,CIRCULATION_PARAMS=$CIRC_FILE,GEOMETRY_DIR=$GEOMETRY_DIR,COMMENT="Phase4 thickness ${VARIANT} severe ${BEATS}beats" \
+        --time=6:00:00 \
+        --export=ALL,MESH=UKB,BPM=$BPM,BEATS=$BEATS,CIRCULATION_PARAMS=$CIRC_FILE,GEOMETRY_DIR=$GEOMETRY_DIR,GEOMETRY_FIELDS=$GEOM_FIELDS,COMMENT="Phase4 thickness ${VARIANT} severe ${BEATS}beats" \
         run_sim_and_post.sbatch | awk '{print $4}')
 
     echo "  -> Job $JOB_ID"

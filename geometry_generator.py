@@ -91,8 +91,96 @@ def modify_wall_thickness(points, displacement_mm, logger=None):
     return pts
 
 
+def _thicken_via_epi_outward(points, displacement_mm, region, logger=None):
+    """Thicken the wall in `region` by pushing the epi surface OUTWARD.
+
+    Each epi point's displacement is weighted by how many of its 5 nearest
+    endo neighbors belong to the target endo region. Epi points deep inside
+    the target region get the full displacement; epi points far away get
+    zero; points at the boundary get a smoothly-varying fraction. This gives
+    a continuous displacement field that GMSH can mesh without introducing
+    sharp steps.
+
+    Sign convention matches the legacy endo functions: `displacement_mm < 0`
+    means the wall thickens. Here that translates to moving the epi surface
+    *outward* along the endo→epi direction by `abs(displacement_mm)` mm.
+
+    Returns
+    -------
+    np.ndarray
+        Modified point cloud (same shape as input).
+    """
+    from scipy.spatial import KDTree
+
+    if displacement_mm == 0.0:
+        return points.copy()
+
+    pts = points.copy()
+
+    # Define the endo target region
+    region_slices = {
+        "rv_fw": [slice(2165, 3224)],
+        "rv":    [slice(1500, 2165), slice(2165, 3224)],
+        "lv":    [slice(0, 1500)],
+        "uniform": [slice(0, 3224)],  # all endo — uniform thickening
+    }
+    if region not in region_slices:
+        raise ValueError(f"Unknown region '{region}'. "
+                          f"Choose from: {list(region_slices.keys())}")
+
+    # Mark every endo point; target_mask is True for endo points in the region
+    n_endo_total = _EPI_RANGE[0]
+    target_mask = np.zeros(n_endo_total, dtype=bool)
+    for sl in region_slices[region]:
+        target_mask[sl] = True
+
+    # All endo points (everything before the epi range starts)
+    endo_all = pts[:n_endo_total]
+    epi_lo, epi_hi = _EPI_RANGE
+    epi = pts[epi_lo:epi_hi]
+    n_epi = epi_hi - epi_lo
+
+    # For each epi point, find its 5 nearest endo neighbors
+    endo_tree = KDTree(endo_all)
+    k = min(5, len(endo_all))
+    dists, nearest_endo_idx = endo_tree.query(epi, k=k)
+    if k == 1:
+        nearest_endo_idx = nearest_endo_idx[:, np.newaxis]
+        dists = dists[:, np.newaxis]
+
+    # Fraction of the 5 nearest endo that are in the target region → smooth
+    # weight on the epi displacement. 1 inside target, 0 outside, smooth at boundary.
+    in_target = target_mask[nearest_endo_idx]           # (n_epi, k) bool
+    weight = in_target.mean(axis=1)                       # (n_epi,) in [0, 1]
+
+    # Outward direction at each epi point = epi − mean(nearest endo), normalized.
+    nearest_coords = endo_all[nearest_endo_idx]           # (n_epi, k, 3)
+    mean_endo = nearest_coords.mean(axis=1)               # (n_epi, 3)
+    outward = epi - mean_endo                             # (n_epi, 3)
+    norms = np.linalg.norm(outward, axis=1, keepdims=True)
+    norms = np.maximum(norms, 1e-10)
+    outward_hat = outward / norms
+
+    # Magnitude: negative displacement = thickening → epi moves outward by |disp|
+    magnitude_mm = -displacement_mm  # positive outward if disp negative
+    displace_vec = (weight * magnitude_mm)[:, np.newaxis] * outward_hat
+    pts[epi_lo:epi_hi] = epi + displace_vec
+
+    if logger:
+        active = weight > 0.01
+        n_active = int(active.sum())
+        max_mm = float(np.max(weight * abs(magnitude_mm)))
+        mean_mm = float(np.mean(weight[active] * abs(magnitude_mm))) if n_active else 0.0
+        logger.info(f"Regional thickness (epi_outward, region={region}): "
+                    f"displacement={displacement_mm:+.1f} mm, "
+                    f"{n_active}/{n_epi} epi points moved, "
+                    f"max outward = {max_mm:.2f} mm, mean outward = {mean_mm:.2f} mm")
+    return pts
+
+
 def modify_wall_thickness_regional(points, displacement_mm, region="all",
-                                    max_fraction=0.90, logger=None):
+                                    max_fraction=0.90, mode="epi_outward",
+                                    logger=None):
     """
     Modify wall thickness for a specific region only.
 
@@ -101,7 +189,8 @@ def modify_wall_thickness_regional(points, displacement_mm, region="all",
     points : np.ndarray, shape (n_points, 3)
         Full UKB point cloud.
     displacement_mm : float
-        How far to move endocardial points (mm). Negative = thickening.
+        How far to thicken (mm). Sign convention: *negative = wall thickens*
+        (matches modify_wall_thickness legacy).
     region : str
         Which region to thicken:
         - "all": all endocardial surfaces (same as modify_wall_thickness)
@@ -110,8 +199,19 @@ def modify_wall_thickness_regional(points, displacement_mm, region="all",
         - "lv": LV endo only (indices 0-1500)
     max_fraction : float
         Maximum displacement as fraction of local wall thickness (default 0.90).
-        Higher values allow more aggressive thickening. Safe for warp-based
-        meshes where the PDE solver maintains element quality.
+        Only used in mode="endo_clamp".
+    mode : str
+        Thickening strategy:
+        - "epi_outward" (default): push the epi surface OUTWARD at the
+          region adjacent to the target endo. Cavity volume is preserved
+          exactly; wall thickens by the full requested amount; no clamp
+          (outward direction is unbounded). Correct way to simulate
+          concentric hypertrophy and the only way to thicken past the
+          local wall thickness of the UKB mean atlas (~3 mm for RV FW,
+          which is the original saturation bug).
+        - "endo_clamp" (legacy): push the endo surface INWARD toward the
+          cavity; clamped at max_fraction * local_wall_thickness. Saturates
+          quickly for thin walls — kept for backwards compatibility.
     logger : logging.Logger, optional
 
     Returns
@@ -121,6 +221,9 @@ def modify_wall_thickness_regional(points, displacement_mm, region="all",
     """
     if region == "all":
         return modify_wall_thickness(points, displacement_mm, logger)
+
+    if mode == "epi_outward":
+        return _thicken_via_epi_outward(points, displacement_mm, region, logger)
 
     from scipy.spatial import KDTree
 
@@ -650,6 +753,7 @@ def generate_and_load(comm, outdir, args, logger, manual_refinement=False, geodi
 
     # Wall displacement: 0.0 = baseline, negative = thickening (mm)
     wall_displacement_mm = getattr(args, 'wall_displacement', 0.0)
+    wall_region = getattr(args, 'wall_region', 'all')
     pca_strategy = getattr(args, 'pca_strategy', None)
     pca_magnitude = getattr(args, 'pca_magnitude', 0.0)
     use_warp = getattr(args, 'warp', False)
@@ -726,14 +830,21 @@ def generate_and_load(comm, outdir, args, logger, manual_refinement=False, geodi
                         f"(displacement = {wall_displacement_mm:+.1f} mm)...")
 
             if use_warp:
-                logger.info("Using WARP method (topology-preserving)")
+                logger.info(f"Using WARP method (topology-preserving), region='{wall_region}'")
                 mean_points = _get_atlas_points(pca_scores=None)
-                target_points = modify_wall_thickness(mean_points, wall_displacement_mm, logger)
+                if wall_region == "all":
+                    target_points = modify_wall_thickness(mean_points, wall_displacement_mm, logger)
+                else:
+                    target_points = modify_wall_thickness_regional(
+                        mean_points, wall_displacement_mm,
+                        region=wall_region, logger=logger,
+                    )
                 geo = _generate_ukb_with_warp(
                     geodir, char_length, target_points, logger,
                     baseline_dir=baseline_dir,
-                    info={"mesh_type": "ukb_warp",
-                          "wall_displacement_mm": wall_displacement_mm},
+                    info={"mesh_type": "ukb_warp_thickness",
+                          "wall_displacement_mm": wall_displacement_mm,
+                          "wall_region": wall_region},
                 )
             else:
                 logger.info("Using REMESH method")
@@ -987,6 +1098,17 @@ if __name__ == "__main__":
               "Default: 0.0 (no change)")
     )
     parser.add_argument(
+        "--wall-region",
+        type=str,
+        default="all",
+        choices=["all", "rv_fw", "rv", "lv", "uniform"],
+        help=("Region to apply wall-displacement to. "
+              "'all' = every endocardial surface (global thickening). "
+              "'rv_fw' = RV free wall only (PAH hypertrophy pattern). "
+              "'rv' / 'lv' = all RV / all LV endocardium. "
+              "Default: 'all'.")
+    )
+    parser.add_argument(
         "--pca-strategy",
         type=str,
         choices=["rv_fw_no_size", "rv_all_no_size", "global_no_size", "max_rv_fw"],
@@ -1070,6 +1192,7 @@ if __name__ == "__main__":
             char_length=cli_args.char_length,
             mesh=mesh_path,
             wall_displacement=cli_args.wall_displacement,
+            wall_region=cli_args.wall_region,
             pca_strategy=cli_args.pca_strategy,
             pca_magnitude=cli_args.pca_magnitude,
             warp=cli_args.warp,

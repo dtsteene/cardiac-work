@@ -14,7 +14,9 @@
 # Usage:
 #   sbatch --export=RESULTS_DIR="/path/to/results_dir" run_postprocess_only.sbatch
 #   sbatch --export=RESULTS_DIR="/path/to/results_dir",RETAG_SEPTUM=1 run_postprocess_only.sbatch
+#   sbatch --export=RESULTS_DIR="/path/to/results_dir",RETAG_SEPTUM_ED=1 run_postprocess_only.sbatch
 #   sbatch --export=RESULTS_DIR="/path/to/results_dir",LAST_BEAT=1 run_postprocess_only.sbatch
+#   sbatch --export=RESULTS_DIR="/path/to/results_dir",GEOMETRY_DIR="/path/to/src/geometry" run_postprocess_only.sbatch
 
 if [ -z "$RESULTS_DIR" ]; then
     echo "ERROR: RESULTS_DIR not set. Use: sbatch --export=RESULTS_DIR=... run_postprocess_only.sbatch"
@@ -22,6 +24,7 @@ if [ -z "$RESULTS_DIR" ]; then
 fi
 
 RETAG_SEPTUM=${RETAG_SEPTUM:-0}
+RETAG_SEPTUM_ED=${RETAG_SEPTUM_ED:-0}
 LAST_BEAT=${LAST_BEAT:-0}
 
 SIM_DIR="/home/dtsteene/D1/cardiac-work"
@@ -43,11 +46,27 @@ if [ -f "simulation_params.json" ] && [ -d "solver/checkpoint.bp" ]; then
     EXTRA_ARGS=""
     if [ "$RETAG_SEPTUM" = "1" ]; then
         EXTRA_ARGS="$EXTRA_ARGS --retag-septum"
-        echo "  Using geometric septum retagging"
+        echo "  Using geometric septum retagging in REFERENCE frame"
+    fi
+    if [ "$RETAG_SEPTUM_ED" = "1" ]; then
+        EXTRA_ARGS="$EXTRA_ARGS --retag-septum-ed"
+        echo "  Using geometric septum retagging in END-DIASTOLIC frame (with preload)"
+    fi
+    if [ -n "$GEOMETRY_DIR" ]; then
+        EXTRA_ARGS="$EXTRA_ARGS --geometry-dir $GEOMETRY_DIR"
+        echo "  Using external geometry dir: $GEOMETRY_DIR"
     fi
     if [ "$LAST_BEAT" = "1" ]; then
         EXTRA_ARGS="$EXTRA_ARGS --last-beat"
         echo "  Processing last beat only"
+    fi
+    if [ "${REGIONAL_INTERNAL:-0}" = "1" ]; then
+        EXTRA_ARGS="$EXTRA_ARGS --no-skip-regional-internal"
+        echo "  Regional internal work computation ENABLED"
+    fi
+    if [ "${DECOMP:-0}" = "1" ]; then
+        EXTRA_ARGS="$EXTRA_ARGS --no-skip-decomp"
+        echo "  Directional decomposition (ss/nn) ENABLED"
     fi
     echo "Running postprocess_metrics.py ${EXTRA_ARGS}..."
     $CONDA_PREFIX/bin/mpirun -n ${SLURM_NTASKS} -launcher fork $CONDA_PREFIX/bin/python ${SIM_DIR}/postprocess_metrics.py . ${EXTRA_ARGS}

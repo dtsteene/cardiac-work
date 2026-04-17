@@ -43,13 +43,19 @@ parser.add_argument("--output-dir", type=Path, default=None,
                     help="Output directory for figures (default: first result dir / transventricular_analysis)")
 parser.add_argument("--label-from", choices=["description", "dirname"], default="description",
                     help="How to label each case in plots")
+parser.add_argument("--input-tag", type=str, default="",
+                    help="Load per_cell_data_<TAG>.npz instead of per_cell_data.npz. "
+                         "Use --input-tag canonical to consume data tagged in canonical "
+                         "(atlas / reference-configuration) mode. Default: the ED-tagged "
+                         "per_cell_data.npz file.")
 args = parser.parse_args()
 
 # ── Load all cases ───────────────────────────────────────────────────────────
 
 def load_case(result_dir: Path) -> dict:
     """Load per_cell_data.npz + metadata for a single sim."""
-    pc_path = result_dir / "per_cell_data.npz"
+    tag_part = f"_{args.input_tag}" if args.input_tag else ""
+    pc_path = result_dir / f"per_cell_data{tag_part}.npz"
     if not pc_path.exists():
         print(f"ERROR: {pc_path} not found. Run compute_per_cell.py first.")
         sys.exit(1)
@@ -140,6 +146,9 @@ def bin_profiles(data: dict, nbins: int) -> dict:
     study = data["study_region"]
     tau = data["tau"][study]
     vol = data["cell_volumes"][study]
+    # Physical distance from LV endo per cell (mm), for the secondary x-axis
+    d_lv_mm = data["d_lv"][study] * 1000.0
+    d_rv_mm = data["d_rv"][study] * 1000.0
 
     # Work arrays
     w_true = data["w_total"][study]
@@ -200,9 +209,24 @@ def bin_profiles(data: dict, nbins: int) -> dict:
             m = (tau >= lo) & (tau < hi)
         n_per_bin[i] = m.sum()
 
+    # Per-bin median physical distances (mm) for secondary-axis labelling
+    bin_d_lv_mm = np.full(nbins, np.nan)
+    bin_d_rv_mm = np.full(nbins, np.nan)
+    for i in range(nbins):
+        lo, hi = bin_edges[i], bin_edges[i + 1]
+        if i == nbins - 1:
+            m = (tau >= lo) & (tau <= hi)
+        else:
+            m = (tau >= lo) & (tau < hi)
+        if m.sum() > 0:
+            bin_d_lv_mm[i] = np.median(d_lv_mm[m])
+            bin_d_rv_mm[i] = np.median(d_rv_mm[m])
+
     return {
         "bin_edges": bin_edges,
         "bin_centers": bin_centers,
+        "bin_d_lv_mm": bin_d_lv_mm,
+        "bin_d_rv_mm": bin_d_rv_mm,
         "n_per_bin": n_per_bin,
         # Densities (work per unit volume)
         "w_true": vol_mean(w_true),
@@ -228,6 +252,32 @@ def bin_profiles(data: dict, nbins: int) -> dict:
 print("\nComputing profiles...")
 for c in cases:
     c["__profile"] = bin_profiles(c, args.nbins)
+
+
+def add_d_lv_mm_axis(ax, profile, label_only_if=True):
+    """Attach a secondary top x-axis labelled in mm (d_LV) using per-bin medians.
+
+    The bottom axis remains tau (normalized transmural position LV->RV).
+    The top axis shows the same tick positions but with text labels in mm,
+    computed from the bin-median d_LV of THIS case's profile. This keeps the
+    reader's physical intuition while the underlying binning stays in tau.
+    """
+    bin_centers = profile["bin_centers"]
+    d_lv_mm = profile["bin_d_lv_mm"]
+    # Pick a subset of bins so the top axis isn't crowded
+    step = max(1, len(bin_centers) // 6)
+    idx = np.arange(0, len(bin_centers), step)
+    ax_top = ax.twiny()
+    ax_top.set_xlim(ax.get_xlim())
+    ax_top.set_xticks(bin_centers[idx])
+    ax_top.set_xticklabels([
+        (f"{d_lv_mm[i]:.1f}" if np.isfinite(d_lv_mm[i]) else "")
+        for i in idx
+    ])
+    if label_only_if:
+        ax_top.set_xlabel("d_LV [mm]", fontsize=9)
+    ax_top.tick_params(axis="x", labelsize=8)
+    return ax_top
 
 # ── Figure 1: Transventricular profiles ─────────────────────────────────────
 
@@ -264,21 +314,31 @@ ax.set_title("Fiber-direction work (w_ff)")
 ax.grid(alpha=0.3)
 
 # Panel (1,0): Proxy comparison for severe/representative case
-# (show all proxies for the middle case)
+# (show all proxies for the middle case — dual y-axes because proxies
+#  and true work live on different magnitude scales by construction)
 ax = axes[1, 0]
 mid_idx = len(cases) // 2
 c = cases[mid_idx]
 p = c["__profile"]
-ax.plot(p["bin_centers"], p["w_true"], "k-o", label="True (S:dE)", lw=2, ms=5)
-ax.plot(p["bin_centers"], p["p_PLV_ff"], "b--s", label="P_LV × dE_ff", lw=1.5, ms=4)
-ax.plot(p["bin_centers"], p["p_PRV_ff"], "r--^", label="P_RV × dE_ff", lw=1.5, ms=4)
-ax.plot(p["bin_centers"], p["p_Trans_ff"], "g--d", label="(P_LV-P_RV) × dE_ff", lw=1.5, ms=4)
+# Left y-axis: true work
+l_true, = ax.plot(p["bin_centers"], p["w_true"], "k-o", label="True (S:dE)", lw=2, ms=5)
 ax.axhline(0, color="k", lw=0.5, alpha=0.5)
 ax.set_xlabel("tau (LV→RV)")
-ax.set_ylabel("Work density (arbitrary)")
-ax.set_title(f"Proxy vs True work — {c['__label']}")
-ax.legend(fontsize=9)
+ax.set_ylabel("True work density (Pa)", color="k")
+ax.tick_params(axis="y", labelcolor="k")
 ax.grid(alpha=0.3)
+# Right y-axis: proxies
+ax_r = ax.twinx()
+l_plv, = ax_r.plot(p["bin_centers"], p["p_PLV_ff"], "b--s", label="P_LV × dE_ff", lw=1.5, ms=4)
+l_prv, = ax_r.plot(p["bin_centers"], p["p_PRV_ff"], "r--^", label="P_RV × dE_ff", lw=1.5, ms=4)
+l_trn, = ax_r.plot(p["bin_centers"], p["p_Trans_ff"], "g--d", label="(P_LV-P_RV) × dE_ff", lw=1.5, ms=4)
+ax_r.set_ylabel("Proxy work density (Pa)", color="tab:blue")
+ax_r.tick_params(axis="y", labelcolor="tab:blue")
+ax.set_title(f"Proxy vs True work — {c['__label']}  (dual y-axes)")
+# Secondary top x-axis: d_LV in mm for physical intuition
+add_d_lv_mm_axis(ax, p)
+# Combined legend from both axes
+ax.legend(handles=[l_true, l_plv, l_prv, l_trn], fontsize=8, loc="best")
 
 # Panel (1,1): Proxy ratio R(tau) = w_proxy / w_true for Trans proxy across all cases
 ax = axes[1, 1]
@@ -310,28 +370,66 @@ plt.close(fig)
 
 n_cols = min(4, n_cases) if n_cases > 0 else 1
 n_rows = (n_cases + n_cols - 1) // n_cols
+# sharey=False because each subplot has its own dual y-axis scales
 fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 3.2 * n_rows),
-                         sharex=True, sharey=True, squeeze=False)
-fig.suptitle("Per-case proxy profiles — bin means in the study region", fontsize=12)
+                         sharex=True, sharey=False, squeeze=False)
+fig.suptitle("Per-case proxy profiles — bin means in the study region\n"
+             "(left y: True work density, right y: proxy work density — different magnitude scales)",
+             fontsize=11)
 axes = axes.flatten()
 
+# Keep a handle to the twin axes so we can share y-ranges across them.
+twin_axes = []
+first_ax, first_ax_r = None, None
+first_handles = None
 for ax, c in zip(axes, cases):
     p = c["__profile"]
-    ax.plot(p["bin_centers"], p["w_true"], "k-", label="True", lw=2)
-    ax.plot(p["bin_centers"], p["p_PLV_ff"], "b--", label="P_LV × dE_ff", lw=1.2)
-    ax.plot(p["bin_centers"], p["p_PRV_ff"], "r--", label="P_RV × dE_ff", lw=1.2)
-    ax.plot(p["bin_centers"], p["p_Trans_ff"], "g--", label="Trans × dE_ff", lw=1.2)
+    # Left y-axis: true work
+    l_true, = ax.plot(p["bin_centers"], p["w_true"], "k-", label="True", lw=2)
     ax.axhline(0, color="k", lw=0.5, alpha=0.5)
+    ax.grid(alpha=0.3)
+    ax.set_xlabel("tau")
+    ax.tick_params(axis="y", labelcolor="k")
+    if ax is axes[0]:
+        ax.set_ylabel("True (Pa)", color="k")
+    # Right y-axis: proxies
+    ax_r = ax.twinx()
+    l_plv, = ax_r.plot(p["bin_centers"], p["p_PLV_ff"], "b--", label="P_LV × dE_ff", lw=1.2)
+    l_prv, = ax_r.plot(p["bin_centers"], p["p_PRV_ff"], "r--", label="P_RV × dE_ff", lw=1.2)
+    l_trn, = ax_r.plot(p["bin_centers"], p["p_Trans_ff"], "g--", label="Trans × dE_ff", lw=1.2)
+    ax_r.tick_params(axis="y", labelcolor="tab:blue")
+    twin_axes.append(ax_r)
+    if ax is axes[min(n_cols - 1, len(cases) - 1)]:
+        ax_r.set_ylabel("Proxy (Pa)", color="tab:blue")
     title = c['__label']
     if c.get("__rv_esp"):
         title += f" (RV={c['__rv_esp']:.0f})"
     ax.set_title(title, fontsize=10)
-    ax.grid(alpha=0.3)
-    ax.set_xlabel("tau")
-    if ax is axes[0]:
-        ax.legend(fontsize=8, loc="best")
+    # Secondary top x-axis: d_LV in mm, this case's bin medians
+    add_d_lv_mm_axis(ax, p, label_only_if=(ax is axes[0]))
+    if first_handles is None:
+        first_handles = [l_true, l_plv, l_prv, l_trn]
 
-# Hide unused subplots
+# Share y-ranges across subplots so shape comparisons across cases are fair.
+# Left axes (true work)
+left_axes_with_data = [ax for ax, c in zip(axes, cases)]
+if left_axes_with_data:
+    lo = min(ax.get_ylim()[0] for ax in left_axes_with_data)
+    hi = max(ax.get_ylim()[1] for ax in left_axes_with_data)
+    for ax in left_axes_with_data:
+        ax.set_ylim(lo, hi)
+# Right axes (proxies)
+if twin_axes:
+    lo = min(ax.get_ylim()[0] for ax in twin_axes)
+    hi = max(ax.get_ylim()[1] for ax in twin_axes)
+    for ax in twin_axes:
+        ax.set_ylim(lo, hi)
+
+# Legend on the first subplot only
+if first_handles is not None:
+    axes[0].legend(handles=first_handles, fontsize=8, loc="best")
+
+# Hide unused subplots (both the axis and its twin)
 for ax in axes[len(cases):]:
     ax.set_visible(False)
 

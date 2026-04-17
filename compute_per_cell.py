@@ -77,6 +77,11 @@ _parser.add_argument("--beat", type=int, default=None,
                      help="Replay a specific beat (0-indexed) instead of the last beat. "
                           "Useful for per-beat convergence analysis. Output is written "
                           "to per_cell_data_beat{N}.npz instead of per_cell_data.npz.")
+_parser.add_argument("--output-tag", type=str, default="",
+                     help="Optional tag inserted into the output filename, e.g. "
+                          "--output-tag ed → per_cell_data_ed.npz (or "
+                          "per_cell_data_ed_beat{N}.npz with --all-beats). "
+                          "Lets you run multiple tagging modes without overwriting.")
 _parser.add_argument("--all-beats", action="store_true",
                      help="Replay EVERY beat in the checkpoint and save one per_cell_data_beat{N}.npz "
                           "per beat. Amortizes the mesh/fiber/form setup cost across all beats. "
@@ -868,16 +873,21 @@ if not _mode_canonical:
 # Region tags from marker (always needed, outside the _mode_canonical branch)
 region_tags = markers_mt.values[:n_local_cells]
 
+n_geo = comm.allreduce(int(is_geometric_septum.sum()))
+n_ldrb = comm.allreduce(int(is_ldrb_septum.sum()))
+n_study = comm.allreduce(int(study_region.sum()))
+# Gather tau values from all ranks' local study-region cells so the printed
+# range reflects the full study region rather than rank 0's local slice
+# (which may be empty after the canonical permutation remap).
+_local_tau_study = tau[study_region] if study_region.any() else np.empty(0, dtype=float)
+_gathered = comm.gather(_local_tau_study, root=0)
 if rank == 0:
-    n_geo = comm.allreduce(int(is_geometric_septum.sum()))
-    n_ldrb = comm.allreduce(int(is_ldrb_septum.sum()))
-    n_study = comm.allreduce(int(study_region.sum()))
     logger.info(f"Study region: geometric={n_geo}, LDRB={n_ldrb}, union={n_study}")
-    logger.info(f"Tau range in study region: [{tau[study_region].min():.3f}, {tau[study_region].max():.3f}]")
-else:
-    comm.allreduce(int(is_geometric_septum.sum()))
-    comm.allreduce(int(is_ldrb_septum.sum()))
-    comm.allreduce(int(study_region.sum()))
+    _all = np.concatenate(_gathered) if _gathered else np.empty(0)
+    if _all.size > 0:
+        logger.info(f"Tau range in study region: [{_all.min():.3f}, {_all.max():.3f}]")
+    else:
+        logger.info("Tau range in study region: [empty — no cells]")
 
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 4: Replay Last Beat + Accumulate Per-Cell Work
@@ -1168,10 +1178,11 @@ for _current_beat_idx in beats_to_process:
         # Filename: if we're processing a specific beat (via --beat or --all-beats),
         # tag the output with the beat index. Otherwise (default: last beat only),
         # use the unversioned filename.
+        _tag_part = f"_{_args.output_tag}" if _args.output_tag else ""
         if _args.all_beats or _args.beat is not None:
-            output_path = results_dir / f"per_cell_data_beat{_current_beat_idx}.npz"
+            output_path = results_dir / f"per_cell_data{_tag_part}_beat{_current_beat_idx}.npz"
         else:
-            output_path = results_dir / "per_cell_data.npz"
+            output_path = results_dir / f"per_cell_data{_tag_part}.npz"
         np.savez(output_path,
                  tau=g_tau,
                  d_lv=g_d_lv,

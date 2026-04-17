@@ -12,7 +12,7 @@
 #   bash submit_all_circ_optim.sh status     # quick status check
 # ==============================================================================
 
-SEVERITIES="healthy_low healthy borderline mild moderate moderate_severe severe very_severe end_stage"
+SEVERITIES="healthy_low healthy mild moderate moderate_severe severe very_severe end_stage"
 N_TRIALS=${1:-2500}
 
 # Status check mode

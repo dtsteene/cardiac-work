@@ -54,7 +54,21 @@ _parser.add_argument(
 _parser.add_argument(
     "--retag-septum", action="store_true", default=False,
     help="Recompute LV/RV/Septum region tags using the geometric distance-based method "
-         "(ldrb geometric-septum-tagging). Overrides markers from checkpoint.",
+         "(ldrb geometric-septum-tagging) in the REFERENCE (unloaded) configuration. "
+         "Overrides markers from checkpoint.",
+)
+_parser.add_argument(
+    "--retag-septum-ed", action="store_true", default=False,
+    help="Same geometric distance-based retagging, but performed in the END-DIASTOLIC "
+         "configuration (reference coords deformed by u(t=0), i.e. with preload applied). "
+         "Mutually exclusive with --retag-septum.",
+)
+_parser.add_argument(
+    "--geometry-dir", type=Path, default=None,
+    help="Path to source geometry folder (containing markers_geometry.json). Used only "
+         "for marker name\u2192tag mapping. Overrides <results_dir>/geometry. Needed when "
+         "the run directory does not contain a geometry subfolder (e.g. thickness-variant "
+         "runs that loaded geometry from an external path).",
 )
 # Refactor 2026-04-13: regional internal work is now compute_per_cell.py's
 # responsibility. These --skip-* flags default TRUE to match the new canonical
@@ -78,6 +92,9 @@ _parser.add_argument(
 )
 _args = _parser.parse_args()
 
+if _args.retag_septum and _args.retag_septum_ed:
+    raise SystemExit("--retag-septum and --retag-septum-ed are mutually exclusive")
+
 results_dir = _args.results_dir.resolve()
 edited_tags_path = _args.edited_tags
 comm = MPI.COMM_WORLD
@@ -100,6 +117,29 @@ if rank == 0:
     logger.info(f"Loaded simulation parameters from {sim_params_path}")
     logger.info(f"  BPM={sim_params['BPM']}, dt={sim_params['dt']}, "
                 f"incompressible={sim_params['incompressible']}")
+
+# ─── Resolve geometry folder (needed only for marker name→tag mapping) ───────
+# Fallback chain:
+#   1. --geometry-dir CLI arg
+#   2. <results_dir>/geometry  (symlink or real directory)
+#   3. sim_params["geometry_dir"]  (recorded by complete_cycle.py)
+if _args.geometry_dir is not None:
+    geo_dir = _args.geometry_dir.resolve()
+elif (results_dir / "geometry").exists():
+    geo_dir = results_dir / "geometry"
+elif "geometry_dir" in sim_params:
+    geo_dir = Path(sim_params["geometry_dir"]).resolve()
+else:
+    logger.error(
+        f"No geometry folder found. Looked at {results_dir / 'geometry'} and "
+        f"sim_params['geometry_dir']. Pass --geometry-dir <path> explicitly."
+    )
+    sys.exit(1)
+if not geo_dir.exists():
+    logger.error(f"Geometry directory does not exist: {geo_dir}")
+    sys.exit(1)
+if rank == 0:
+    logger.info(f"Using geometry folder for marker dict: {geo_dir}")
 
 # ─── 2. Load Ta History ──────────────────────────────────────────────────────
 
@@ -228,15 +268,18 @@ if edited_tags_path is not None:
         logger.info(f"  Overridden: {n_changed} cells changed "
                      f"(LV={n_lv}, RV={n_rv}, Septum={n_sept})")
 
-# ─── Optional: Geometric septum retagging ────────────────────────────────────
+# ─── Optional: Geometric septum retagging (REFERENCE frame) ──────────────────
 # Recomputes LV/RV/Septum cell tags using distance-based geometry:
 #   Septum = max(dist_to_LV_endo, dist_to_RV_endo) < dist_to_EPI
-# All data (mesh, ffun, centroids) comes from checkpoint.bp — no DOF mismatch risk.
+# Only the reference-frame variant runs here. The ED-frame variant
+# (--retag-septum-ed) is applied AFTER problem construction to avoid
+# allocating an extra P2 vector space before pulse builds its own, which
+# trips ffcx JIT compilation on some nodes.
 if _args.retag_septum:
     from scipy.spatial import cKDTree as _cKDTree
 
     if rank == 0:
-        logger.info("Recomputing region tags with geometric distance-based septum tagging...")
+        logger.info("Recomputing region tags with geometric distance-based septum tagging in reference (unloaded) frame...")
 
     # Log OLD tags for comparison
     _imap = mesh.topology.index_map(3)
@@ -249,9 +292,8 @@ if _args.retag_septum:
         logger.info(f"  OLD tags (global): LV={_old_lv}, RV={_old_rv}, Septum={_old_sept}")
 
     # Read marker name→tag mapping from geometry folder (just a dict, no DOF dependency)
-    _geo_dir_tmp = results_dir / "geometry"
     if rank == 0:
-        _geo_tmp = cardiac_geometries.geometry.Geometry.from_folder(MPI.COMM_SELF, _geo_dir_tmp)
+        _geo_tmp = cardiac_geometries.geometry.Geometry.from_folder(MPI.COMM_SELF, geo_dir)
         _raw_markers = _geo_tmp.markers
     else:
         _raw_markers = None
@@ -290,7 +332,7 @@ if _args.retag_septum:
     _tree_rv = _cKDTree(_rv_coords)
     _tree_epi = _cKDTree(_epi_coords)
 
-    # Compute distances at cell centroids (from the checkpoint mesh)
+    # Compute distances at cell centroids (deformed if ED mode)
     mesh.topology.create_connectivity(3, 0)
     _centroids = dolfinx.mesh.compute_midpoints(mesh, 3, np.arange(_n_local, dtype=np.int32))
 
@@ -322,8 +364,7 @@ if _args.retag_septum:
                      f"(LV: {_old_lv}→{_new_lv}, RV: {_old_rv}→{_new_rv}, "
                      f"Septum: {_old_sept}→{_new_sept})")
 
-# Load geometry folder for marker name mapping only
-geo_dir = results_dir / "geometry"
+# Load geometry folder for marker name mapping only (geo_dir resolved above)
 geo = cardiac_geometries.geometry.Geometry.from_folder(comm, geo_dir)
 
 # Build HeartGeometry (mesh is already in reference config — NO prestress needed)
@@ -465,6 +506,129 @@ problem = pulse.problem.StaticProblem(
 if rank == 0:
     logger.info("Problem reconstructed (material + BCs + cavities)")
 
+# ─── Optional: Geometric septum retagging in END-DIASTOLIC frame ─────────────
+# We deliberately defer this until AFTER the pulse.StaticProblem has been built:
+# allocating an extra P2 vector space and calling adios4dolfinx.read_function on
+# it BEFORE pulse's own problem.u exists corrupts ffcx JIT state on some
+# slurm nodes (Compilation failed on root node). By the time we reach this
+# point the problem is fully compiled, so we can safely reuse problem.u as the
+# temporary loader for u(t=0).
+#
+# The problem itself keeps using the ORIGINAL markers_mt (reference-config
+# partition), which is physically correct: that is the partition the forward
+# sim used to apply Ta. We only override markers_mt for the downstream
+# MetricsCalculator so that regional aggregation reflects the ED classification.
+if _args.retag_septum_ed:
+    from scipy.spatial import cKDTree as _cKDTree
+
+    if rank == 0:
+        logger.info("Recomputing region tags in END-DIASTOLIC frame (deferred, after problem build)...")
+
+    _imap_ed = mesh.topology.index_map(3)
+    _n_local_ed = _imap_ed.size_local
+    _old_tags_ed = markers_mt.values[:_n_local_ed].copy()
+    _old_lv_ed = comm.allreduce(int((_old_tags_ed == 1).sum()))
+    _old_rv_ed = comm.allreduce(int((_old_tags_ed == 2).sum()))
+    _old_sept_ed = comm.allreduce(int((_old_tags_ed == 3).sum()))
+    if rank == 0:
+        logger.info(f"  OLD tags (global): LV={_old_lv_ed}, RV={_old_rv_ed}, Septum={_old_sept_ed}")
+
+    # Marker-name → facet-tag dict (rank 0 reads, broadcast)
+    if rank == 0:
+        _geo_tmp_ed = cardiac_geometries.geometry.Geometry.from_folder(MPI.COMM_SELF, geo_dir)
+        _raw_markers_ed = _geo_tmp_ed.markers
+    else:
+        _raw_markers_ed = None
+    _raw_markers_ed = comm.bcast(_raw_markers_ed, root=0)
+
+    # Load u(t=0) into problem.u (will be overwritten by the replay loop below)
+    adios4dolfinx.read_function(checkpoint_path, problem.u, time=0.0, name="displacement")
+    if rank == 0:
+        logger.info("  Loaded u(t=0) into problem.u for ED deformation")
+
+    _bb_tree_ed = dolfinx.geometry.bb_tree(mesh, mesh.topology.dim)
+
+    def _deform_ed(points):
+        """Return points + u(t=0)(points) using problem.u (already loaded)."""
+        points = np.asarray(points, dtype=np.float64)
+        if points.shape[0] == 0:
+            return points.copy()
+        cc = dolfinx.geometry.compute_collisions_points(_bb_tree_ed, points)
+        cols = dolfinx.geometry.compute_colliding_cells(mesh, cc, points)
+        cells = np.full(points.shape[0], -1, dtype=np.int32)
+        for i in range(points.shape[0]):
+            link = cols.links(i)
+            if len(link) > 0:
+                cells[i] = link[0]
+        ok = cells >= 0
+        out = points.copy()
+        if ok.any():
+            out[ok] = points[ok] + problem.u.eval(points[ok], cells[ok])
+        if not ok.all():
+            _n_miss = int((~ok).sum())
+            logger.warning(f"  [rank {rank}] {_n_miss}/{points.shape[0]} points not in local cells; kept reference coords")
+        return out
+
+    mesh.topology.create_connectivity(2, 0)
+    _f2v_ed = mesh.topology.connectivity(2, 0)
+
+    def _surface_coords_global_ed(marker_tag_ids):
+        facets = np.hstack([ffun.find(t) for t in marker_tag_ids])
+        verts = set()
+        for f in facets:
+            verts.update(_f2v_ed.links(f))
+        local_coords = mesh.geometry.x[np.array(sorted(verts), dtype=np.int64)] if verts else np.empty((0, 3))
+        local_coords = _deform_ed(local_coords)
+        all_coords = comm.allgather(local_coords)
+        return np.vstack(all_coords) if any(len(c) > 0 for c in all_coords) else np.empty((0, 3))
+
+    _lv_tags_ed = [_raw_markers_ed.get("LV", _raw_markers_ed.get("ENDO_LV", [None]))[0]]
+    _rv_tags_ed = [_raw_markers_ed.get("RV", _raw_markers_ed.get("ENDO_RV", [None]))[0]]
+    _epi_tags_ed = [_raw_markers_ed.get("EPI", [None])[0]]
+
+    _lv_coords_ed = _surface_coords_global_ed(_lv_tags_ed)
+    _rv_coords_ed = _surface_coords_global_ed(_rv_tags_ed)
+    _epi_coords_ed = _surface_coords_global_ed(_epi_tags_ed)
+
+    if rank == 0:
+        logger.info(f"  Surface vertices (global, deformed): LV_endo={len(_lv_coords_ed)}, "
+                    f"RV_endo={len(_rv_coords_ed)}, EPI={len(_epi_coords_ed)}")
+
+    _tree_lv_ed = _cKDTree(_lv_coords_ed)
+    _tree_rv_ed = _cKDTree(_rv_coords_ed)
+    _tree_epi_ed = _cKDTree(_epi_coords_ed)
+
+    mesh.topology.create_connectivity(3, 0)
+    _centroids_ed = dolfinx.mesh.compute_midpoints(mesh, 3, np.arange(_n_local_ed, dtype=np.int32))
+    _centroids_ed = _deform_ed(_centroids_ed)
+
+    _d_lv_ed, _ = _tree_lv_ed.query(_centroids_ed)
+    _d_rv_ed, _ = _tree_rv_ed.query(_centroids_ed)
+    _d_epi_ed, _ = _tree_epi_ed.query(_centroids_ed)
+
+    _is_sept_ed = np.maximum(_d_lv_ed, _d_rv_ed) < _d_epi_ed
+    _new_tags_ed = np.where(_is_sept_ed, 3,
+                   np.where(_d_lv_ed <= _d_rv_ed, 1, 2)).astype(np.int32)
+
+    _n_changed_ed = int((_new_tags_ed != _old_tags_ed).sum())
+
+    markers_mt = dolfinx.mesh.meshtags(
+        mesh, 3,
+        np.arange(_imap_ed.size_local + _imap_ed.num_ghosts, dtype=np.int32),
+        np.concatenate([_new_tags_ed, markers_mt.values[_n_local_ed:]]),
+    )
+    markers_mt.name = "cfun"
+
+    _new_lv_ed = comm.allreduce(int((_new_tags_ed == 1).sum()))
+    _new_rv_ed = comm.allreduce(int((_new_tags_ed == 2).sum()))
+    _new_sept_ed = comm.allreduce(int((_new_tags_ed == 3).sum()))
+    _n_changed_ed = comm.allreduce(_n_changed_ed)
+    if rank == 0:
+        logger.info(f"  NEW tags (global, ED frame): LV={_new_lv_ed}, RV={_new_rv_ed}, Septum={_new_sept_ed}")
+        logger.info(f"  Changed:  {_n_changed_ed} cells "
+                    f"(LV: {_old_lv_ed}\u2192{_new_lv_ed}, RV: {_old_rv_ed}\u2192{_new_rv_ed}, "
+                    f"Septum: {_old_sept_ed}\u2192{_new_sept_ed}) \u2014 downstream metrics only")
+
 # ─── 7. Initialize Metrics Calculator ────────────────────────────────────────
 
 from metrics_calculator import MetricsCalculator
@@ -507,13 +671,19 @@ metrics_model = pulse.CardiacModel(
     compressibility=cardiac_model.compressibility,
 )
 
-# Create a geo-like object with markers_mt on the checkpoint mesh
+# Create a geo-like object carrying everything MetricsCalculator may need:
+# the checkpoint mesh, the cell-tag meshtag, the facet-tag meshtag, and the
+# original marker name → (tag, codim) dict. The facet tags and markers are
+# needed by the tau_tags constructors (both Euclidean and Laplace).
 class GeoProxy:
-    def __init__(self, mesh, additional_data):
+    def __init__(self, mesh, additional_data, ffun=None, markers=None):
         self.mesh = mesh
         self.additional_data = additional_data
+        self.ffun = ffun
+        self.markers = markers or {}
 
-geo_proxy = GeoProxy(mesh, {"markers_mt": markers_mt})
+geo_proxy = GeoProxy(mesh, {"markers_mt": markers_mt},
+                     ffun=ffun, markers=geo.markers)
 
 metrics_calc = MetricsCalculator(
     geometry=geometry,

@@ -254,6 +254,17 @@ print(f"Cells within {args.n_epi_layers_exclude} layer(s) of epi (to exclude): {
 #          iff  entry_t < t
 entry_t = np.maximum(d_lv, d_rv) - d_epi  # in mm
 
+# Laplace-equivalent sweep scalar.
+#   entry_Lap(c) = max(epi_scalar(c), 2*|lv_rv_scalar(c) - 0.5|)
+# Threshold entry_Lap < s gives a nested family of septa:
+#   s -> 0    : collapses to the mid-wall mid-septum core
+#                (Cobiveco-style u_LVRV = 0.5 isosurface limit)
+#   s ~ 0.5   : roughly reproduces the LDRB binary rule
+#                (epi_scalar <= 0.5 AND 0.1 < u_LVRV < 0.9 ~~ entry_Lap < 0.5)
+#   s -> 1    : whole myocardium
+# Units: dimensionless in [0, 1]. Directly analogous to entry_t (mm).
+entry_laplace = np.maximum(epi_vals, 2.0 * np.abs(lvrv_vals - 0.5))
+
 # Envelope: anatomical bound that the sweep must stay within
 envelope = ((d_epi >= args.d_epi_min)
             & (d_sum >= args.d_sum_min)
@@ -269,6 +280,8 @@ env_not_touching_epi = ~exclude_by_topology
 # appear when the user slides a Threshold filter up
 LARGE_SENTINEL = 1e6
 entry_t_for_sweep = np.where(envelope, entry_t, LARGE_SENTINEL)
+# Same trick for the Laplace scalar. Sentinel chosen >1 so it's outside [0,1].
+entry_laplace_for_sweep = np.where(envelope, entry_laplace, LARGE_SENTINEL)
 
 # Normalized gradient scalar: 0 at the deepest (tightest) cells,
 # 1 at the widest (highest entry_t) cells, within the envelope.
@@ -342,10 +355,23 @@ print(f"  {int((env_entries < 0).sum())} cells have entry_t < 0  (these are the 
 print(f"  {int((env_entries >= 0).sum())} cells have entry_t >= 0 (add as t grows)")
 
 # Suggest some threshold values for the slider
-print(f"\nSuggested slider positions for ParaView Threshold:")
+print(f"\nSuggested slider positions for ParaView Threshold (Euclidean entry_t):")
 for t in [-5, -3, -1, 0, 1, 2, 3, 5, 10]:
     n_in = int((env_entries < t).sum())
     print(f"  t = {t:>+3} mm  →  {n_in:>4} cells in septum(t)")
+
+# Laplace sweep diagnostic
+env_entries_lap = entry_laplace[envelope]
+print(f"\nentry_laplace within envelope (dimensionless in [0,1]):")
+print(f"  min  = {env_entries_lap.min():.3f}  (mid-wall mid-septum core)")
+print(f"  max  = {env_entries_lap.max():.3f}  (widest point of the envelope)")
+print(f"\nSuggested slider positions for ParaView Threshold (Laplace entry_laplace):")
+for s in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
+    n_in = int((env_entries_lap < s).sum())
+    print(f"  s = {s:>+4.2f}  →  {n_in:>4} cells in septum(s)")
+
+# (sorted_lap / s_match_geo_by_count computed further down, after
+#  n_geometric_in_env and the jaccard() function are both defined.)
 
 # ── Reference markers: encode named septum definitions as an integer label ──
 # ref_marker values:
@@ -401,6 +427,64 @@ print(f"\nJaccard similarity (set overlap, 1.0 = identical, 0.0 = disjoint):")
 print(f"  geometric ↔ sweep(t=0):        {j_geo:.3f}")
 print(f"  LDRB      ↔ sweep(t={t_match_ldrb_by_count:.2f}): {j_ldrb:.3f}")
 
+# ── Laplace sweep diagnostics ────────────────────────────────────────────────
+env_entries_lap = entry_laplace[envelope]
+print(f"\nentry_laplace within envelope (dimensionless in [0,1]):")
+print(f"  min  = {env_entries_lap.min():.3f}  (mid-wall mid-septum core)")
+print(f"  max  = {env_entries_lap.max():.3f}  (widest point of the envelope)")
+print(f"\nSuggested slider positions for ParaView Threshold (Laplace entry_laplace):")
+for s in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
+    n_in = int((env_entries_lap < s).sum())
+    print(f"  s = {s:.2f}  →  {n_in:>4} cells in septum(s)")
+
+# Cell-count-matched Laplace thresholds (geometric and LDRB reference points)
+sorted_lap = np.sort(entry_laplace[envelope])
+if n_geometric_in_env <= len(sorted_lap):
+    s_match_geo_by_count = float(sorted_lap[min(n_geometric_in_env - 1, len(sorted_lap) - 1)])
+else:
+    s_match_geo_by_count = 1.0
+if n_ldrb <= len(sorted_lap):
+    s_match_ldrb_by_count = float(sorted_lap[min(n_ldrb - 1, len(sorted_lap) - 1)])
+else:
+    s_match_ldrb_by_count = 1.0
+
+print(f"\nLaplace sweep reference points (by cell-count match):")
+print(f"  match |geometric| ({n_geometric_in_env} cells)  →  s ≈ {s_match_geo_by_count:.3f}")
+print(f"  match |LDRB|      ({n_ldrb} cells)         →  s ≈ {s_match_ldrb_by_count:.3f}")
+
+# Euclidean-vs-Laplace sweep set agreement at matched cell counts.
+# If the two sweeps pick different physical cells at the same total count,
+# that's the Laplace bowing artifact you want to see in ParaView.
+sweep_eucl_at_geo  = envelope & (entry_t       < 0.0)
+sweep_lap_at_geo   = envelope & (entry_laplace < s_match_geo_by_count)
+sweep_eucl_at_ldrb = envelope & (entry_t       < t_match_ldrb_by_count)
+sweep_lap_at_ldrb  = envelope & (entry_laplace < s_match_ldrb_by_count)
+j_eucl_vs_lap_geo  = jaccard(sweep_eucl_at_geo,  sweep_lap_at_geo)
+j_eucl_vs_lap_ldrb = jaccard(sweep_eucl_at_ldrb, sweep_lap_at_ldrb)
+# Also compare each against the raw LDRB rule for reference
+j_lap_vs_ldrb_rule = jaccard(sweep_lap_at_ldrb, is_ldrb_septum)
+
+print(f"\nEuclidean ↔ Laplace SWEEP AGREEMENT at matched cell counts:")
+print(f"  (Jaccard of sweep_Eucl ↔ sweep_Lap tagging the same total count)")
+print(f"  at |geometric| count: {j_eucl_vs_lap_geo:.3f}")
+print(f"  at |LDRB|      count: {j_eucl_vs_lap_ldrb:.3f}")
+print(f"  Laplace sweep ↔ raw LDRB rule: {j_lap_vs_ldrb_rule:.3f}")
+print(f"  (1.0 = identical sets; << 1.0 means the two sweeps pick different")
+print(f"   physical cells at the same count — that's the Laplace-bowing vs")
+print(f"   Euclidean difference visible in ParaView. Compare side by side")
+print(f"   with the 'entry_t_for_sweep' and 'entry_laplace_for_sweep' fields.)")
+
+# Per-cell sweep disagreement marker (for ParaView visualization).
+# At the LDRB-count-matched thresholds:
+#   0 = outside both sweeps
+#   1 = in Euclidean sweep only (Lap says no)
+#   2 = in Laplace sweep only   (Eucl says no)
+#   3 = in both (agreement)
+sweep_disagreement_ldrb = np.zeros(n_cells, dtype=np.float64)
+sweep_disagreement_ldrb[sweep_eucl_at_ldrb & ~sweep_lap_at_ldrb] = 1.0
+sweep_disagreement_ldrb[sweep_lap_at_ldrb  & ~sweep_eucl_at_ldrb] = 2.0
+sweep_disagreement_ldrb[sweep_eucl_at_ldrb & sweep_lap_at_ldrb]   = 3.0
+
 # ── Write XDMF with all fields ───────────────────────────────────────────────
 # Note: V_DG0 was already created earlier (for the CG1→DG0 interpolation)
 
@@ -410,7 +494,10 @@ def make_field(name, arr):
     return f
 
 fields = [
-    make_field("entry_t_for_sweep", entry_t_for_sweep),   # ← main slider field
+    make_field("entry_t_for_sweep", entry_t_for_sweep),   # ← Euclidean slider field (mm)
+    make_field("entry_laplace_for_sweep", entry_laplace_for_sweep),  # ← Laplace slider field ([0,1])
+    make_field("entry_laplace_raw", entry_laplace),        # Laplace sweep scalar, no sentinel
+    make_field("sweep_disagreement_ldrb", sweep_disagreement_ldrb),  # 0/1/2/3 Eucl vs Lap at |LDRB|
     make_field("septum_depth_fraction", septum_depth_fraction),  # 0=deepest, 1=widest, NaN outside
     make_field("ref_marker", ref_marker),                  # 0=none, 1=LDRB-only, 2=geo-only, 3=both
     make_field("is_geometric_septum", is_geometric.astype(np.float64)),
@@ -457,12 +544,33 @@ print("     2 = geometric only  (blue)")
 print("     3 = both (intersection) (purple)")
 print("     You'll see how the two definitions disagree at the boundaries.")
 print()
-print("  C) Sliding threshold sweep — see cells enter as t grows")
+print("  C) Sliding EUCLIDEAN sweep — see cells enter as t (mm) grows")
 print("     Filters → Threshold")
 print("     Array: 'entry_t_for_sweep', Lower: -100")
-print("     Upper threshold: drag from -5 up through 0 to ~+10")
+print("     Upper threshold: drag from -5 up through 0 to ~+10 mm")
 print("     At upper=0 you get exactly the geometric septum.")
 print("     At upper>0 the sweep widens smoothly outward.")
+print()
+print("  C2) Sliding LAPLACE sweep — the Cobiveco-flavoured analogue")
+print("     Filters → Threshold")
+print("     Array: 'entry_laplace_for_sweep', Lower: 0")
+print("     Upper threshold: drag from 0.1 up through 0.5 to 0.9")
+print("     At upper -> 0 collapses to the mid-wall mid-septum core")
+print("     At upper ~ 0.5 roughly reproduces the LDRB binary rule")
+print("     At upper -> 1 widens to the whole envelope")
+print()
+print("  C3) DIRECT COMPARISON — where the two sweeps disagree")
+print("     Color by 'sweep_disagreement_ldrb' with a categorical colormap")
+print("     Computed at the cell-count that matches |LDRB|, so both sweeps")
+print("     have the SAME total number of cells — any colour other than")
+print("     'both' means the two sweeps are picking different physical cells.")
+print("     0 = outside both (grey/transparent)")
+print("     1 = Euclidean only (blue)   — Eucl takes cell, Lap rejects")
+print("     2 = Laplace only   (red)    — Lap takes cell, Eucl rejects")
+print("     3 = both           (purple) — agreement")
+print("     Purple cells are the core both methods agree on. Red cells")
+print("     are where the Laplace sweep bows outward (curvature artifact).")
+print("     Blue cells are where the Euclidean sweep reaches deeper.")
 print()
 print("  D) Raw LDRB Laplace fields (for debugging the LDRB definition)")
 print("     Color by 'lv_rv_scalar' or 'epi_scalar'")

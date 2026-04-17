@@ -66,6 +66,9 @@ fi
 if [ "${ALL_BEATS:-0}" = "1" ]; then
     EXTRA_ARGS="$EXTRA_ARGS --all-beats"
 fi
+if [ -n "${OUTPUT_TAG}" ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --output-tag ${OUTPUT_TAG}"
+fi
 
 cd $SIM_DIR
 time $CONDA_PREFIX/bin/mpirun -n ${SLURM_NTASKS} -launcher fork \

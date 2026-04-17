@@ -32,7 +32,7 @@ echo "Beats:       $BEATS  (use BEATS=6 for publication-quality converged runs)"
 echo "BPM:         $BPM"
 echo ""
 
-for SEVERITY in healthy borderline mild moderate moderate_severe severe very_severe end_stage; do
+for SEVERITY in healthy_low healthy mild moderate moderate_severe severe very_severe end_stage; do
     CIRC_FILE="${CIRC_DIR}/optimized_regazzoni_ukb_${SEVERITY}.json"
     if [ ! -f "$CIRC_FILE" ]; then
         echo "SKIP $SEVERITY — $CIRC_FILE not found"

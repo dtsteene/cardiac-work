@@ -207,54 +207,53 @@ for t_target in [-5, -3, -1, 0, 1, 3, 5, 10]:
           f"{r_PLV[idx]:>8.3f} {r_PRV[idx]:>8.3f} {r_Trans[idx]:>9.3f} "
           f"{r_mean[idx]:>8.3f} {r_dom[idx]:>8.3f}")
 
-# ── Plot ─────────────────────────────────────────────────────────────────────
-fig, axes = plt.subplots(1, 2, figsize=(14, 5.5), gridspec_kw={"width_ratios": [3, 1]})
+# ── Plot (matches analyze_spectrum.py fig_spectrum_sweep style) ──────────────
+SWEEP_STYLE = {
+    "r_PLV":   dict(color="#1f77b4", label=r"$P_{LV}$",              values=r_PLV),
+    "r_PRV":   dict(color="#d62728", label=r"$P_{RV}$",              values=r_PRV),
+    "r_Trans": dict(color="#2ca02c", label=r"$P_{LV}-P_{RV}$",       values=r_Trans),
+    "r_Mean":  dict(color="#ff7f0e", label=r"$(P_{LV}+P_{RV})/2$",
+                    values=r_mean, ls="--"),
+}
 
-ax = axes[0]
-ax.plot(t_mm, r_PLV, '-o', color='C0', label='P_LV × dε_ll', lw=1.8, ms=3)
-ax.plot(t_mm, r_PRV, '-o', color='C3', label='P_RV × dε_ll', lw=1.8, ms=3)
-ax.plot(t_mm, r_Trans, '-s', color='C2', label='(P_LV − P_RV) × dε_ll', lw=2.2, ms=4)
-ax.plot(t_mm, r_mean, '-D', color='m', label='(P_LV + P_RV)/2 × dε_ll', lw=1.8, ms=3)
-ax.plot(t_mm, r_dom, '-^', color='k', label='P_dom × dε_ll', lw=1.8, ms=3)
-ax.axvline(0, color='blue', ls='--', lw=1.5, alpha=0.7, label='t=0 (geometric)')
-ax.axhline(0, color='k', lw=0.5, alpha=0.3)
+fig, ax = plt.subplots(figsize=(10.5, 5.4), constrained_layout=True)
+ax.axhline(0.0, color="lightgray", lw=0.8, zorder=0)
+ax.axhline(1.0, color="lightgray", lw=0.5, ls=":")
+for key, style in SWEEP_STYLE.items():
+    ax.plot(t_mm, style["values"],
+            color=style["color"], lw=2.4 if key == "r_Trans" else 1.5,
+            ls=style.get("ls", "-"), label=style["label"],
+            alpha=0.95 if key == "r_Trans" else 0.75)
 
-# Reference markers: direct definitions (plotted at their mean cell count on right panel)
-# On main panel, show as horizontal dashes at the right edge
-ref_x = t_mm.max() * 0.98
-ax.plot(ref_x, ref_geo["PLV"], 's', color='C0', ms=8, mew=2, mfc='none', zorder=5)
-ax.plot(ref_x, ref_geo["Trans"], 's', color='C2', ms=8, mew=2, mfc='none', zorder=5)
-ax.plot(ref_x*0.94, ref_ldrb["PLV"], 'D', color='C0', ms=7, mew=2, mfc='none', zorder=5)
-ax.plot(ref_x*0.94, ref_ldrb["Trans"], 'D', color='C2', ms=7, mew=2, mfc='none', zorder=5)
-ax.annotate('geo', (ref_x, ref_geo["PLV"]), fontsize=7, ha='left', va='bottom',
-            xytext=(3, 2), textcoords='offset points')
-ax.annotate('ldrb', (ref_x*0.94, ref_ldrb["Trans"]), fontsize=7, ha='right', va='bottom',
-            xytext=(-3, 2), textcoords='offset points')
+ax.axvline(0.0, color="gray", lw=1.0, ls="--", alpha=0.7)
+ax.text(0.0, -0.96, "  geometric cutoff (t=0)",
+        ha="left", va="bottom", fontsize=9, color="gray")
 
-ax.set_xlabel('t (mm) — septum width\n← tighter | geometric at 0 | wider →')
-ax.set_ylabel(f'Pearson r (across {n_cases} cases)')
-ax.set_title('Sensitivity: does the proxy track disease progression?')
-ax.legend(fontsize=8, loc='lower left')
-ax.grid(alpha=0.3)
-ax.set_ylim(-1.1, 1.1)
+ax.set_xlim(t_mm[0] - 0.5, t_mm[-1] + 0.5)
+ax.set_ylim(-1.05, 1.1)
+ax.set_xlabel(r"Boundary relaxation threshold $t$ (mm)   "
+              r"$\;\;\mathrm{mask}(t) = \{c : \mathrm{entry}_t(c) \leq t\} "
+              r"\cap \mathrm{envelope}$",
+              fontsize=10)
+ax.set_ylabel(f"Pearson r with $W_{{true}}$ across {n_cases} severities",
+              fontsize=11)
+ax.grid(alpha=0.25)
+ax.legend(loc="lower left", fontsize=9, ncol=3, framealpha=0.95)
 
-ax2 = axes[1]
-ax2.plot(t_mm, mean_cells_at_t, 'k-', lw=1.5)
-ax2.axvline(0, color='blue', ls='--', lw=1.5, alpha=0.7)
-ax2.axhline(geo_n, color='blue', ls=':', lw=1, alpha=0.5)
-ax2.axhline(ldrb_n, color='red', ls=':', lw=1, alpha=0.5)
-ax2.text(t_mm.max()*0.95, geo_n, f' geo≈{geo_n}', fontsize=8, color='blue', va='bottom', ha='right')
-ax2.text(t_mm.max()*0.95, ldrb_n, f' ldrb≈{ldrb_n}', fontsize=8, color='red', va='bottom', ha='right')
-ax2.set_xlabel('t (mm)')
-ax2.set_ylabel('Mean cells in septum(t)')
-ax2.set_title('Septum size')
-ax2.grid(alpha=0.3)
+ax_top = ax.twiny()
+ax_top.set_xlim(ax.get_xlim())
+sel = np.linspace(0, len(t_mm) - 1, 6).astype(int)
+ax_top.set_xticks(t_mm[sel])
+ax_top.set_xticklabels([f"{int(mean_cells_at_t[i])}" for i in sel], fontsize=8)
+ax_top.set_xlabel("cells in sweep region", fontsize=9, color="dimgray")
+ax_top.tick_params(axis="x", labelcolor="dimgray")
 
-fig.suptitle(f'Inter-case sensitivity ({n_cases} cases, longitudinal strain proxy)', fontsize=11)
-plt.tight_layout()
+ax.set_title(f"Proxy tracking across septum sweep  ({MODE})",
+             fontsize=12, fontweight="bold")
+
 fig_path = out_dir / "sweep_sensitivity.pdf"
-fig.savefig(fig_path, dpi=150, bbox_inches="tight")
-fig.savefig(fig_path.with_suffix(".png"), dpi=150, bbox_inches="tight")
+fig.savefig(fig_path, bbox_inches="tight")
+fig.savefig(fig_path.with_suffix(".png"), dpi=160, bbox_inches="tight")
 print(f"\nSaved {fig_path}")
 
 np.savez(out_dir / "sweep_raw.npz",

@@ -171,6 +171,21 @@ if comm.rank == 0:
 comm.barrier()
 geodir = Path(args.geometry_dir) if args.geometry_dir else None
 
+# --- Ensure the run directory owns a geometry handle for postprocess_metrics.py ---
+# postprocess_metrics.py needs <outdir>/geometry to exist (it only reads marker
+# name→tag mapping from markers_geometry.json). When --geometry-dir points at an
+# external folder (thickness variant, PCA mesh, etc.), symlink it into outdir so
+# postprocess works with no extra flags. Restart mode already copies its own geo.
+if comm.rank == 0 and geodir is not None and not RESTART_MODE:
+    _outdir_geo = outdir / "geometry"
+    if not _outdir_geo.exists():
+        try:
+            _outdir_geo.symlink_to(geodir.resolve())
+        except OSError:
+            import shutil as _shutil_geo
+            _shutil_geo.copytree(geodir.resolve(), _outdir_geo)
+comm.barrier()
+
 circulation.log.setup_logging(logging.INFO)
 logger = logging.getLogger("pulse")
 scifem_logger = logging.getLogger("scifem")
@@ -1084,6 +1099,7 @@ if comm.rank == 0:
         "lvv_target_m3": float(lvv_target),
         "rvv_target_m3": float(rvv_target),
         "geo_scale": getattr(geo, '_geo_scale', 1.0),
+        "geometry_dir": str(Path(args.geometry_dir).resolve()) if args.geometry_dir else None,
     }
     with open(outdir / "simulation_params.json", "w") as f:
         json.dump(sim_params, f, indent=2, default=custom_json)
@@ -1175,6 +1191,7 @@ finally:
                 "lvv_target_m3": float(lvv_target),
                 "rvv_target_m3": float(rvv_target),
                 "geo_scale": getattr(geo, '_geo_scale', 1.0),
+                "geometry_dir": str(Path(args.geometry_dir).resolve()) if args.geometry_dir else None,
             }
             with open(outdir / "simulation_params.json", "w") as f:
                 json.dump(sim_params, f, indent=2, default=custom_json)

@@ -292,7 +292,28 @@ This was found to be **not what we actually wanted for Question A**. At the tigh
 
 ## Transventricular Profiles — Question B (queued)
 
-**Status**: queued for later investigation. The data infrastructure (`per_cell_data.npz` with tau, per-cell w_total, and per-cell proxies) already supports this analysis — it requires only a new analysis script, no new simulations or new per-cell computation.
+> **CRITICAL UPDATE 2026-04-14 — elevate Question B from "queued" to "required for defense".**
+>
+> Re-examining the role of Question B in the thesis argument: **Question A alone (scalar r across disease cases, stable under septum-boundary sweep) is defensible but not explanatory**. It tells a supervisor that P_LV's correlation is not a tagging artifact, but it does not tell them *why* the correlation holds, and it cannot distinguish "P_LV tracks truth across the whole wall" from "P_LV only tracks the LV-side of the septum and the LV-side happens to dominate the integral." Those two explanations predict identical Question-A curves but diverge in severe PAH, where RV hypertrophy can shift the integral weight toward the RV side — exactly the regime the thesis is about.
+>
+> The transmural density profile (Question B) is the **mechanistic lens that resolves this ambiguity**. Three concrete claims it enables that Question A cannot:
+>
+> 1. **Spatial validity of each proxy.** Plotting `rho_true(tau)`, `rho_PLV(tau)`, `rho_PRV(tau)`, `rho_Trans(tau)` as continuous curves over the wall reveals *where* each pressure is a valid local predictor. Expected pattern: P_LV matches near tau≈0.3 (LV side), P_RV matches near tau≈0.7 (RV side), P_Trans matches across the whole wall. That is a pointwise statement, which is what clinical myocardial-work imaging actually needs — clinicians apply the proxy pointwise to strain maps, not to a transmurally-averaged septum.
+>
+> 2. **Testable artifact hypothesis for Question A.** If the profile shows P_LV only tracks near the LV side but its aggregate r is still 0.99, then the LV side must dominate the integral — the RV-side error is small, not small-and-tracked. This generates a **falsifiable prediction**: P_LV should degrade in cases where RV-side work grows enough to shift the integral weight. Check this against the 8-case spectrum. If the prediction holds, the aggregate-r result is reframed honestly as "P_LV is a good aggregate proxy *because* the LV side dominates in our cohort". If it fails, the aggregate result stands on its own.
+>
+> 3. **Second thesis finding: transmural reorganization with disease.** Overlay `rho_true(tau)` curves for all 8 cases. The profile shape itself may migrate across the disease spectrum (RV-side work growing in PAH as the RV hypertrophies into the septum). That is a **physics** statement about PAH septal mechanics, independent of proxy validation, and gives the thesis a second story that does not depend on the proxy ranking at all.
+>
+> **Status change**: Question B was queued on the argument that it is not clinically answerable by standard echo (true — it remains a mechanics question) and therefore not a proxy-design result (also true). But it is now required as the **mechanistic explanation** for Question A. Without it, the Question-A r≈0.99 is vulnerable to the "curve fit" critique: a supervisor can ask "how do you know this isn't an integration-weight coincidence?" and the scalar sweep alone cannot answer. The transmural profile can.
+>
+> **Re-framing of the thesis structure**:
+> - Question A (scalar sweep) = **robustness section** — establishes that the proxy ranking is real, not a boundary-definition artifact.
+> - Question B (transmural profile) = **mechanism section** — explains *where* in the wall each proxy is valid and *why* the aggregate result holds. Also delivers the independent physics finding about transmural work redistribution under PAH.
+> - Both together = a defensible story: the ranking is robust (A) *and* mechanistically grounded (B).
+>
+> **Minimum viable experiment before committing**: one afternoon's work on the healthy UKB case. Take the existing `per_cell_data.npz`, bin cells by tau (10 strata), compute `rho_true`, `rho_PLV`, `rho_PRV`, `rho_Trans` within the fixed geometric septum, plot all four curves on one axis. If they look like the expected LV-side/RV-side/both pattern → the mechanism story is there, commit to Question B as a primary result. If they are flat and parallel → the mechanism lens adds nothing, stay with Question A only. This experiment uses already-saved data, no new simulations, no new per-cell computation.
+
+**Status**: **ELEVATED from queued to required-for-defense as of 2026-04-14** — see update block above. The data infrastructure (`per_cell_data.npz` with tau, per-cell w_total, and per-cell proxies) already supports this analysis — it requires only a new analysis script, no new simulations or new per-cell computation.
 
 ### Design: tau-band sweep at fixed septum definition
 
@@ -777,6 +798,101 @@ would also be stable, but inherit the curvature-bowing artifact LDRB suffers
 from: they systematically undertag curved septum regions (the bulge toward the
 LV in PAH-shaped hearts) and systematically overtag at the basal lip. Pure
 Euclidean on a canonical reference avoids both by construction.
+
+#### The critical argument: growth direction (added 2026-04-14)
+
+After actually implementing a Laplace-based sweep scalar
+
+    entry_Lap(c) = max(u_epi(c), 2 * |u_LVRV(c) - 0.5|)
+
+and comparing it directly against the Euclidean `entry_t` in ParaView on the
+UKB mesh (`verify_sweep_envelope.py` now writes both to the same XDMF), the
+**real** reason to prefer Euclidean became clear, and it is not about
+smoothness or bowing artifacts. It is about the **direction the sweep grows
+in as the threshold expands**. The two methods grow in topologically
+orthogonal directions, and only one of them corresponds to the scientific
+question this thesis asks.
+
+**What the sweep is supposed to do.** The proxy-validation question is:
+*"At what lateral extent of the septum does each pressure proxy stop
+tracking the true work?"* Every step of the sweep should add or remove cells
+at the **lateral boundary** (toward the anterior/posterior septal
+junctions), while the cells that remain should always span the **full wall
+thickness** from LV endo to RV endo. The sweep is asking how wide a septum
+you can draw, not how deep inside the wall you reach. "Transmural integrity"
+is a precondition, not something the sweep should be varying.
+
+**What Euclidean `entry_t` does.** `max(d_LV, d_RV) - d_epi` grows the sweep
+laterally:
+
+- The core (t very negative) is cells with both `d_LV` and `d_RV` small
+  **and** `d_epi` large — i.e. cells that fully span the LV-to-RV wall and
+  sit deep away from the epicardium. These are full-thickness cells at the
+  narrow middle of the septum.
+- As t increases, the admission rule relaxes `max(d_LV, d_RV) < d_epi + t`.
+  New cells enter where the *sideways margin* to the epicardium shrinks — at
+  the anterior/posterior junctions where `d_epi` drops. The sweep slides
+  outward toward the junctions.
+- Every cell ever admitted has small `d_LV` AND small `d_RV`, so transmural
+  integrity is maintained throughout the sweep. The sweep grows
+  **septum → free wall**, laterally.
+
+**What Laplace `entry_Lap` does.** `max(u_epi, 2|u_LVRV - 0.5|)` grows the
+sweep transmurally:
+
+- Including `u_epi` in the max means "a cell is in the core only if it is
+  deep inside the wall" — but `u_epi` is specifically a **transmural**
+  depth field (0 on both endos, 1 on epi), so this locks the core into the
+  mid-wall layer, not the narrow central septum.
+- Including `2|u_LVRV - 0.5|` pins the core to the LV-RV bisector, a
+  thin sheet running through the middle of the septum along the transmural
+  direction.
+- The intersection is a *slab* running roughly parallel to the endos,
+  sitting in the middle of the wall. As s grows, the slab inflates outward
+  **toward the endos**, not outward toward the junctions.
+- At low s the sweep does not span LV to RV at all — it is a ribbon in the
+  mid-wall that does not touch either endocardium. Transmural integrity is
+  violated for most of the sweep range.
+- The sweep grows **inside → outside**, transmurally.
+
+**This is a property of the equation, not a bad parameterization.** You
+cannot fix it by choosing different thresholds, because `u_epi` is itself a
+transmural coordinate by construction. Removing `u_epi` from the max
+destroys the sweep's ability to distinguish septum from free wall (both have
+cells near the LV-RV bisector). The only way to get a Laplace sweep that
+grows laterally would be to solve a new Laplace problem with Dirichlet BCs
+on the anterior and posterior *septal junctions* — but you do not know where
+those are until after you have tagged the septum, which is what the sweep
+is for. Catch-22.
+
+Meanwhile, the Euclidean sweep gets lateral growth for free, because
+subtracting `d_epi` creates a "margin from the outer surface" that shrinks
+toward the junctions by pure geometry — no PDE needed.
+
+**How this shows up in the cell-count plateau.** The 198-cell jump between
+s=0.5 and s=0.6 (~49% of the entire Laplace sweep entering in one step) is
+the transmural slab *reaching the endocardia simultaneously* on both LV and
+RV sides. Before s=0.5 the slab is still mid-wall; at s≈0.55 it touches
+both endos at once across a large area of the septum. This is not a
+numerical artifact — it is the Laplace sweep fulfilling its growth
+direction, which happens to be the wrong direction for our question. The
+Euclidean sweep has no equivalent jump because its growth is continuous
+along the lateral surface of the wall, where there is no geometric
+coincidence to trigger a sudden enrolment.
+
+**One-sentence framing for the thesis.** *"The Euclidean sweep varies the
+lateral extent of the septum while holding transmural integrity fixed,
+which is exactly the quantity the proxy-validation question varies. The
+Laplace sweep varies transmural depth, which is a different question — it
+asks how deep into the wall the proxy is valid, not how wide the septum
+can be drawn. The two sweeps are not two versions of the same test; they
+test two different things, and only the Euclidean one matches the
+proxy-validation framing."*
+
+This argument subsumes the earlier bowing / non-linearity observations.
+The 4× variation in per-step cell count and the 49% worst-step fraction
+are symptoms; the underlying cause is that the Laplace sweep is measuring
+and growing in the wrong dimension for this study.
 
 ### Ridge-bounded sweep — future work
 
