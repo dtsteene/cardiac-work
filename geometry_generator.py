@@ -10,6 +10,223 @@ import cardiac_geometries.geometry
 import cardiac_geometries.utils
 
 
+def _compute_and_save_geometry_fields(geodir, outdir, d_sum_max_mm, logger):
+    """Compute geometric fields (distances, Laplace scalars, region masks) for the
+    saved geometry and write them alongside as:
+
+        <geodir>/geometry_fields.npz   — per-cell numpy arrays, consumer-facing
+                                          (read by compute_per_cell.py etc.)
+        <outdir>/geometry_fields.xdmf  — same fields as DG0 functions for ParaView viz
+
+    All fields are pure geometry (depend only on mesh + facet markers). Runs
+    serially on rank 0 by loading the saved geometry with COMM_SELF so the
+    cell ordering matches downstream consumers.
+
+    Absorbs the logic that was previously split across precompute_geometry_fields.py,
+    verify_sweep_envelope.py, and viz_region_split.py.
+    """
+    import ufl
+    import pyvista as pv
+    import dolfinx.fem.petsc
+    from petsc4py import PETSc
+
+    logger.info(f"Computing geometry fields (d_sum_max={d_sum_max_mm} mm)...")
+
+    geo_ser = cardiac_geometries.geometry.Geometry.from_folder(MPI.COMM_SELF, geodir)
+    mesh = geo_ser.mesh
+    ffun = geo_ser.ffun
+    markers = geo_ser.markers
+
+    # Look up marker integer values from the geometry's marker dict.
+    # Tuple form: markers[name] = (value, dim)
+    def _marker_value(name):
+        if name not in markers:
+            return None
+        v = markers[name]
+        return v[0] if isinstance(v, (tuple, list)) else v
+
+    LV_MARKER = _marker_value("ENDO_LV")
+    RV_MARKER = _marker_value("ENDO_RV")
+    EPI_MARKER = _marker_value("EPI")
+    if LV_MARKER is None or RV_MARKER is None or EPI_MARKER is None:
+        raise RuntimeError(
+            f"Missing one of ENDO_LV/ENDO_RV/EPI in geometry markers: {markers}")
+    logger.info(f"  Using markers: LV={LV_MARKER}, RV={RV_MARKER}, EPI={EPI_MARKER}")
+
+    mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
+    mesh.topology.create_connectivity(2, 0)
+    mesh.topology.create_connectivity(3, 2)
+    f2v = mesh.topology.connectivity(2, 0)
+    c2f = mesh.topology.connectivity(3, 2)
+
+    cells = np.arange(mesh.topology.index_map(3).size_local, dtype=np.int32)
+    centroids = dolfinx.mesh.compute_midpoints(mesh, 3, cells)
+    n_cells = len(cells)
+
+    # Detect mesh units. After generate_and_load scaling, mesh is in meters
+    # (bbox ~0.05-0.15 m). Fallback for unscaled meshes (mm).
+    bbox = mesh.geometry.x.max(axis=0) - mesh.geometry.x.min(axis=0)
+    mesh_to_mm = 1.0 if bbox.max() > 10 else 1000.0
+    logger.info(f"  Cells: {n_cells}, mesh extent: {bbox.max():.4f} "
+                f"(mesh_to_mm={mesh_to_mm})")
+
+    # ── Surface PolyData for facet-based distance ───────────────────────────
+    def _build_surface_poly(marker):
+        facets = ffun.find(marker)
+        tris = []
+        for f_idx in facets:
+            verts = f2v.links(f_idx)
+            if len(verts) == 3:
+                tris.append(mesh.geometry.x[verts])
+        if not tris:
+            return None
+        tris = np.array(tris)
+        n = len(tris)
+        points = tris.reshape(-1, 3)
+        faces = np.zeros(n * 4, dtype=np.int64)
+        for i in range(n):
+            faces[i*4] = 3
+            faces[i*4+1:i*4+4] = [i*3, i*3+1, i*3+2]
+        return pv.PolyData(points, faces=faces)
+
+    lv_poly = _build_surface_poly(LV_MARKER)
+    rv_poly = _build_surface_poly(RV_MARKER)
+    epi_poly = _build_surface_poly(EPI_MARKER)
+
+    # ── Distances ───────────────────────────────────────────────────────────
+    centroids_poly = pv.PolyData(centroids.astype(np.float64))
+    d_lv = np.abs(centroids_poly.compute_implicit_distance(lv_poly)["implicit_distance"])
+    d_rv = np.abs(centroids_poly.compute_implicit_distance(rv_poly)["implicit_distance"])
+    d_epi = np.abs(centroids_poly.compute_implicit_distance(epi_poly)["implicit_distance"])
+    d_sum = d_lv + d_rv
+    tau = d_lv / (d_lv + d_rv)
+
+    # Geometric septum: max(d_lv, d_rv) < d_epi
+    is_geometric_septum = np.maximum(d_lv, d_rv) < d_epi
+
+    # ── LDRB septum via Laplace solves ──────────────────────────────────────
+    V_CG1 = dolfinx.fem.functionspace(mesh, ("CG", 1))
+    u_t = ufl.TrialFunction(V_CG1)
+    v_t = ufl.TestFunction(V_CG1)
+    a = ufl.dot(ufl.grad(u_t), ufl.grad(v_t)) * ufl.dx
+    L = dolfinx.fem.Constant(mesh, 0.0) * v_t * ufl.dx
+
+    lv_f = ffun.find(LV_MARKER)
+    rv_f = ffun.find(RV_MARKER)
+    epi_f = ffun.find(EPI_MARKER)
+    lv_d = dolfinx.fem.locate_dofs_topological(V_CG1, 2, lv_f)
+    rv_d = dolfinx.fem.locate_dofs_topological(V_CG1, 2, rv_f)
+    epi_d = dolfinx.fem.locate_dofs_topological(V_CG1, 2, epi_f)
+
+    lvrv = dolfinx.fem.petsc.LinearProblem(
+        a, L,
+        bcs=[dolfinx.fem.dirichletbc(PETSc.ScalarType(1.0), lv_d, V_CG1),
+             dolfinx.fem.dirichletbc(PETSc.ScalarType(0.0), rv_d, V_CG1)],
+        petsc_options={"ksp_type": "preonly", "pc_type": "lu"},
+        petsc_options_prefix="geo_lvrv",
+    ).solve()
+
+    epi_s = dolfinx.fem.petsc.LinearProblem(
+        a, L,
+        bcs=[dolfinx.fem.dirichletbc(PETSc.ScalarType(1.0), epi_d, V_CG1),
+             dolfinx.fem.dirichletbc(PETSc.ScalarType(0.0), lv_d, V_CG1),
+             dolfinx.fem.dirichletbc(PETSc.ScalarType(0.0), rv_d, V_CG1)],
+        petsc_options={"ksp_type": "preonly", "pc_type": "lu"},
+        petsc_options_prefix="geo_epi",
+    ).solve()
+
+    V_DG0 = dolfinx.fem.functionspace(mesh, ("DG", 0))
+    lvrv_dg0 = dolfinx.fem.Function(V_DG0)
+    lvrv_dg0.interpolate(lvrv)
+    lvrv_vals = lvrv_dg0.x.array[:n_cells].copy()
+
+    epi_dg0 = dolfinx.fem.Function(V_DG0)
+    epi_dg0.interpolate(epi_s)
+    epi_vals = epi_dg0.x.array[:n_cells].copy()
+
+    is_ldrb_septum = (epi_vals <= 0.5) & (lvrv_vals > 0.1) & (lvrv_vals < 0.9)
+
+    # ── Topological epi exclusion ───────────────────────────────────────────
+    epi_facets_set = set(ffun.find(EPI_MARKER).tolist())
+    touches_epi = np.zeros(n_cells, dtype=bool)
+    for ci in range(n_cells):
+        for fi in c2f.links(ci):
+            if fi in epi_facets_set:
+                touches_epi[ci] = True
+                break
+
+    # ── Entry_t, envelope, study_region ─────────────────────────────────────
+    # entry_t = max(d_lv, d_rv) - d_epi: t=0 recovers the geometric septum.
+    # Envelope: d_sum bound + exclude cells touching epi surface (drops
+    # d_epi_min/d_sum_min; see results/docs/transmural_work_profiles.md).
+    entry_t = np.maximum(d_lv, d_rv) - d_epi
+    d_sum_max = d_sum_max_mm / mesh_to_mm
+    envelope = (d_sum <= d_sum_max) & ~touches_epi
+    study_region = (is_geometric_septum | is_ldrb_septum) & (d_sum < d_sum_max)
+
+    # ── Save npz (consumer-facing) ──────────────────────────────────────────
+    out_npz = geodir / "geometry_fields.npz"
+    np.savez(out_npz,
+             centroids=centroids,
+             tau=tau,
+             d_lv=d_lv, d_rv=d_rv, d_epi=d_epi, d_sum=d_sum,
+             is_geometric_septum=is_geometric_septum,
+             is_ldrb_septum=is_ldrb_septum,
+             study_region=study_region,
+             envelope=envelope,
+             entry_t=entry_t,
+             touches_epi=touches_epi,
+             lv_rv_scalar=lvrv_vals,
+             epi_scalar_dg0=epi_vals,
+             d_sum_max_mm=d_sum_max_mm)
+    logger.info(
+        f"  Saved {out_npz}: geo={int(is_geometric_septum.sum())}, "
+        f"ldrb={int(is_ldrb_septum.sum())}, envelope={int(envelope.sum())}, "
+        f"touches_epi={int(touches_epi.sum())}")
+
+    # ── Save XDMF (viz) ─────────────────────────────────────────────────────
+    def _make_field(name, arr):
+        f = dolfinx.fem.Function(V_DG0)
+        f.name = name
+        f.x.array[:n_cells] = arr.astype(np.float64)
+        return f
+
+    # Convenience scalars for ParaView exploration
+    side_eu = np.where(tau < 0.5, 1.0, 2.0)
+    side_lap = np.where(lvrv_vals > 0.5, 1.0, 2.0)
+    # ref_marker: 0=none, 1=LDRB-only, 2=geo-only, 3=both
+    ref_marker = np.zeros(n_cells, dtype=np.float64)
+    ref_marker[is_ldrb_septum & ~is_geometric_septum] = 1.0
+    ref_marker[is_geometric_septum & ~is_ldrb_septum] = 2.0
+    ref_marker[is_geometric_septum & is_ldrb_septum] = 3.0
+
+    xdmf_fields = [
+        _make_field("is_geometric_septum", is_geometric_septum.astype(float)),
+        _make_field("is_ldrb_septum",      is_ldrb_septum.astype(float)),
+        _make_field("envelope",            envelope.astype(float)),
+        _make_field("study_region",        study_region.astype(float)),
+        _make_field("touches_epi",         touches_epi.astype(float)),
+        _make_field("ref_marker",          ref_marker),
+        _make_field("tau_eu",              tau),
+        _make_field("tau_lap",             lvrv_vals),
+        _make_field("epi_scalar",          epi_vals),
+        _make_field("side_eu",             side_eu),
+        _make_field("side_lap",            side_lap),
+        _make_field("d_lv",                d_lv),
+        _make_field("d_rv",                d_rv),
+        _make_field("d_epi",               d_epi),
+        _make_field("d_sum",               d_sum),
+        _make_field("entry_t",             entry_t),
+    ]
+
+    out_xdmf = outdir / "geometry_fields.xdmf"
+    with dolfinx.io.XDMFFile(MPI.COMM_SELF, str(out_xdmf), "w") as xf:
+        xf.write_mesh(mesh)
+        for f in xdmf_fields:
+            xf.write_function(f)
+    logger.info(f"  Saved {out_xdmf}")
+
+
 def generate_and_load(comm, outdir, args, logger, manual_refinement=False, geodir=None):
     """
     Handles the generation (on Rank 0) and loading (on all Ranks) of the geometry.
@@ -253,6 +470,18 @@ def generate_and_load(comm, outdir, args, logger, manual_refinement=False, geodi
 
     geo._geo_scale = 1.0  # Already in meters
 
+    # ========================================================================
+    # PHASE 3: GEOMETRY FIELDS (Rank 0 Only, cached)
+    # ========================================================================
+    # Compute & save the per-cell geometric fields (distances, Laplace scalars,
+    # region masks) that downstream analysis consumes. Only done once per
+    # geometry — if geometry_fields.npz already exists we skip.
+    comm.barrier()
+    if comm.rank == 0 and not (geodir / "geometry_fields.npz").exists():
+        d_sum_max_mm = getattr(args, 'd_sum_max_mm', 22.0)
+        _compute_and_save_geometry_fields(geodir, outdir, d_sum_max_mm, logger)
+    comm.barrier()
+
     return geo
 
 
@@ -296,6 +525,13 @@ if __name__ == "__main__":
         "--manual-refinement",
         action="store_true",
         help="Launch interactive Septum Tag Editor after LDRB tagging to manually correct tags before saving"
+    )
+    parser.add_argument(
+        "--d-sum-max-mm",
+        type=float,
+        default=22.0,
+        help="Upper bound on d_lv + d_rv (mm) for the septum envelope field. "
+             "Prevents the sweep from reaching free-wall cells. Default: 22.0"
     )
 
     cli_args = parser.parse_args()
@@ -347,6 +583,7 @@ if __name__ == "__main__":
         args = argparse.Namespace(
             char_length=cli_args.char_length,
             mesh=mesh_path,
+            d_sum_max_mm=cli_args.d_sum_max_mm,
         )
 
         # Log info
