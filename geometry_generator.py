@@ -38,19 +38,23 @@ def _compute_and_save_geometry_fields(geodir, outdir, d_sum_max_mm, logger):
     markers = geo_ser.markers
 
     # Look up marker integer values from the geometry's marker dict.
-    # Tuple form: markers[name] = (value, dim)
-    def _marker_value(name):
-        if name not in markers:
-            return None
-        v = markers[name]
-        return v[0] if isinstance(v, (tuple, list)) else v
+    # Two naming conventions coexist:
+    #   - UKB mesh (cardiac_geometries.mesh.ukb):  "LV", "RV", "EPI"
+    #   - Custom patient meshes (XDMF path):       "ENDO_LV", "ENDO_RV", "EPI"
+    # Values may be stored as tuple or list: markers[name] = (int, dim).
+    def _marker_value(names):
+        for name in names:
+            if name in markers:
+                v = markers[name]
+                return v[0] if isinstance(v, (tuple, list)) else v
+        return None
 
-    LV_MARKER = _marker_value("ENDO_LV")
-    RV_MARKER = _marker_value("ENDO_RV")
-    EPI_MARKER = _marker_value("EPI")
+    LV_MARKER = _marker_value(["ENDO_LV", "LV"])
+    RV_MARKER = _marker_value(["ENDO_RV", "RV"])
+    EPI_MARKER = _marker_value(["EPI"])
     if LV_MARKER is None or RV_MARKER is None or EPI_MARKER is None:
         raise RuntimeError(
-            f"Missing one of ENDO_LV/ENDO_RV/EPI in geometry markers: {markers}")
+            f"Missing LV/RV/EPI in geometry markers: {markers}")
     logger.info(f"  Using markers: LV={LV_MARKER}, RV={RV_MARKER}, EPI={EPI_MARKER}")
 
     mesh.topology.create_connectivity(mesh.topology.dim - 1, mesh.topology.dim)
