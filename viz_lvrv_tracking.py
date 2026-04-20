@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-viz_free_wall_tracking.py — Section B, plot 2: proxy tracking in the LV
-and RV "territories" (Laplace tau split, no septum carved out).
+viz_lvrv_tracking.py — Section B, plot 2: proxy tracking in the LV
+and RV "territories" — binary Laplace tau split, no septum carved out
+(not a "free wall" plot; the septal cells are folded into whichever
+side tau assigns them to).
 
 The opening argument before the septum gets introduced: at a region that
 faces ONE cavity with an unambiguous pressure choice, does the clinical
@@ -23,7 +25,7 @@ Each region's W_true and W_proxy (PLV, PRV, Trans) are the regional sums
 of the per-cell fields over the 7 spectrum cases → 7-point Pearson r per
 proxy per region.
 
-Output: fig_free_wall_tracking.png — 1×2 dual-axis panels (LV | RV),
+Output: fig_lvrv_tracking.png — 1×2 dual-axis panels (LV | RV),
 black diamond W_true on the left axis, coloured proxies on the right.
 """
 import numpy as np
@@ -136,10 +138,10 @@ for j, region in enumerate(("LV", "RV")):
 
 fig.suptitle("LV / RV territory tracking  (binary tau split, no septum)",
               fontsize=12, fontweight="bold")
-fig.savefig(OUT / "fig_free_wall_tracking.png", dpi=160, bbox_inches="tight")
-fig.savefig(OUT / "fig_free_wall_tracking.pdf", bbox_inches="tight")
-print(f"\nSaved {OUT / 'fig_free_wall_tracking.png'}")
+fig.savefig(OUT / "fig_lvrv_tracking.png", dpi=160, bbox_inches="tight")
+fig.savefig(OUT / "fig_lvrv_tracking.pdf", bbox_inches="tight")
+print(f"\nSaved {OUT / 'fig_lvrv_tracking.png'}")
 
 # Also save raw for downstream reuse
-np.savez(OUT / "free_wall_raw.npz", **arrs, **{f"r_{k}": v for k, v in r_values.items()})
-print(f"Saved {OUT / 'free_wall_raw.npz'}")
+np.savez(OUT / "lvrv_raw.npz", **arrs, **{f"r_{k}": v for k, v in r_values.items()})
+print(f"Saved {OUT / 'lvrv_raw.npz'}")

@@ -95,7 +95,7 @@ def region_densities(pc, septum_key):
     return out
 
 
-# ── Plot (mirrors plot_work_breakdown.py layout) ───────────────────────────
+# ── Plot (mirrors the benched plot_work_breakdown.py layout) ──────────────
 def make_plot(ordered_cases, labels, septum_key, title_septum, sweep_label,
               out_path, n_sep_cells):
     """Work-breakdown style 2×2 plot using DENSITY (Pa) instead of total
