@@ -167,8 +167,8 @@ geodir = Path(args.geometry_dir) if args.geometry_dir else None
 # --- Ensure the run directory owns a geometry handle for postprocess_metrics.py ---
 # postprocess_metrics.py needs <outdir>/geometry to exist (it only reads marker
 # name→tag mapping from markers_geometry.json). When --geometry-dir points at an
-# external folder (thickness variant, PCA mesh, etc.), symlink it into outdir so
-# postprocess works with no extra flags. Restart mode already copies its own geo.
+# external shared-mesh folder, symlink it into outdir so postprocess works with
+# no extra flags. Restart mode already copies its own geo.
 if comm.rank == 0 and geodir is not None and not RESTART_MODE:
     _outdir_geo = outdir / "geometry"
     if not _outdir_geo.exists():

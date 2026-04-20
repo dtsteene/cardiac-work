@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-export_per_cell_xdmf.py — Export per-cell work + proxy fields to ParaView XDMF
-on the canonical atlas mesh, for spatial inspection.
+export_per_cell_xdmf.py — Export per-cell WORK + PROXY fields to ParaView XDMF
+on the canonical atlas mesh, for spatial inspection of simulation outputs.
+
+Purely sim-dependent fields (w_total, proxy_PLV/PRV/Trans, proxy/truth ratios).
+For pure-geometry fields (distances, Laplace scalars, region masks), open
+<geometry_dir>/geometry_fields.xdmf — written by geometry_generator.py.
 
 Uses the ckpt_to_cg_idx saved in per_cell_data.npz (by compute_per_cell.py
 running in canonical mode with linear_sum_assignment). No u_pre recomputation
@@ -96,18 +100,11 @@ def process_case(case_dir, label, beat):
         return np.clip(r, -5, 5)
 
     fields = [
-        mk("w_total", pc["w_total"]),
-        mk("proxy_PLV", pc["proxy_PLV_ll"]),
-        mk("proxy_PRV", pc["proxy_PRV_ll"]),
+        mk("w_total",     pc["w_total"]),
+        mk("proxy_PLV",   pc["proxy_PLV_ll"]),
+        mk("proxy_PRV",   pc["proxy_PRV_ll"]),
         mk("proxy_Trans", pc["proxy_Trans_ll"]),
-        mk("is_geometric_septum", pc["is_geometric_septum"].astype(float)),
-        mk("is_ldrb_septum", pc["is_ldrb_septum"].astype(float)),
-        mk("tau", pc["tau"]),
-        mk("entry_t_mm", pc["entry_t"] * 1000),
-        mk("d_lv_mm", pc["d_lv"] * 1000),
-        mk("d_rv_mm", pc["d_rv"] * 1000),
-        mk("d_epi_mm", pc["d_epi"] * 1000),
-        mk("ratio_PLV", safe_ratio(pc["proxy_PLV_ll"], pc["w_total"])),
+        mk("ratio_PLV",   safe_ratio(pc["proxy_PLV_ll"],   pc["w_total"])),
         mk("ratio_Trans", safe_ratio(pc["proxy_Trans_ll"], pc["w_total"])),
     ]
 
