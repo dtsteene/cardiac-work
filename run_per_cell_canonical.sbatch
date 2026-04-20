@@ -1,14 +1,12 @@
 #!/bin/bash
 # Per-cell work computation in CANONICAL ATLAS MODE.
 #
-# Two steps in one job:
-#   1. precompute_geometry_fields.py on the case's own geometry/ dir
-#      → writes geometry/geometry_fields.npz (zero-strain reference tagging
-#        computed on the unloaded mesh of THIS case — consistent cell count
-#        with its solver mesh, but tags are material/reference-config based)
-#   2. compute_per_cell.py $RESULTS_DIR --geometry-fields ... --output-tag canonical
-#      → writes per_cell_data_canonical.npz alongside the existing ED-tagged
-#        per_cell_data.npz (which is NOT overwritten)
+# Runs compute_per_cell.py in canonical/reference-config mode, reading
+# geometry_fields.npz from the case's own geometry/ dir (written by
+# geometry_generator.py at mesh-generation time — no precompute step needed).
+#
+# → writes per_cell_data_canonical.npz alongside the existing ED-tagged
+#   per_cell_data.npz (which is NOT overwritten)
 #
 # Companion to run_per_cell.sbatch (which does the default ED-tagging path).
 # Submit this to rerun the per-cell computation in canonical/reference-config
@@ -66,34 +64,27 @@ trap "rm -rf ${XDG_CACHE_HOME}" EXIT
 
 cd "$SIM_DIR"
 
-# ── Step 1: precompute_geometry_fields.py on this case ────────────────────
-echo
-echo "=== Step 1: precompute_geometry_fields.py ==="
-date
-$CONDA_PREFIX/bin/python "${SIM_DIR}/precompute_geometry_fields.py" "$GEOM_DIR"
-STEP1_EXIT=$?
-if [ $STEP1_EXIT -ne 0 ]; then
-    echo "Step 1 FAILED with exit $STEP1_EXIT — aborting"
-    exit $STEP1_EXIT
-fi
 if [ ! -f "$GEOM_FIELDS" ]; then
-    echo "Step 1 did not produce $GEOM_FIELDS — aborting"
+    echo "ERROR: $GEOM_FIELDS not found"
+    echo "Geometry fields should be written automatically by geometry_generator.py"
+    echo "at mesh generation time. If this geometry was produced before that change,"
+    echo "regenerate it with geometry_generator.py to populate geometry_fields.npz."
     exit 2
 fi
 
-# ── Step 2: compute_per_cell.py in canonical mode ─────────────────────────
+# ── compute_per_cell.py in canonical mode ─────────────────────────────────
 echo
-echo "=== Step 2: compute_per_cell.py --geometry-fields ==="
+echo "=== compute_per_cell.py --geometry-fields ==="
 date
 time $CONDA_PREFIX/bin/mpirun -n ${SLURM_NTASKS} -launcher fork \
     $CONDA_PREFIX/bin/python "${SIM_DIR}/compute_per_cell.py" \
         "$RESULTS_DIR" \
         --geometry-fields "$GEOM_FIELDS" \
         --output-tag canonical
-STEP2_EXIT=$?
+EXIT=$?
 
 echo
-echo "--- Job Finished (step1=$STEP1_EXIT, step2=$STEP2_EXIT) ---"
+echo "--- Job Finished (exit=$EXIT) ---"
 date
 
 if [ -f "${RESULTS_DIR}/per_cell_data_canonical.npz" ]; then
@@ -101,5 +92,7 @@ if [ -f "${RESULTS_DIR}/per_cell_data_canonical.npz" ]; then
 else
     echo "MISSING: ${RESULTS_DIR}/per_cell_data_canonical.npz not written"
 fi
+
+exit $EXIT
 
 exit $STEP2_EXIT
