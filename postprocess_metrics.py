@@ -15,9 +15,6 @@ Required files in results_dir:
 Usage:
   python3 postprocess_metrics.py <results_directory>
   mpirun -n 4 python3 postprocess_metrics.py <results_directory>
-
-  # With manually edited septum tags (from septum_editor.py):
-  python3 postprocess_metrics.py <results_directory> --edited-tags edited_tags.npz
 """
 
 import json
@@ -42,11 +39,6 @@ import argparse
 
 _parser = argparse.ArgumentParser(description="Offline metrics from simulation checkpoint.")
 _parser.add_argument("results_dir", type=Path, help="Path to simulation results directory")
-_parser.add_argument(
-    "--edited-tags", type=Path, default=None, metavar="NPZ",
-    help="Path to edited_tags.npz from septum_editor. Overrides checkpoint "
-         "region markers (matched by cell centroid, no DOF-ordering dependency).",
-)
 _parser.add_argument(
     "--last-beat", action="store_true", default=False,
     help="Only process the last cardiac cycle (saves time for converged multi-beat sims).",
@@ -96,7 +88,6 @@ if _args.retag_septum and _args.retag_septum_ed:
     raise SystemExit("--retag-septum and --retag-septum-ed are mutually exclusive")
 
 results_dir = _args.results_dir.resolve()
-edited_tags_path = _args.edited_tags
 comm = MPI.COMM_WORLD
 rank = comm.rank
 
@@ -215,58 +206,6 @@ if rank == 0:
 # Load markers from checkpoint (same file = same DOF ordering)
 ffun = adios4dolfinx.read_meshtags(checkpoint_path, mesh, meshtag_name="ffun")
 markers_mt = adios4dolfinx.read_meshtags(checkpoint_path, mesh, meshtag_name="cfun")
-
-# ─── Optional: Override region markers from edited_tags.npz ─────────────────
-# The septum_editor exports cell centroids + edited tags in a .npz file.
-# We match cells between the XDMF (editor) and .bp (checkpoint) meshes by
-# nearest centroid — no DOF-ordering dependency, fully safe.
-if edited_tags_path is not None:
-    from scipy.spatial import cKDTree
-
-    if rank == 0:
-        logger.info(f"Loading edited region tags from {edited_tags_path}")
-
-    edited = np.load(edited_tags_path)
-    edit_centroids = edited["centroids"]  # (n_edit, 3)
-    edit_tags = edited["tags"]            # (n_edit,)
-
-    # Compute centroids of the checkpoint mesh (local cells only)
-    mesh.topology.create_connectivity(3, 0)
-    imap_mt = mesh.topology.index_map(3)
-    n_local = imap_mt.size_local
-    local_cells = np.arange(n_local, dtype=np.int32)
-    bp_centroids = dolfinx.mesh.compute_midpoints(mesh, 3, local_cells)  # (n_local, 3)
-
-    # Build KDTree on the editor centroids, query with checkpoint centroids
-    tree = cKDTree(edit_centroids)
-    dists, indices = tree.query(bp_centroids)
-
-    max_dist = dists.max()
-    if rank == 0:
-        logger.info(f"  Centroid matching: max distance = {max_dist:.2e} m "
-                     f"({n_local} local cells matched)")
-    if max_dist > 1e-6:
-        logger.warning(f"  ⚠️  Large centroid mismatch ({max_dist:.2e} m) — "
-                        f"edited tags may not correspond to this mesh!")
-
-    # Build new MeshTags with edited values on the checkpoint mesh
-    new_values = edit_tags[indices].astype(np.int32)
-    old_values = markers_mt.values[:n_local]
-    n_changed = int((new_values != old_values).sum())
-
-    markers_mt = dolfinx.mesh.meshtags(
-        mesh, 3,
-        np.arange(imap_mt.size_local + imap_mt.num_ghosts, dtype=np.int32),
-        np.concatenate([new_values, markers_mt.values[n_local:]]),
-    )
-    markers_mt.name = "cfun"
-
-    if rank == 0:
-        n_lv = int((new_values == 1).sum())
-        n_rv = int((new_values == 2).sum())
-        n_sept = int((new_values == 3).sum())
-        logger.info(f"  Overridden: {n_changed} cells changed "
-                     f"(LV={n_lv}, RV={n_rv}, Septum={n_sept})")
 
 # ─── Optional: Geometric septum retagging (REFERENCE frame) ──────────────────
 # Recomputes LV/RV/Septum cell tags using distance-based geometry:

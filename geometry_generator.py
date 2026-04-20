@@ -231,7 +231,7 @@ def _compute_and_save_geometry_fields(geodir, outdir, d_sum_max_mm, logger):
     logger.info(f"  Saved {out_xdmf}")
 
 
-def generate_and_load(comm, outdir, args, logger, manual_refinement=False, geodir=None):
+def generate_and_load(comm, outdir, args, logger, geodir=None):
     """
     Handles the generation (on Rank 0) and loading (on all Ranks) of the geometry.
     Returns the loaded cardiac_geometries.geometry.Geometry object.
@@ -330,32 +330,6 @@ def generate_and_load(comm, outdir, args, logger, manual_refinement=False, geodi
         with dolfinx.io.XDMFFile(MPI.COMM_SELF, outdir / "markers_scalar.xdmf", "w") as xdmf:
             xdmf.write_mesh(geo.mesh)
             xdmf.write_meshtags(markers_mt, geo.mesh.geometry)
-
-        # --- OPTIONAL MANUAL REFINEMENT ---
-        # Open the interactive Septum Tag Editor so the user can correct the
-        # LDRB-generated septum boundary before it flows into the FEM solver.
-        # After the window is closed, editor.tags holds the final assignments
-        # (1=LV, 2=RV, 3=Septum) which are used to rebuild markers_mt.
-        # These tags end up in geometry.bp → additional_data["markers_mt"] →
-        # scifem.create_space_of_simple_functions → correct DOF assignment in FEniCSx.
-        if manual_refinement:
-            from septum_editor import SeptumEditor
-            xdmf_path = outdir / "markers_scalar.xdmf"
-            logger.info("=" * 60)
-            logger.info("MANUAL REFINEMENT: Launching Septum Tag Editor.")
-            logger.info("Edit septum tags, then close the window to continue.")
-            logger.info("(Press S inside the editor to also persist edits to disk.)")
-            logger.info("=" * 60)
-            editor = SeptumEditor(xdmf_path, output_path=None)
-            editor.run()  # blocks until window is closed
-            # Rebuild markers_mt from the editor's in-memory tags.
-            # This captures all edits regardless of whether the user pressed S.
-            updated_values = editor.tags[:total_cells].astype(np.int32)
-            markers_mt = dolfinx.mesh.meshtags(geo.mesh, 3, entities, updated_values)
-            n_lv   = int((updated_values == 1).sum())
-            n_rv   = int((updated_values == 2).sum())
-            n_sept = int((updated_values == 3).sum())
-            logger.info(f"Manual refinement complete — LV={n_lv}, RV={n_rv}, Septum={n_sept} cells.")
 
         # 3. System for Viz (DG1)
         fiber_space = "DG_1"
@@ -526,11 +500,6 @@ if __name__ == "__main__":
         help="Characteristic mesh length in mm (default: 5.0)"
     )
     parser.add_argument(
-        "--manual-refinement",
-        action="store_true",
-        help="Launch interactive Septum Tag Editor after LDRB tagging to manually correct tags before saving"
-    )
-    parser.add_argument(
         "--d-sum-max-mm",
         type=float,
         default=22.0,
@@ -596,8 +565,7 @@ if __name__ == "__main__":
         logger.info(f"Characteristic length: {args.char_length} mm")
 
         # Generate and load geometry
-        geo = generate_and_load(comm, outdir, args, logger,
-                                manual_refinement=cli_args.manual_refinement)
+        geo = generate_and_load(comm, outdir, args, logger)
 
         logger.info(f"✓ {geo_type.upper()} geometry generated successfully!")
         logger.info(f"  Mesh: {geo.mesh}")
