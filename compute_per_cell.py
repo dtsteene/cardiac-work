@@ -38,7 +38,7 @@ from scipy.spatial import cKDTree
 from petsc4py import PETSc
 
 # pyvista is used for point-to-facet distance (more accurate than
-# nearest-vertex on coarse meshes, see verify_sweep_envelope.py)
+# nearest-vertex on coarse meshes).
 try:
     import pyvista as pv
     _HAS_PYVISTA = True
@@ -53,10 +53,10 @@ _parser.add_argument("results_dir", type=Path)
 _parser.add_argument("--retag-septum", action="store_true", default=False)
 _parser.add_argument("--geometry-fields", type=Path, default=None,
                      help="CANONICAL atlas mode: load canonical septum tags from "
-                          "a precomputed geometry_fields.npz (produced by "
-                          "precompute_geometry_fields.py on the shared geometry.bp). "
-                          "Tags are propagated to this case via the u_pre permutation. "
-                          "Gives identical cell labels across all cases in a spectrum. "
+                          "a precomputed geometry_fields.npz (emitted automatically "
+                          "by geometry_generator.py alongside geometry.bp). Tags are "
+                          "propagated to this case via the u_pre permutation, giving "
+                          "identical cell labels across all cases in a spectrum. "
                           "RECOMMENDED for sweep analyses. Mutually exclusive with "
                           "--tag-at-unloaded.")
 _parser.add_argument("--tag-at-unloaded", action="store_true",
@@ -709,7 +709,7 @@ if _mode_canonical:
 # is mesh-resolution-independent. Fall back to nearest-vertex (cKDTree) if
 # pyvista is unavailable. On coarse meshes (char_length ~ 10 mm) the two
 # methods can disagree by several mm near surfaces, and facet distance is the
-# correct answer — see verify_sweep_envelope.py for the design discussion.
+# correct answer.
 def _build_surface_polydata_global(tag_ids):
     """Build a GLOBAL PolyData by gathering surface triangles across all MPI ranks.
 

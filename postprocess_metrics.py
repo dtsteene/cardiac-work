@@ -59,8 +59,8 @@ _parser.add_argument(
     "--geometry-dir", type=Path, default=None,
     help="Path to source geometry folder (containing markers_geometry.json). Used only "
          "for marker name\u2192tag mapping. Overrides <results_dir>/geometry. Needed when "
-         "the run directory does not contain a geometry subfolder (e.g. thickness-variant "
-         "runs that loaded geometry from an external path).",
+         "the run directory does not contain a geometry subfolder (e.g. shared-mesh runs "
+         "that loaded geometry from an external path).",
 )
 # Refactor 2026-04-13: regional internal work is now compute_per_cell.py's
 # responsibility. These --skip-* flags default TRUE to match the new canonical

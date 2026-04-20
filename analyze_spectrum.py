@@ -2,8 +2,7 @@
 """
 analyze_spectrum.py — Septal proxy correlation across the PAH severity spectrum.
 
-Mirrors the structure of analyze_thickness.py but with severity as the sweep
-axis instead of wall thickness. Produces two figures:
+Produces two figures:
 
   fig_spectrum_core.png   — W_true + 3 canonical proxies vs severity, absolute
                              units, one panel per septum definition.
@@ -79,7 +78,7 @@ missing = [k for k in KEYS if k not in sims]
 if missing:
     print(f"\nWARNING: missing {len(missing)} cases: {missing}")
 
-# ── Shared helpers (mirror analyze_thickness.py) ─────────────────────────────
+# ── Shared helpers ───────────────────────────────────────────────────────────
 def safe_r(x, y):
     if np.std(x) == 0 or np.std(y) == 0 or len(x) < 3:
         return np.nan
