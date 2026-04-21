@@ -67,12 +67,6 @@ _parser.add_argument("--tag-at-unloaded", action="store_true",
                           "See session update 2026-04-13 in transmural_work_profiles.md.")
 _parser.add_argument("--d-sum-max-mm", type=float, default=22.0,
                      help="Envelope upper bound on d_sum (mm).")
-_parser.add_argument("--d-sum-min-mm", type=float, default=4.0,
-                     help="Envelope lower bound on d_sum (mm). (Ignored — kept for "
-                          "argparse backwards compatibility. See session update.)")
-_parser.add_argument("--d-epi-min-mm", type=float, default=2.0,
-                     help="Envelope minimum d_epi (mm). (Ignored — kept for "
-                          "argparse backwards compatibility. See session update.)")
 _parser.add_argument("--beat", type=int, default=None,
                      help="Replay a specific beat (0-indexed) instead of the last beat. "
                           "Useful for per-beat convergence analysis. Output is written "
@@ -681,8 +675,6 @@ if _mode_canonical:
     else:
         mesh_scale_to_mm = 1.0
     d_sum_max = _d_sum_max_mm_canonical / mesh_scale_to_mm
-    d_sum_min = 0.0
-    d_epi_min = 0.0
     envelope = (d_sum <= d_sum_max) & ~touches_epi
     study_region = (is_geometric_septum | is_ldrb_septum) & (d_sum < d_sum_max)
 
@@ -845,8 +837,6 @@ if not _mode_canonical:
         mesh_scale_to_mm = 1.0
 
     d_sum_max = _args.d_sum_max_mm / mesh_scale_to_mm
-    d_sum_min = _args.d_sum_min_mm / mesh_scale_to_mm
-    d_epi_min = _args.d_epi_min_mm / mesh_scale_to_mm
 
     study_region = (is_geometric_septum | is_ldrb_septum) & (d_sum < d_sum_max)
 
@@ -1228,9 +1218,7 @@ for _current_beat_idx in beats_to_process:
                      _ckpt_to_cg_idx_global if _ckpt_to_cg_idx_global is not None
                      else np.array([], dtype=np.int64)
                  ),
-                 # Envelope parameters used (for provenance)
-                 envelope_d_epi_min_mm=_args.d_epi_min_mm,
-                 envelope_d_sum_min_mm=_args.d_sum_min_mm,
+                 # Envelope parameter used (for provenance)
                  envelope_d_sum_max_mm=_args.d_sum_max_mm,
         )
         logger.info(f"Saved per-cell data to {output_path}")
