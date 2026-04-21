@@ -16,6 +16,10 @@ thickness_meshes/
 thickness_variants/
 geometries/
 
+# Transient optuna output from optimize_mesh_circ.py
+# (canonical JSONs are copied to data/ukb_circ_v2/)
+results_mesh_*/
+
 # Experimental artifacts (plots, analysis scripts)
 *.png
 *.jpg

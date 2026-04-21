@@ -21,7 +21,7 @@ if [ "$1" = "status" ]; then
     squeue -u $USER -o "%.8i %.16j %.2t %.10M %.6D %R" | head -20
     echo ""
     echo "=== Results so far ==="
-    RESULTS_DIR="/global/D1/homes/dtsteene/circulation/examples/results_mesh_ukb"
+    RESULTS_DIR="/global/D1/homes/dtsteene/cardiac-work/results_mesh_ukb"
     V2_DIR="/global/D1/homes/dtsteene/cardiac-work/data/ukb_circ_v2"
     for sev in $SEVERITIES; do
         json="$V2_DIR/optimized_regazzoni_ukb_${sev}.json"

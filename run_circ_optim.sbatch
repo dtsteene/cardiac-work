@@ -33,11 +33,10 @@ module load anaconda3
 eval "$(conda shell.bash hook)"
 conda activate RV
 
-SCRIPT_DIR="/global/D1/homes/dtsteene/circulation/examples"
 WORK_DIR="/global/D1/homes/dtsteene/cardiac-work"
 
-# Output goes next to the optimization script
-cd "$SCRIPT_DIR"
+# Output goes next to the optimization script (results_mesh_<name>/ under WORK_DIR)
+cd "$WORK_DIR"
 
 echo "============================================================"
 echo "  Circulation parameter optimization"
@@ -53,7 +52,7 @@ echo "  Started  : $(date)"
 echo "============================================================"
 
 # --- Run optimization (use --lv-edv/--rv-edv to skip MPI mesh reading) ---
-python optimize_mesh_circ.py \
+python "$WORK_DIR/optimize_mesh_circ.py" \
     --lv-edv "$LV_EDV" \
     --rv-edv "$RV_EDV" \
     --mesh-name "$MESH_NAME" \
@@ -71,7 +70,7 @@ echo "============================================================"
 
 # --- Copy results to cardiac-work data directory ---
 if [ $EXIT_CODE -eq 0 ]; then
-    RESULTS_DIR="$SCRIPT_DIR/results_mesh_${MESH_NAME}"
+    RESULTS_DIR="$WORK_DIR/results_mesh_${MESH_NAME}"
     TARGET_DIR="$WORK_DIR/data/ukb_circ_v2"
     mkdir -p "$TARGET_DIR"
 
