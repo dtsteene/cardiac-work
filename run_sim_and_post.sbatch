@@ -21,6 +21,7 @@ METRICS_SPACE=${METRICS_SPACE:-"DG1"}
 CIRCULATION_PARAMS=${CIRCULATION_PARAMS:-""}
 ALPHA_EPI=${ALPHA_EPI:-""}
 ALPHA_BASE=${ALPHA_BASE:-""}
+BASE_DIRICHLET=${BASE_DIRICHLET:-"x"}
 INCOMPRESSIBLE=${INCOMPRESSIBLE:-0}
 ONE_SIDED_ROBIN=${ONE_SIDED_ROBIN:-0}
 COMMENT=${COMMENT:-"No description provided"}
@@ -117,6 +118,7 @@ ARGS_STR="$ARGS_STR --metrics_space $METRICS_SPACE"
 [ "$CI" = "1" ] && ARGS_STR="$ARGS_STR --ci"
 [ -n "$ALPHA_EPI" ] && ARGS_STR="$ARGS_STR --alpha_epi $ALPHA_EPI"
 [ -n "$ALPHA_BASE" ] && ARGS_STR="$ARGS_STR --alpha_base $ALPHA_BASE"
+[ -n "$BASE_DIRICHLET" ] && ARGS_STR="$ARGS_STR --base-dirichlet $BASE_DIRICHLET"
 [ "$INCOMPRESSIBLE" = "1" ] && ARGS_STR="$ARGS_STR --incompressible"
 [ "$ONE_SIDED_ROBIN" = "1" ] && ARGS_STR="$ARGS_STR --one-sided-robin"
 [ -n "$GEOMETRY_DIR" ] && ARGS_STR="$ARGS_STR --geometry-dir $GEOMETRY_DIR"
@@ -143,6 +145,8 @@ ERR_FILE="${LOG_DIR}/${GEO_TAG}_sim_${SLURM_JOB_ID}.err"
 
 # Work directory on local scratch
 WORK_DIR="/work/$USER/cardiac_${GEO_TAG}_${SLURM_JOB_ID}"
+SIM_STDOUT="${WORK_DIR}/simulation_stdout.log"
+SIM_STDERR="${WORK_DIR}/simulation_stderr.log"
 mkdir -p ${WORK_DIR}
 export XDG_CACHE_HOME="${WORK_DIR}/.cache"
 
@@ -199,7 +203,12 @@ echo "  Save Dir:  $RESULTS_DIR"
 # Trap EXIT so data transfer happens even on SIGTERM/timeout.
 # SLURM sends SIGTERM → 30s grace → SIGKILL. This trap runs on SIGTERM,
 # giving us time to copy results before SIGKILL arrives.
+TRANSFER_DONE=0
 transfer_and_cleanup() {
+    if [ "$TRANSFER_DONE" = "1" ]; then
+        return
+    fi
+    TRANSFER_DONE=1
     echo "--- Transferring data from scratch to results dir ---"
     if [ -d "${WORK_DIR}" ]; then
         cd ${WORK_DIR}
@@ -210,6 +219,8 @@ transfer_and_cleanup() {
         else
             echo "WARNING: No results directory found in scratch."
         fi
+        cp "${SIM_STDOUT}" "${RESULTS_DIR}/simulation_stdout.log" 2>/dev/null || true
+        cp "${SIM_STDERR}" "${RESULTS_DIR}/simulation_stderr.log" 2>/dev/null || true
     else
         echo "WARNING: Work directory ${WORK_DIR} not found (already cleaned?)."
     fi
@@ -224,7 +235,10 @@ transfer_and_cleanup() {
 }
 trap transfer_and_cleanup EXIT
 
-time $CONDA_PREFIX/bin/mpirun -n ${SLURM_NTASKS} -launcher fork $CONDA_PREFIX/bin/python ${SIM_DIR}/complete_cycle.py $BPM $ARGS_STR
+echo "  Simulation stdout: ${SIM_STDOUT}"
+echo "  Simulation stderr: ${SIM_STDERR}"
+{ time $CONDA_PREFIX/bin/mpirun -n ${SLURM_NTASKS} -launcher fork $CONDA_PREFIX/bin/python ${SIM_DIR}/complete_cycle.py $BPM $ARGS_STR; } \
+    > "${SIM_STDOUT}" 2> "${SIM_STDERR}"
 SIM_EXIT=$?
 
 if [ $SIM_EXIT -ne 0 ]; then
@@ -256,7 +270,8 @@ if [ $SIM_EXIT -eq 0 ]; then
         fi
         echo "Running compute_per_cell.py ..."
         $CONDA_PREFIX/bin/mpirun -n ${SLURM_NTASKS} -launcher fork \
-            $CONDA_PREFIX/bin/python ${SIM_DIR}/compute_per_cell.py $PER_CELL_ARGS
+            $CONDA_PREFIX/bin/python ${SIM_DIR}/compute_per_cell.py $PER_CELL_ARGS \
+            > "${RESULTS_DIR}/compute_per_cell.log" 2> "${RESULTS_DIR}/compute_per_cell.err"
         PER_CELL_EXIT=$?
         if [ $PER_CELL_EXIT -ne 0 ]; then
             echo "WARNING: compute_per_cell.py exited with code $PER_CELL_EXIT"
@@ -267,14 +282,19 @@ if [ $SIM_EXIT -eq 0 ]; then
         # --- B. Boundary + loops: slim postprocess_metrics.py ---
         # With the 2026-04-13 refactor, default flags skip the regional
         # internal work and directional decomposition paths (compute_per_cell
-        # owns them). This call produces boundary work, Robin work, PV/PS/SS
-        # loop time-series, and the energy balance diagnostic only.
-        echo "Running postprocess_metrics.py (slim mode)..."
+        # owns them). Set POST_FULL=1 to re-enable the regional internal work
+        # computation (needed for a working engineering_debug.png); default
+        # stays off to match the fast path.
+        POST_ARGS="."
+        [ "${POST_FULL:-0}" = "1" ] && POST_ARGS=". --no-skip-regional-internal"
+        echo "Running postprocess_metrics.py (POST_FULL=${POST_FULL:-0})..."
         $CONDA_PREFIX/bin/mpirun -n ${SLURM_NTASKS} -launcher fork \
-            $CONDA_PREFIX/bin/python ${SIM_DIR}/postprocess_metrics.py .
+            $CONDA_PREFIX/bin/python ${SIM_DIR}/postprocess_metrics.py $POST_ARGS \
+            > "${RESULTS_DIR}/postprocess_metrics.log" 2> "${RESULTS_DIR}/postprocess_metrics.err"
         echo "Metrics computed"
 
-        python3 ${SIM_DIR}/run_postprocessing.py .
+        python3 ${SIM_DIR}/run_postprocessing.py . \
+            > "${RESULTS_DIR}/run_postprocessing.log" 2> "${RESULTS_DIR}/run_postprocessing.err"
         echo "Analysis complete"
     else
         echo "Skipping post-processing (missing checkpoint data)."
@@ -284,3 +304,4 @@ fi
 # Cleanup and data transfer handled by the EXIT trap (transfer_and_cleanup)
 echo "--- Job Finished ---"
 date
+exit $SIM_EXIT

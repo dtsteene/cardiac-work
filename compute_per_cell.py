@@ -263,14 +263,20 @@ robin_base = pulse.RobinBC(
 
 def dirichlet_bc(V_space):
     facets = geometry.facet_tags.find(geometry.markers["BASE"][0])
-    if sim_params["incompressible"]:
+    base_dirichlet = sim_params.get("base_dirichlet", "x")
+    if base_dirichlet == "full" or sim_params["incompressible"]:
         dofs = dolfinx.fem.locate_dofs_topological(V_space, 2, facets)
         u_zero = dolfinx.fem.Function(V_space)
+        u_zero.x.array[:] = 0.0
         return [dolfinx.fem.dirichletbc(u_zero, dofs)]
-    else:
-        V_x = V_space.sub(0)
-        dofs = dolfinx.fem.locate_dofs_topological(V_x, 2, facets)
-        return [dolfinx.fem.dirichletbc(0.0, dofs, V_x)]
+    V_x = V_space.sub(0)
+    dofs = dolfinx.fem.locate_dofs_topological(V_x, 2, facets)
+    return [dolfinx.fem.dirichletbc(0.0, dofs, V_x)]
+
+base_dirichlet = sim_params.get("base_dirichlet", "x")
+dirichlet_bcs = () if base_dirichlet == "none" else (dirichlet_bc,)
+if rank == 0:
+    logger.info(f"Base Dirichlet mode: {base_dirichlet}")
 
 volume2ml = sim_params["volume2ml"]
 lv_marker = "LV" if "LV" in geometry.markers else "ENDO_LV"
@@ -283,7 +289,7 @@ cavities = [
     pulse.problem.Cavity(marker=lv_marker, volume=lv_volume),
     pulse.problem.Cavity(marker=rv_marker, volume=rv_volume),
 ]
-bcs = pulse.BoundaryConditions(robin=[robin_epi, robin_base], dirichlet=(dirichlet_bc,))
+bcs = pulse.BoundaryConditions(robin=[robin_epi, robin_base], dirichlet=dirichlet_bcs)
 problem = pulse.problem.StaticProblem(
     model=cardiac_model, geometry=geometry, bcs=bcs, cavities=cavities,
     parameters={"mesh_unit": sim_params["mesh_unit"], "u_space": "P_2"},
@@ -337,6 +343,139 @@ expr_S_total = dolfinx.fem.Expression(S_tot_ufl, points_tensor)
 V_DG0 = dolfinx.fem.functionspace(mesh, ("DG", 0))
 v_dg0 = ufl.TestFunction(V_DG0)
 
+# Cellwise geometric frame for candidate clinical radial/circumferential
+# pressure-strain proxies. The radial direction is nearest endocardium -> nearest
+# epicardium; later, before projection, it is orthogonalized against the saved
+# longitudinal direction l0. This keeps the frame geometric/clinical rather than
+# tied to the material sheet-normal direction n0.
+V_DG0_vec = dolfinx.fem.functionspace(mesh, ("DG", 0, (3,)))
+mesh.topology.create_connectivity(2, 0)
+mesh.topology.create_connectivity(3, 0)
+f2v_conn = mesh.topology.connectivity(2, 0)
+imap_3 = mesh.topology.index_map(3)
+n_local_cells = imap_3.size_local
+local_cells = np.arange(n_local_cells, dtype=np.int32)
+centroids_ref = dolfinx.mesh.compute_midpoints(mesh, 3, local_cells)
+
+
+def _surface_triangles_global(tag_ids):
+    local = []
+    for tag in tag_ids:
+        for facet in ffun.find(tag):
+            vert_ids = f2v_conn.links(facet)
+            if len(vert_ids) == 3:
+                local.append(mesh.geometry.x[vert_ids])
+    local_arr = np.asarray(local, dtype=float) if local else np.empty((0, 3, 3), dtype=float)
+    gathered = comm.allgather(local_arr)
+    nonempty = [arr for arr in gathered if len(arr) > 0]
+    if not nonempty:
+        return np.empty((0, 3, 3), dtype=float)
+    return np.concatenate(nonempty, axis=0)
+
+
+def _closest_point_on_triangle(point, tri):
+    # Ericson, Real-Time Collision Detection, section 5.1.5.
+    a, b, c = tri
+    ab = b - a
+    ac = c - a
+    ap = point - a
+    d1 = float(np.dot(ab, ap))
+    d2 = float(np.dot(ac, ap))
+    if d1 <= 0.0 and d2 <= 0.0:
+        return a
+
+    bp = point - b
+    d3 = float(np.dot(ab, bp))
+    d4 = float(np.dot(ac, bp))
+    if d3 >= 0.0 and d4 <= d3:
+        return b
+
+    vc = d1 * d4 - d3 * d2
+    if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
+        return a + (d1 / (d1 - d3)) * ab
+
+    cp = point - c
+    d5 = float(np.dot(ab, cp))
+    d6 = float(np.dot(ac, cp))
+    if d6 >= 0.0 and d5 <= d6:
+        return c
+
+    vb = d5 * d2 - d1 * d6
+    if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
+        return a + (d2 / (d2 - d6)) * ac
+
+    va = d3 * d6 - d5 * d4
+    if va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0:
+        return b + ((d4 - d3) / ((d4 - d3) + (d5 - d6))) * (c - b)
+
+    denom = 1.0 / (va + vb + vc)
+    return a + ab * (vb * denom) + ac * (vc * denom)
+
+
+def _closest_points_to_surface(query_points, triangles, k=24):
+    if len(triangles) == 0:
+        raise RuntimeError("Cannot build geometric frame: requested surface has no triangles")
+    centers = triangles.mean(axis=1)
+    tree = cKDTree(centers)
+    k_eff = min(k, len(triangles))
+    _, nearest = tree.query(query_points, k=k_eff)
+    if nearest.ndim == 1:
+        nearest = nearest[:, None]
+
+    closest = np.empty_like(query_points)
+    distances = np.empty(len(query_points), dtype=float)
+    for i, point in enumerate(query_points):
+        best_point = None
+        best_d2 = np.inf
+        for tri_idx in nearest[i]:
+            candidate = _closest_point_on_triangle(point, triangles[int(tri_idx)])
+            d2 = float(np.dot(point - candidate, point - candidate))
+            if d2 < best_d2:
+                best_d2 = d2
+                best_point = candidate
+        closest[i] = best_point
+        distances[i] = best_d2 ** 0.5
+    return closest, distances
+
+
+def _normalize_rows(values):
+    norms = np.linalg.norm(values, axis=1)
+    out = np.zeros_like(values)
+    good = norms > 1e-12
+    out[good] = values[good] / norms[good, None]
+    if (~good).any() and rank == 0:
+        logger.warning(f"Geometric frame: {int((~good).sum())} near-zero radial vectors")
+    return out
+
+
+def _dg0_vector_function(values, name):
+    fn = dolfinx.fem.Function(V_DG0_vec, name=name)
+    arr = fn.x.array.reshape(-1, 3)
+    arr[:] = 0.0
+    arr[:len(values)] = values
+    fn.x.scatter_forward()
+    return fn
+
+
+_lv_tags_frame = [geometry.markers.get("LV", geometry.markers.get("ENDO_LV"))[0]]
+_rv_tags_frame = [geometry.markers.get("RV", geometry.markers.get("ENDO_RV"))[0]]
+_epi_tags_frame = [geometry.markers["EPI"][0]]
+
+_lv_tri = _surface_triangles_global(_lv_tags_frame)
+_rv_tri = _surface_triangles_global(_rv_tags_frame)
+_epi_tri = _surface_triangles_global(_epi_tags_frame)
+
+_cp_lv, _d_lv_frame = _closest_points_to_surface(centroids_ref, _lv_tri)
+_cp_rv, _d_rv_frame = _closest_points_to_surface(centroids_ref, _rv_tri)
+_cp_epi, _ = _closest_points_to_surface(centroids_ref, _epi_tri)
+_nearest_lv = _d_lv_frame <= _d_rv_frame
+_cp_endo = np.where(_nearest_lv[:, None], _cp_lv, _cp_rv)
+_r_endo_epi_values = _normalize_rows(_cp_epi - _cp_endo)
+radial_endo_epi_dg0 = _dg0_vector_function(_r_endo_epi_values, "radial_endo_to_epi")
+
+if rank == 0:
+    logger.info("Built geometric radial candidate: nearest endocardium -> epicardium")
+
 # dx with same quadrature as the tensor space
 dx_q = ufl.Measure("dx", domain=mesh, metadata={"quadrature_degree": 6})
 
@@ -357,6 +496,19 @@ deps_ll = None
 if l0 is not None:
     deps_ll = proj(dE, l0)
 
+deps_radial = None
+deps_circ = None
+if l0 is not None:
+    def unit(v):
+        return v / ufl.sqrt(ufl.inner(v, v) + 1e-16)
+
+    radial0 = unit(radial_endo_epi_dg0 - ufl.inner(radial_endo_epi_dg0, l0) * l0)
+    circ0 = unit(ufl.cross(l0, radial0))
+    deps_radial = proj(dE, radial0)
+    deps_circ = proj(dE, circ0)
+elif rank == 0:
+    logger.warning("l0 not loaded — radial/circumferential clinical-frame proxies unavailable")
+
 # Compile per-cell forms
 # Each form: assemble_vector gives a vector of length n_cells
 form_w_total = dolfinx.fem.form(wd_total * v_dg0 * dx_q)
@@ -365,6 +517,8 @@ form_w_ss = dolfinx.fem.form(wd_sheet * v_dg0 * dx_q)
 form_w_nn = dolfinx.fem.form(wd_normal * v_dg0 * dx_q) if wd_normal is not None else None
 form_deps_ff = dolfinx.fem.form(deps_ff * v_dg0 * dx_q)
 form_deps_ll = dolfinx.fem.form(deps_ll * v_dg0 * dx_q) if deps_ll is not None else None
+form_deps_radial = dolfinx.fem.form(deps_radial * v_dg0 * dx_q) if deps_radial is not None else None
+form_deps_circ = dolfinx.fem.form(deps_circ * v_dg0 * dx_q) if deps_circ is not None else None
 
 # Cell volume form (assemble once)
 form_vol = dolfinx.fem.form(dolfinx.fem.Constant(mesh, 1.0) * v_dg0 * dx_q)
@@ -955,6 +1109,12 @@ for _current_beat_idx in beats_to_process:
     cum_proxy_PLV_ll = np.zeros(n)
     cum_proxy_PRV_ll = np.zeros(n)
     cum_proxy_Trans_ll = np.zeros(n)
+    cum_proxy_PLV_radial = np.zeros(n)
+    cum_proxy_PRV_radial = np.zeros(n)
+    cum_proxy_Trans_radial = np.zeros(n)
+    cum_proxy_PLV_circ = np.zeros(n)
+    cum_proxy_PRV_circ = np.zeros(n)
+    cum_proxy_Trans_circ = np.zeros(n)
 
     # Cell volumes (reuse the form_vol compiled above)
     cell_vols_vec = dolfinx.fem.assemble_vector(form_vol)
@@ -1016,6 +1176,20 @@ for _current_beat_idx in beats_to_process:
                 cum_proxy_PLV_ll += p_LV_avg * deps_ll_arr
                 cum_proxy_PRV_ll += p_RV_avg * deps_ll_arr
                 cum_proxy_Trans_ll += (p_LV_avg - p_RV_avg) * deps_ll_arr
+
+            if form_deps_radial is not None:
+                deps_radial_vec = dolfinx.fem.assemble_vector(form_deps_radial)
+                deps_radial_arr = deps_radial_vec.array[:n]
+                cum_proxy_PLV_radial += p_LV_avg * deps_radial_arr
+                cum_proxy_PRV_radial += p_RV_avg * deps_radial_arr
+                cum_proxy_Trans_radial += (p_LV_avg - p_RV_avg) * deps_radial_arr
+
+            if form_deps_circ is not None:
+                deps_circ_vec = dolfinx.fem.assemble_vector(form_deps_circ)
+                deps_circ_arr = deps_circ_vec.array[:n]
+                cum_proxy_PLV_circ += p_LV_avg * deps_circ_arr
+                cum_proxy_PRV_circ += p_RV_avg * deps_circ_arr
+                cum_proxy_Trans_circ += (p_LV_avg - p_RV_avg) * deps_circ_arr
 
             p_LV_prev, p_RV_prev = p_LV, p_RV
         else:
@@ -1155,6 +1329,13 @@ for _current_beat_idx in beats_to_process:
     g_proxy_PLV_ll = gather_to_root(cum_proxy_PLV_ll)
     g_proxy_PRV_ll = gather_to_root(cum_proxy_PRV_ll)
     g_proxy_Trans_ll = gather_to_root(cum_proxy_Trans_ll)
+    g_proxy_PLV_radial = gather_to_root(cum_proxy_PLV_radial)
+    g_proxy_PRV_radial = gather_to_root(cum_proxy_PRV_radial)
+    g_proxy_Trans_radial = gather_to_root(cum_proxy_Trans_radial)
+    g_proxy_PLV_circ = gather_to_root(cum_proxy_PLV_circ)
+    g_proxy_PRV_circ = gather_to_root(cum_proxy_PRV_circ)
+    g_proxy_Trans_circ = gather_to_root(cum_proxy_Trans_circ)
+    g_radial_endo_to_epi = gather_to_root(_r_endo_epi_values)
     g_cell_volumes = gather_to_root(cell_volumes)
     g_centroids = gather_to_root(centroids)
     g_lvrv_vals = gather_to_root(lvrv_vals)
@@ -1199,8 +1380,15 @@ for _current_beat_idx in beats_to_process:
                  proxy_PLV_ll=g_proxy_PLV_ll,
                  proxy_PRV_ll=g_proxy_PRV_ll,
                  proxy_Trans_ll=g_proxy_Trans_ll,
+                 proxy_PLV_radial=g_proxy_PLV_radial,
+                 proxy_PRV_radial=g_proxy_PRV_radial,
+                 proxy_Trans_radial=g_proxy_Trans_radial,
+                 proxy_PLV_circ=g_proxy_PLV_circ,
+                 proxy_PRV_circ=g_proxy_PRV_circ,
+                 proxy_Trans_circ=g_proxy_Trans_circ,
                  cell_volumes=g_cell_volumes,
                  centroids=g_centroids,
+                 radial_endo_to_epi=g_radial_endo_to_epi,
                  lv_rv_scalar=g_lvrv_vals,
                  epi_scalar_dg0=g_epi_vals,
                  # DG0 vs scalar integration cross-check (machine-precision invariant)

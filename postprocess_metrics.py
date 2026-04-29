@@ -406,15 +406,20 @@ robin_base = pulse.RobinBC(
 # Dirichlet BC
 def dirichlet_bc(V_space):
     facets = geometry.facet_tags.find(geometry.markers["BASE"][0])
-    if sim_params["incompressible"]:
+    base_dirichlet = sim_params.get("base_dirichlet", "x")
+    if base_dirichlet == "full" or sim_params["incompressible"]:
         dofs = dolfinx.fem.locate_dofs_topological(V_space, 2, facets)
         u_zero = dolfinx.fem.Function(V_space)
         u_zero.x.array[:] = 0.0
         return [dolfinx.fem.dirichletbc(u_zero, dofs)]
-    else:
-        V_x = V_space.sub(0)
-        dofs = dolfinx.fem.locate_dofs_topological(V_x, 2, facets)
-        return [dolfinx.fem.dirichletbc(0.0, dofs, V_x)]
+    V_x = V_space.sub(0)
+    dofs = dolfinx.fem.locate_dofs_topological(V_x, 2, facets)
+    return [dolfinx.fem.dirichletbc(0.0, dofs, V_x)]
+
+base_dirichlet = sim_params.get("base_dirichlet", "x")
+dirichlet_bcs = () if base_dirichlet == "none" else (dirichlet_bc,)
+if rank == 0:
+    logger.info(f"Base Dirichlet mode: {base_dirichlet}")
 
 # Cavities
 volume2ml = sim_params["volume2ml"]
@@ -432,7 +437,7 @@ cavities = [
     pulse.problem.Cavity(marker=rv_marker, volume=rv_volume),
 ]
 
-bcs = pulse.BoundaryConditions(robin=[robin_epi, robin_base], dirichlet=(dirichlet_bc,))
+bcs = pulse.BoundaryConditions(robin=[robin_epi, robin_base], dirichlet=dirichlet_bcs)
 
 problem = pulse.problem.StaticProblem(
     model=cardiac_model,

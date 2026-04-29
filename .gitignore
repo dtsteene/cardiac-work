@@ -5,8 +5,12 @@ __pycache__/
 *.pyc
 .ipynb_checkpoints/
 log/
+logs*/
+tmp/
 *.sbatch.out
 *.sbatch.err
+*.log
+*.bak
 data/
 
 # Generated mesh variants (large, reproducible from scripts)

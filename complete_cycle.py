@@ -50,6 +50,14 @@ parser.add_argument('--metrics_space', type=str, default="DG0", help='Function s
 parser.add_argument('--circulation_params', type=str, default=None, help='Path to JSON file with circulation parameters')
 parser.add_argument('--alpha_epi', type=float, default=1e5, help='Epicardial spring stiffness (Pa/m) (default: 1e5)')
 parser.add_argument('--alpha_base', type=float, default=1e6, help='Basal spring stiffness (Pa/m) (default: 1e6)')
+parser.add_argument(
+    '--base-dirichlet',
+    choices=('x', 'none', 'full'),
+    default='x',
+    help='Basal Dirichlet constraint: x fixes the base-normal displacement, '
+         'none uses Robin support only, full clamps all displacement components '
+         '(default: x).',
+)
 parser.add_argument('--one-sided-robin', action='store_true', help='Use one-sided Robin BC (only resists outward displacement)')
 parser.add_argument('--incompressible', action='store_true', help='Use incompressible formulation')
 parser.add_argument('--geometry-dir', type=str, default=None,
@@ -517,7 +525,16 @@ if comm.rank == 0:
 
 # --- Setup Problem (From V1: Uses Scifem and markers_mt) ---
 
-def setup_problem(geometry, f0, s0, material_params, alpha_epi_val=1e5, alpha_base_val=1e6, incompressible=False):
+def setup_problem(
+    geometry,
+    f0,
+    s0,
+    material_params,
+    alpha_epi_val=1e5,
+    alpha_base_val=1e6,
+    incompressible=False,
+    base_dirichlet="x",
+):
     material = pulse.HolzapfelOgden(f0=f0, s0=s0, **material_params)
 
     # Use scifem to create simple function space based on markers_mt
@@ -562,6 +579,12 @@ def setup_problem(geometry, f0, s0, material_params, alpha_epi_val=1e5, alpha_ba
 
     def dirichlet_bc(V: dolfinx.fem.FunctionSpace):
         facets = geometry.facet_tags.find(geometry.markers["BASE"][0])
+
+        if base_dirichlet == "full":
+            dofs = dolfinx.fem.locate_dofs_topological(V, 2, facets)
+            u_zero = dolfinx.fem.Function(V)
+            u_zero.x.array[:] = 0.0
+            return [dolfinx.fem.dirichletbc(u_zero, dofs)]
         
         try:
             # --- CASE 1: Standard / Compressible ---
@@ -592,14 +615,20 @@ def setup_problem(geometry, f0, s0, material_params, alpha_epi_val=1e5, alpha_ba
             # Apply BC to the full vector space V
             return [dolfinx.fem.dirichletbc(u_zero, dofs)]
 
-    return model, robin, dirichlet_bc, Ta
+    if base_dirichlet == "none":
+        dirichlet_bcs = ()
+    else:
+        dirichlet_bcs = (dirichlet_bc,)
+
+    return model, robin, dirichlet_bcs, Ta
 
 
 material_params = pulse.HolzapfelOgden.transversely_isotropic_parameters()
 # Use Compressible for Prestressing always (Hybrid Strategy)
-model, robin, dirichlet_bc, Ta = setup_problem(
+model, robin, dirichlet_bcs, Ta = setup_problem(
     geometry=geometry, f0=geo.f0, s0=geo.s0, material_params=material_params,
-    alpha_epi_val=args.alpha_epi, alpha_base_val=args.alpha_base, incompressible=False
+    alpha_epi_val=args.alpha_epi, alpha_base_val=args.alpha_base,
+    incompressible=False, base_dirichlet=args.base_dirichlet,
 )
 
 # --- Prestressing (Inverse Elasticity) ---
@@ -628,7 +657,7 @@ neumann_lv = pulse.NeumannBC(traction=pressure_lv, marker=lv_marker_id)
 neumann_rv = pulse.NeumannBC(traction=pressure_rv, marker=rv_marker_id)
 
 bcs_prestress = pulse.BoundaryConditions(
-    robin=robin, dirichlet=(dirichlet_bc,), neumann=(neumann_lv, neumann_rv),
+    robin=robin, dirichlet=dirichlet_bcs, neumann=(neumann_lv, neumann_rv),
 )
 
 solver_dir = outdir / "solver"
@@ -711,9 +740,10 @@ logger.info(f"Unloaded volumes: LV={lvv_unloaded * volume2ml:.2f} mL, RV={rvv_un
 if args.incompressible:
     logger.info("Warning: Hybrid Prestressing Strategy Active (Compressible Unloading -> Incompressible Forward)")
 
-model, robin, dirichlet_bc, Ta = setup_problem(
+model, robin, dirichlet_bcs, Ta = setup_problem(
     geometry=geometry, f0=f0_quad, s0=s0_quad, material_params=material_params,
-    incompressible=args.incompressible
+    alpha_epi_val=args.alpha_epi, alpha_base_val=args.alpha_base,
+    incompressible=args.incompressible, base_dirichlet=args.base_dirichlet,
 )
 
 lv_volume = dolfinx.fem.Constant(geometry.mesh, dolfinx.default_scalar_type(lvv_unloaded))
@@ -726,7 +756,7 @@ cavities = [
     pulse.problem.Cavity(marker=rv_marker, volume=rv_volume),
 ]
 
-bcs_forward = pulse.BoundaryConditions(robin=robin, dirichlet=(dirichlet_bc,))
+bcs_forward = pulse.BoundaryConditions(robin=robin, dirichlet=dirichlet_bcs)
 
 problem = pulse.problem.StaticProblem(
     model=model,
@@ -1075,6 +1105,7 @@ if comm.rank == 0:
         "incompressible": args.incompressible,
         "alpha_epi": args.alpha_epi,
         "alpha_base": args.alpha_base,
+        "base_dirichlet": args.base_dirichlet,
         "one_sided_robin": args.one_sided_robin,
         "material_params": {k: {"value": float(v.value), "unit": str(v.original_unit)} for k, v in material_params.items()},
         "activation": {
@@ -1167,6 +1198,7 @@ finally:
                 "incompressible": args.incompressible,
                 "alpha_epi": args.alpha_epi,
                 "alpha_base": args.alpha_base,
+                "base_dirichlet": args.base_dirichlet,
                 "one_sided_robin": args.one_sided_robin,
                 "material_params": {k: {"value": float(v.value), "unit": str(v.original_unit)} for k, v in material_params.items()},
                 "activation": {
