@@ -7,7 +7,7 @@
 # geometry_generator.py --single ukb -c 10 --output-dir data/shared_ukb_mesh
 #
 # Each sim loads the mesh via adios4dolfinx (verified bit-for-bit correct
-# round-trip for serial-write / parallel-read). See test_adios_roundtrip.py.
+# round-trip for serial-write / parallel-read).
 
 set -e
 cd /home/dtsteene/D1/cardiac-work
