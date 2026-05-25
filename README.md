@@ -76,11 +76,18 @@ sbatch --export=RESULTS_DIR=results/sims/<dir> run_postprocess_only.sbatch
 # Per-cell work in canonical-tagging mode
 sbatch --export=RESULTS_DIR=results/sims/<dir> run_per_cell_canonical.sbatch
 
-# 8 severities on a single shared UKB mesh
-bash launch_phase1_shared_mesh.sh
-
-# Capped shared-L5 production sweep (16 cases — the main thesis sweep)
+# Capped RV-EDP shared-L5 production sweep (16 cases — the main thesis sweep)
 bash submit_capped_shared_l5_sweep.sh
+
+# Shared-unloaded-reference sweep (Design B — only 0D circulation varies)
+bash submit_shared_unloaded_l5_sweep.sh
+
+# Patient-mesh sweep (appendix D)
+bash submit_patient_mesh_fem.sbatch
+
+# Unloading-only sensitivity sweeps (appendix C reference-state)
+bash submit_unloading_ab.sh
+bash submit_unloading_stiffness_sweep.sh
 ```
 
 ## Geometry
