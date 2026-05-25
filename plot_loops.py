@@ -336,11 +336,14 @@ def plot_engineering_debug(metrics, outdir):
 def plot_full_hemodynamics(metrics, outdir):
     """Creates the Clinical Hemodynamics dashboard (Reconstructed Volumes)."""
     
-    # 1. Retrieve Data — use 0D model pressures with 0D volumes for consistency
-    v_LV_clin = get_arr(metrics, ["V_LV_Clinical"])
-    v_RV_clin = get_arr(metrics, ["V_RV_Clinical"])
-    p_LV = get_arr(metrics, ["p_LV_0D", "p_LV"])  # Prefer 0D pressures, fallback to solver
-    p_RV = get_arr(metrics, ["p_RV_0D", "p_RV"])
+    # 1. Retrieve Data -- match the primary PV-loop panel.
+    # In older multi-beat postprocessing, 0D/clinical traces can become flat
+    # after the first beat. Solver pressures and FEM cavity volumes remain the
+    # reliable dynamic traces for these dashboards.
+    v_LV_clin = get_arr(metrics, ["V_LV_FEM", "V_LV", "V_LV_Clinical"])
+    v_RV_clin = get_arr(metrics, ["V_RV_FEM", "V_RV", "V_RV_Clinical"])
+    p_LV = get_arr(metrics, ["p_LV", "p_LV_0D"])
+    p_RV = get_arr(metrics, ["p_RV", "p_RV_0D"])
     
     # Get Time (safely)
     if p_LV is not None:
@@ -350,13 +353,13 @@ def plot_full_hemodynamics(metrics, outdir):
 
     # Check existence
     if v_LV_clin is None or v_RV_clin is None:
-        print(" Missing 'V_LV_Clinical' or 'V_RV_Clinical'. Skipping full hemodynamics plot.")
+        print(" Missing LV/RV volume traces. Skipping full hemodynamics plot.")
         return
 
     # --- FIGURE SETUP ---
     fig = plt.figure(figsize=(14, 10))
     gs = gridspec.GridSpec(2, 2, figure=fig)
-    fig.suptitle("Estimated Full Organ Hemodynamics (Reconstructed)", fontsize=18, fontweight='bold')
+    fig.suptitle("Hemodynamics (Solver Pressures + FEM Cavity Volumes)", fontsize=18, fontweight='bold')
 
     ax_pv_lv = fig.add_subplot(gs[0, 0])
     ax_pv_rv = fig.add_subplot(gs[0, 1])
@@ -365,7 +368,7 @@ def plot_full_hemodynamics(metrics, outdir):
 
     # --- PLOT 1: LV PV Loop (Clinical) ---
     ax_pv_lv.plot(v_LV_clin, p_LV, 'tab:blue', linewidth=2.5)
-    ax_pv_lv.set_title("LV PV Loop (Clinical)", fontweight='bold')
+    ax_pv_lv.set_title("LV PV Loop", fontweight='bold')
     ax_pv_lv.set_xlabel("Volume (mL)")
     ax_pv_lv.set_ylabel("Pressure (mmHg)")
     ax_pv_lv.grid(True, alpha=0.3)
@@ -380,7 +383,7 @@ def plot_full_hemodynamics(metrics, outdir):
 
     # --- PLOT 2: RV PV Loop (Clinical) ---
     ax_pv_rv.plot(v_RV_clin, p_RV, 'tab:red', linewidth=2.5)
-    ax_pv_rv.set_title("RV PV Loop (Clinical)", fontweight='bold')
+    ax_pv_rv.set_title("RV PV Loop", fontweight='bold')
     ax_pv_rv.set_xlabel("Volume (mL)")
     ax_pv_rv.set_ylabel("Pressure (mmHg)")
     ax_pv_rv.grid(True, alpha=0.3)
@@ -403,7 +406,7 @@ def plot_full_hemodynamics(metrics, outdir):
         ax_vol.plot(v_RV_clin, 'tab:red', linewidth=2, label='RV Volume')
         ax_vol.set_xlabel("Step")
 
-    ax_vol.set_title("Clinical Volumes over Time", fontweight='bold')
+    ax_vol.set_title("Volumes over Time", fontweight='bold')
     ax_vol.set_ylabel("Volume (mL)")
     ax_vol.legend()
     ax_vol.grid(True, alpha=0.3)
@@ -435,6 +438,12 @@ def save_hemodynamics_json(metrics, outdir):
     def get_max(key):
         arr = get_arr(metrics, [key])
         return float(np.max(arr)) if arr is not None else None
+
+    def get_arr_with_source(keys):
+        for k in keys:
+            if k in metrics:
+                return np.array(metrics[k]), k
+        return None, None
     
     data["Pressures"] = {
         "LV_Peak": get_max("p_LV"),
@@ -442,12 +451,12 @@ def save_hemodynamics_json(metrics, outdir):
         "LA_Mean": float(np.mean(get_arr(metrics, ["p_LA"]))) if get_arr(metrics, ["p_LA"]) is not None else None
     }
     
-    # Volumes (Try Clinical first, then raw)
-    v_lv = get_arr(metrics, ["V_LV_Clinical"])
-    if v_lv is None: v_lv = get_arr(metrics, ["V_LV"])
-    
-    v_rv = get_arr(metrics, ["V_RV_Clinical"])
-    if v_rv is None: v_rv = get_arr(metrics, ["V_RV"])
+    # Match the PV-loop panel: use FEM cavity volumes first.
+    # Some sliced last-beat dashboard files contain constant clinical/0D volume
+    # traces, which makes EDV==ESV even when the FEM volume loop is healthy.
+    v_lv, lv_volume_source = get_arr_with_source(["V_LV_FEM", "V_LV", "V_LV_Clinical"])
+    v_rv, rv_volume_source = get_arr_with_source(["V_RV_FEM", "V_RV", "V_RV_Clinical"])
+    data["Volume_Source"] = {"LV": lv_volume_source, "RV": rv_volume_source}
     
     if v_lv is not None:
         edv_lv = float(np.max(v_lv))

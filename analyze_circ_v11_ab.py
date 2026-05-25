@@ -171,7 +171,7 @@ def replay_pv_loops(data, n_beats=50, dt=1e-3):
 
 
 def plot_pv_loops():
-    cmap = plt.cm.viridis
+    cmap = plt.cm.coolwarm
     fig, axes = plt.subplots(2, 2, figsize=(14, 11))
     variants = [("Exponential EDPVR (kE free)", EXP), ("Linear EDPVR (kE=0)", LIN)]
     for col, (title, data_dict) in enumerate(variants):

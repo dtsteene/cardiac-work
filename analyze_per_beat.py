@@ -234,7 +234,7 @@ ax.text(0.02, 0.98, summary, transform=ax.transAxes, fontsize=9,
 
 # Panel 4: Sweep at beat 0 vs last beat (r_PLV)
 ax = fig.add_subplot(gs[1, 0])
-cmap = plt.cm.viridis
+cmap = plt.cm.coolwarm
 for bi, beat in enumerate(all_beats):
     color = cmap(bi / max(1, len(all_beats) - 1))
     ax.plot(t_mm_sweep, r_plv_sweep[bi], "-", color=color, lw=1.5, label=f"beat {beat}")

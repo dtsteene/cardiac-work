@@ -350,9 +350,9 @@ print(f"Saved {OUT_DIR / 'fig_cascade_totals.png'}")
 PA_TO_KPA = 1.0 / 1000.0
 
 LOOP_LEVELS = [
-    ("L1", r"$E_{ff}$",          r"$S_{ff}$ (kPa)"),
-    ("L2", r"$E_{ff}$",          r"$P_{cav}$ (kPa)"),
-    ("L3", r"$\varepsilon_{ll}$", r"$P_{cav}$ (kPa)"),
+    ("L1", "Fibre stress-strain", r"$E_{ff}$",          r"$S_{ff}$ (kPa)"),
+    ("L2", "Pressure with fibre strain", r"$E_{ff}$",          r"$P_{cav}$ (kPa)"),
+    ("L3", "Pressure with longitudinal strain", r"$\varepsilon_{ll}$", r"$P_{cav}$ (kPa)"),
 ]
 
 ROW_COLORS = ("#1f77b4", "#d62728")  # LV blue, RV red
@@ -366,13 +366,25 @@ for row_i, R in enumerate((LV_R, RV_R)):
         "L2": (c["E_ff"],          c["P_pa"] * PA_TO_KPA),
         "L3": (c["E_ll"],          c["P_pa"] * PA_TO_KPA),
     }
-    for col_i, (level, xlabel, ylabel) in enumerate(LOOP_LEVELS):
+    for col_i, (level, title, xlabel, ylabel) in enumerate(LOOP_LEVELS):
         ax = axes[row_i, col_i]
         x, y = series[level]
         ax.plot(x, y, color=color, lw=1.8, alpha=0.95)
+        arrow_i = int(0.32 * (len(x) - 1))
+        arrow_j = min(arrow_i + max(3, len(x) // 18), len(x) - 1)
+        ax.annotate(
+            "",
+            xy=(x[arrow_j], y[arrow_j]),
+            xytext=(x[arrow_i], y[arrow_i]),
+            arrowprops=dict(arrowstyle="->", color=color, lw=1.4, alpha=0.8),
+        )
+        ax.scatter([x[0]], [y[0]], s=16, color=color, edgecolor="white",
+                   linewidth=0.6, zorder=3)
+        if row_i == 0:
+            ax.set_title(title, fontsize=11, fontweight="bold")
         ax.set_xlabel(xlabel, fontsize=11)
         if col_i == 0:
-            ax.set_ylabel(f"{'LV' if row_i == 0 else 'RV'}\n{ylabel}",
+            ax.set_ylabel(f"{'LV-side' if row_i == 0 else 'RV-side'}\n{ylabel}",
                           fontsize=11)
         else:
             ax.set_ylabel(ylabel, fontsize=10)

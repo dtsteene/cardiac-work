@@ -42,12 +42,15 @@ export OMP_NUM_THREADS=1
 export MPICH_HYDRA_LAUNCHER=fork
 
 # Per-job FFCx cache directory to avoid JIT compilation races when many
-# per_cell jobs start simultaneously. Without this, parallel jobs collide on
-# the shared ~/.cache/fenics directory and some fail with JIT timeouts.
-export XDG_CACHE_HOME="/tmp/fenics-cache-${SLURM_JOB_ID}"
-mkdir -p "${XDG_CACHE_HOME}"
+# per_cell jobs start simultaneously. Keep it on D1 rather than node-local
+# /tmp, which can be tight on some nodes during FFCx/CFFI compilation.
+CACHE_BASE="/global/D1/homes/dtsteene/tmp/fenics-cache"
+export XDG_CACHE_HOME="${CACHE_BASE}/${SLURM_JOB_ID}"
+export TMPDIR="${XDG_CACHE_HOME}/tmp"
+mkdir -p "${XDG_CACHE_HOME}" "${TMPDIR}"
 echo "  FEniCS cache: ${XDG_CACHE_HOME}"
-# Clean up on exit so /tmp doesn't fill up
+echo "  TMPDIR:       ${TMPDIR}"
+# Clean up on exit so the shared cache area doesn't fill up
 trap "rm -rf ${XDG_CACHE_HOME}" EXIT
 
 EXTRA_ARGS=""

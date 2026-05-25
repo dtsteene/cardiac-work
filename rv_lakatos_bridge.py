@@ -164,7 +164,7 @@ def make_figure(rows: list[dict[str, object]], corr_rows: list[dict[str, object]
     r_peak = next(float(row["r"]) for row in corr_rows if row["metric_key"] == "peak_abs_E_ll")
 
     fig, axes = plt.subplots(1, 2, figsize=(10.5, 4.4), constrained_layout=True, sharey=True)
-    cmap = "viridis"
+    cmap = "coolwarm"
 
     sc0 = axes[0].scatter(peak, tensor, c=rvsp, cmap=cmap, s=56, edgecolor="black", linewidth=0.4)
     add_fit(axes[0], peak, tensor, "#666666")

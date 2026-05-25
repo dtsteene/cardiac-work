@@ -36,6 +36,7 @@ import cardiac_geometries
 import cardiac_geometries.geometry
 from scipy.spatial import cKDTree
 from petsc4py import PETSc
+from clinical_frame import tangent_project_longitudinal
 
 # pyvista is used for point-to-facet distance (more accurate than
 # nearest-vertex on coarse meshes).
@@ -475,6 +476,11 @@ radial_endo_epi_dg0 = _dg0_vector_function(_r_endo_epi_values, "radial_endo_to_e
 
 if rank == 0:
     logger.info("Built geometric radial candidate: nearest endocardium -> epicardium")
+
+if l0 is not None:
+    l0 = tangent_project_longitudinal(l0, radial_endo_epi_dg0)
+    if rank == 0:
+        logger.info("Projected l0 into the wall tangent plane for longitudinal strain")
 
 # dx with same quadrature as the tensor space
 dx_q = ufl.Measure("dx", domain=mesh, metadata={"quadrature_degree": 6})
@@ -1211,6 +1217,28 @@ for _current_beat_idx in beats_to_process:
         logger.warning("n0 not loaded — cum_w_cross includes the sheet-normal component "
                        "in addition to true cross-fiber work.")
 
+    finite_checks = {
+        "w_total": cum_w_total,
+        "w_ff": cum_w_ff,
+        "w_ss": cum_w_ss,
+        "w_nn": cum_w_nn,
+        "w_cross": cum_w_cross,
+        "proxy_PLV_ll": cum_proxy_PLV_ll,
+        "proxy_PRV_ll": cum_proxy_PRV_ll,
+        "proxy_Trans_ll": cum_proxy_Trans_ll,
+    }
+    bad_counts = {
+        name: comm.allreduce(int(arr.size - np.isfinite(arr).sum()), op=MPI.SUM)
+        for name, arr in finite_checks.items()
+    }
+    if any(count > 0 for count in bad_counts.values()):
+        if rank == 0:
+            logger.error("Non-finite per-cell values detected; refusing to save invalid work data.")
+            for name, count in bad_counts.items():
+                if count > 0:
+                    logger.error(f"  {name}: {count} non-finite entries")
+        raise FloatingPointError("Non-finite per-cell work/proxy values")
+
     # ════════════════════════════════════════════════════════════════════════════
     # SECTION 5: Validation
     # ════════════════════════════════════════════════════════════════════════════
@@ -1238,6 +1266,9 @@ for _current_beat_idx in beats_to_process:
         logger.info("  DG0 vs scalar integration (machine-precision check):")
         logger.info(f"    w_total: DG0_sum={w_total_dg0_sum_global:.6e}  scalar={w_total_scalar_global:.6e}  rel={rel_total:.2e}")
         logger.info(f"    w_ff:    DG0_sum={w_ff_dg0_sum_global:.6e}  scalar={w_ff_scalar_global:.6e}  rel={rel_ff:.2e}")
+        if not np.isfinite([w_total_dg0_sum_global, w_total_scalar_global, w_ff_dg0_sum_global, w_ff_scalar_global, rel_total, rel_ff]).all():
+            logger.error("    !! DG0/scalar validation contains non-finite values. This output is invalid.")
+            raise FloatingPointError("Non-finite DG0/scalar validation")
         if rel_total > 1e-10 or rel_ff > 1e-10:
             logger.error("    !! DG0/scalar mismatch exceeds 1e-10 — DG0 trick is NOT producing "
                          "the same result as direct integration. This is a BUG.")

@@ -31,3 +31,9 @@ results_mesh_*/
 *.pdf
 *.out
 *.err
+
+# ParaView export bundles generated from simulation outputs
+paraview_exports/
+
+# Local FEniCS/JIT caches
+.fenics-cache*/

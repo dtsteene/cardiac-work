@@ -102,7 +102,9 @@ def density(pc: np.lib.npyio.NpzFile, mask: np.ndarray, values: str | np.ndarray
 
 
 def candidate_arrays(pc: np.lib.npyio.NpzFile, strain_suffix: str) -> dict[str, np.ndarray]:
-    tau = pc["lv_rv_scalar"] if "lv_rv_scalar" in pc.files else pc["tau"]
+    # Canonical convention for pressure choices: tau=0 on the LV side and
+    # tau=1 on the RV side. The saved Laplace scalar has the opposite orientation.
+    tau = 1.0 - pc["lv_rv_scalar"] if "lv_rv_scalar" in pc.files else pc["tau"]
     plv = pc[f"proxy_PLV_{strain_suffix}"]
     prv = pc[f"proxy_PRV_{strain_suffix}"]
     return {

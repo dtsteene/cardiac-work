@@ -32,6 +32,7 @@ import basix.ufl
 import pulse
 import cardiac_geometries
 import cardiac_geometries.geometry
+from clinical_frame import build_radial_endo_to_epi_dg0, tangent_project_longitudinal
 
 # ─── Parse Arguments ──────────────────────────────────────────────────────────
 
@@ -82,10 +83,39 @@ _parser.add_argument(
     help="Skip regional internal work (work_true_*, work_active/passive/comp_*, "
          "work_ff/ss/nn/cross_*). compute_per_cell.py is now the canonical source.",
 )
+_parser.add_argument(
+    "--metrics-space", type=str, default="Quadrature6",
+    help="State/storage space for MetricsCalculator, e.g. DG0, DG1, Quadrature4, "
+         "or Quadrature6. The production offline path uses Quadrature6.",
+)
+_parser.add_argument(
+    "--metrics-subdir", type=str, default="metrics",
+    help="Subdirectory under results_dir where metrics_downsample_*.npy is written. "
+         "Use this to keep sensitivity runs separate from production metrics.",
+)
 _args = _parser.parse_args()
 
 if _args.retag_septum and _args.retag_septum_ed:
     raise SystemExit("--retag-septum and --retag-septum-ed are mutually exclusive")
+
+
+def _parse_metrics_space(spec: str):
+    cleaned = spec.strip().replace("_", "").replace("-", "").lower()
+    if cleaned.startswith("quadrature"):
+        degree_str = cleaned.removeprefix("quadrature")
+        degree = int(degree_str) if degree_str else 6
+        return ("Quadrature", degree)
+    if cleaned.startswith("dg"):
+        degree_str = cleaned.removeprefix("dg")
+        if not degree_str:
+            raise SystemExit("--metrics-space DG requires a degree, e.g. DG0 or DG1")
+        return ("DG", int(degree_str))
+    raise SystemExit(
+        f"Unsupported --metrics-space '{spec}'. Use DG0, DG1, Quadrature4, or Quadrature6."
+    )
+
+
+metrics_space_type = _parse_metrics_space(_args.metrics_space)
 
 results_dir = _args.results_dir.resolve()
 comm = MPI.COMM_WORLD
@@ -155,31 +185,10 @@ if not circ_path.exists():
 
 circ_history = np.load(circ_path, allow_pickle=True).item()
 
-# FIX: The history.npy may contain multi-beat 0D pre-run data (e.g. 10 beats, 0-8s)
-# while the FEM checkpoint is only 1 coupled beat (0-0.8s). If we interpolate FEM times
-# against this multi-beat history, we read from beat 1 (transient) instead of the last
-# (quasi-steady) beat. Detect this and use only the last beat.
 circ_time_arr = np.array(circ_history["time"])
 HR_Hz = sim_params["BPM"] / 60.0
 cycle_length = 1.0 / HR_Hz
 circ_duration = circ_time_arr[-1] - circ_time_arr[0]
-
-if circ_duration > cycle_length * 1.5:
-    # Multi-beat history detected — extract last beat
-    last_beat_start = circ_time_arr[-1] - cycle_length
-    mask = circ_time_arr >= last_beat_start - 1e-10
-    if rank == 0:
-        logger.warning(
-            f"⚠️  Multi-beat circulation history detected ({circ_duration:.1f}s = "
-            f"{circ_duration/cycle_length:.0f} beats). Extracting last beat from "
-            f"t={last_beat_start:.2f}s onward ({np.sum(mask)} points)."
-        )
-    # Shift time so last beat starts at 0
-    for key in circ_history:
-        arr = np.array(circ_history[key])
-        if len(arr) == len(circ_time_arr):
-            circ_history[key] = arr[mask]
-    circ_history["time"] = np.array(circ_history["time"]) - last_beat_start
 
 if rank == 0:
     logger.info(f"Loaded circulation history: {len(circ_history['time'])} points, "
@@ -593,8 +602,15 @@ l0_field = None
 try:
     l0_field = dolfinx.fem.Function(Q_vec)
     adios4dolfinx.read_function(checkpoint_path, l0_field, time=0.0, name="l0")
+    radial_endo_epi_dg0, _ = build_radial_endo_to_epi_dg0(
+        mesh=mesh,
+        ffun=ffun,
+        markers=geo.markers,
+        comm=comm,
+    )
+    l0_field = tangent_project_longitudinal(l0_field, radial_endo_epi_dg0)
     if rank == 0:
-        logger.info("Loaded apex_gradient (l0) — longitudinal strain (E_ll) available")
+        logger.info("Loaded apex_gradient (l0) and projected it into the wall tangent plane")
 except Exception:
     if rank == 0:
         logger.warning("l0 not in checkpoint — longitudinal strain unavailable")
@@ -636,7 +652,7 @@ metrics_calc = MetricsCalculator(
     problem=problem,
     comm=comm,
     cardiac_model=metrics_model,
-    metrics_space_type=("Quadrature", 6),
+    metrics_space_type=metrics_space_type,
     alpha_epi=alpha_epi,
     alpha_base=alpha_base,
     hydro_pressure=problem.p if sim_params["incompressible"] else None,
@@ -649,6 +665,7 @@ metrics_calc = MetricsCalculator(
 
 if rank == 0:
     logger.info("MetricsCalculator initialized")
+    logger.info(f"  Metrics space: {metrics_space_type[0]} degree {metrics_space_type[1]}")
     _mode = []
     if not _args.skip_decomp: _mode.append("decomp")
     if not _args.skip_research: _mode.append("research")
@@ -669,12 +686,32 @@ if rank == 0:
 
 # Circulation history has finer time resolution (0.1ms) than FEM checkpoints (1ms).
 # We need to interpolate pressures at exact checkpoint times.
-# FIX: If the circulation history was shifted to start at 0 (multi-beat extraction),
-# we must also shift the checkpoint timestamps to match, otherwise np.interp
-# extrapolates to a constant (the last value).
+# If the circulation history is multi-beat but the FEM checkpoint is a single
+# beat, use the last circulation beat. If both are multi-beat, keep the full
+# history; otherwise the 0D volumes become constant after the first beat.
+timestamp_duration = timestamps[-1] - timestamps[0] if len(timestamps) > 1 else 0.0
+if circ_duration > cycle_length * 1.5 and timestamp_duration <= cycle_length * 1.5:
+    last_beat_start = circ_time_arr[-1] - cycle_length
+    mask = circ_time_arr >= last_beat_start - 1e-10
+    if rank == 0:
+        logger.warning(
+            f"⚠️  Multi-beat circulation with single-beat checkpoint detected. "
+            f"Extracting last circulation beat from t={last_beat_start:.2f}s "
+            f"onward ({np.sum(mask)} points)."
+        )
+    for key in circ_history:
+        arr = np.array(circ_history[key])
+        if len(arr) == len(circ_time_arr):
+            circ_history[key] = arr[mask]
+    circ_history["time"] = np.array(circ_history["time"]) - last_beat_start + timestamps[0]
+elif circ_duration > cycle_length * 1.5 and timestamp_duration > cycle_length * 1.5:
+    if rank == 0:
+        logger.info("Multi-beat circulation and FEM checkpoint detected; keeping full circulation history.")
+
+# If the circulation history was already shifted to a local one-beat clock while
+# the checkpoint timestamps are absolute, shift checkpoint times into that frame.
 circ_time = np.array(circ_history["time"])
 if len(timestamps) > 0 and timestamps[0] > circ_time[-1]:
-    # Checkpoint times are absolute (e.g. 7.2-8.0) but circ was shifted to 0-0.8
     _time_offset = timestamps[0] - circ_time[0]
     if rank == 0:
         logger.info(f"Aligning checkpoint times to circulation: offset={_time_offset:.4f}s")
@@ -814,7 +851,7 @@ for i in range(start_step, n_steps):
 
 # ─── 11. Save Metrics ────────────────────────────────────────────────────────
 
-metrics_dir = results_dir / "metrics"
+metrics_dir = results_dir / _args.metrics_subdir
 if rank == 0:
     metrics_dir.mkdir(exist_ok=True)
     logger.info("Saving metrics...")

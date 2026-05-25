@@ -67,11 +67,51 @@ parser.add_argument('--restart-from', type=str, default=None,
                     help='Path to previous results directory to continue from. '
                          'Loads displacement checkpoint + 0D state and continues for --beats more beats. '
                          'Automatically uses geometry from the restart dir.')
+parser.add_argument('--load-unloaded-from', type=str, default=os.getenv("LOAD_UNLOADED_FROM") or None,
+                    help='Path to an existing solver/prestress_inverse.bp to use as the unloaded '
+                         'reference. When set, inverse unloading is skipped and u_pre is loaded '
+                         'from this file.')
+parser.add_argument('--restart-pre-circ', action='store_true',
+                    default=os.getenv("RESTART_PRE_CIRC", "0") == "1",
+                    help='In restart mode, run a standalone 0D warm-up with the target circulation '
+                         'parameters before coupled FEM. This avoids shocking the old 0D state with '
+                         'new PAH parameters at the first coupled timestep while keeping the restarted '
+                         'unloaded/reference geometry.')
+parser.add_argument('--restart-ramp-steps', type=int,
+                    default=int(os.getenv("RESTART_RAMP_STEPS", 20)),
+                    help='Number of mechanics substeps used to ramp from ED to the restart target state '
+                         '(default: 20). Increase for fixed-reference acute loading tests.')
+parser.add_argument('--pre-circ-beats', type=int, default=int(os.getenv("PRE_CIRC_BEATS", 10)),
+                    help='Number of standalone 0D warm-up beats before unloading (default: 10).')
+parser.add_argument('--pre-circ-max-beats', type=int, default=int(os.getenv("PRE_CIRC_MAX_BEATS", 10)),
+                    help='Maximum standalone 0D warm-up beats if convergence checking is enabled.')
+parser.add_argument('--pre-circ-convergence-tol', type=float, default=float(os.getenv("PRE_CIRC_CONVERGENCE_TOL", 0.0)),
+                    help='If >0, rerun the standalone 0D warm-up until final-cycle LV/RV volume drift is below this fraction.')
+parser.add_argument('--stop-after-unloading', action='store_true',
+                    default=os.getenv("STOP_AFTER_UNLOADING", "0") == "1",
+                    help='Stop after prestress/unloading diagnostics, before the coupled FEM cycle.')
+parser.add_argument('--lv-material-scale', type=float, default=float(os.getenv("LV_MATERIAL_SCALE", 1.0)),
+                    help='Scale passive HO a-like parameters in LDRB LV cells.')
+parser.add_argument('--rv-material-scale', type=float, default=float(os.getenv("RV_MATERIAL_SCALE", 1.0)),
+                    help='Scale passive HO a-like parameters in LDRB RV cells.')
+parser.add_argument('--septum-material-scale', type=float, default=float(os.getenv("SEPTUM_MATERIAL_SCALE", 1.0)),
+                    help='Scale passive HO a-like parameters in LDRB septum cells.')
+parser.add_argument('--rv-edp-scale', type=float, default=float(os.getenv("RV_EDP_SCALE", 1.0)),
+                    help='Scale the RV ED pressure target used by unloading.')
+parser.add_argument('--rv-edp-max-mmhg', type=float, default=None if os.getenv("RV_EDP_MAX_MMHG") in (None, "") else float(os.getenv("RV_EDP_MAX_MMHG")),
+                    help='Optional cap on RV ED pressure target in mmHg.')
+parser.add_argument('--rv-edp-override-mmhg', type=float, default=None if os.getenv("RV_EDP_OVERRIDE_MMHG") in (None, "") else float(os.getenv("RV_EDP_OVERRIDE_MMHG")),
+                    help='Optional absolute RV ED pressure target in mmHg.')
 args = parser.parse_args()
 
 # --- Restart Setup ---
 RESTART_MODE = args.restart_from is not None
 RESTART_DIR = Path(args.restart_from) if RESTART_MODE else None
+LOAD_UNLOADED_FROM = Path(args.load_unloaded_from).expanduser().resolve() if args.load_unloaded_from else None
+if RESTART_MODE and LOAD_UNLOADED_FROM is not None:
+    raise ValueError("--restart-from and --load-unloaded-from cannot be combined")
+if LOAD_UNLOADED_FROM is not None and not LOAD_UNLOADED_FROM.exists():
+    raise FileNotFoundError(f"LOAD_UNLOADED_FROM does not exist: {LOAD_UNLOADED_FROM}")
 if RESTART_MODE:
     # Copy geometry from restart dir into output dir (don't modify the source!)
     # The geometry_generator scaling code re-saves geometry.bp in-place,
@@ -144,6 +184,69 @@ def custom_json(obj):
     else:
         return str(obj)
 
+
+def summarize_history(history, cycle_length, keys=("V_LV", "V_RV", "p_LV", "p_RV")):
+    """Small JSON-safe summary of a circulation history."""
+    diagnostics = {
+        "n_points": int(len(history.get("time", []))),
+        "cycle_length_s": float(cycle_length),
+    }
+
+    time = np.asarray(history.get("time", []), dtype=float)
+    prev_idx = None
+    if len(time) > 1:
+        target_t = time[-1] - cycle_length
+        prev_idx = int(np.argmin(np.abs(time - target_t)))
+        diagnostics["final_time_s"] = float(time[-1])
+        diagnostics["previous_cycle_index"] = prev_idx
+        diagnostics["previous_cycle_time_s"] = float(time[prev_idx])
+
+    max_volume_cycle_rel_change = 0.0
+    for key in keys:
+        if key not in history:
+            continue
+        arr = np.asarray(history[key], dtype=float)
+        item = {
+            "shape": list(arr.shape),
+            "first": float(arr[0]),
+            "last": float(arr[-1]),
+            "min": float(np.min(arr)),
+            "max": float(np.max(arr)),
+        }
+        if prev_idx is not None and 0 <= prev_idx < len(arr):
+            delta = float(arr[-1] - arr[prev_idx])
+            denom = max(abs(float(arr[prev_idx])), 1e-12)
+            rel = delta / denom
+            item["final_cycle_delta"] = delta
+            item["final_cycle_rel_change"] = float(rel)
+            if key in ("V_LV", "V_RV"):
+                max_volume_cycle_rel_change = max(max_volume_cycle_rel_change, abs(rel))
+        diagnostics[key] = item
+
+    diagnostics["max_volume_cycle_rel_change"] = float(max_volume_cycle_rel_change)
+    return diagnostics
+
+
+def summarize_variable(var):
+    """Serialize pulse.Variable values, including regional Function-valued parameters."""
+    value = getattr(var, "value", var)
+    unit = str(getattr(var, "original_unit", ""))
+    if isinstance(value, dolfinx.fem.Function):
+        arr = np.asarray(value.x.array, dtype=float)
+        local_count = int(arr.size)
+        return {
+            "kind": "Function",
+            "unit": unit,
+            "local_count": local_count,
+            "local_min": float(np.min(arr)) if local_count else None,
+            "local_max": float(np.max(arr)) if local_count else None,
+            "local_mean": float(np.mean(arr)) if local_count else None,
+        }
+    if isinstance(value, dolfinx.fem.Constant):
+        arr = np.asarray(value.value, dtype=float)
+        return {"kind": "Constant", "unit": unit, "value": arr.tolist()}
+    return {"kind": "scalar", "unit": unit, "value": float(value)}
+
 # Setup logging to print only from rank 0
 class MPIFilter(logging.Filter):
     def __init__(self, comm, *args, **kwargs):
@@ -172,19 +275,22 @@ if comm.rank == 0:
 comm.barrier()
 geodir = Path(args.geometry_dir) if args.geometry_dir else None
 
-# --- Ensure the run directory owns a geometry handle for postprocess_metrics.py ---
-# postprocess_metrics.py needs <outdir>/geometry to exist (it only reads marker
-# name→tag mapping from markers_geometry.json). When --geometry-dir points at an
-# external shared-mesh folder, symlink it into outdir so postprocess works with
-# no extra flags. Restart mode already copies its own geo.
-if comm.rank == 0 and geodir is not None and not RESTART_MODE:
+# --- Ensure the run directory owns a geometry handle for offline postprocessing ---
+# postprocess_metrics.py and compute_per_cell.py expect <outdir>/geometry to
+# exist. In restart mode the mechanics uses a scratch copy of the restart
+# geometry, but offline postprocessing should point at the durable source.
+if comm.rank == 0:
     _outdir_geo = outdir / "geometry"
-    if not _outdir_geo.exists():
+    if RESTART_MODE and RESTART_DIR is not None:
+        _geo_source = RESTART_DIR / "geometry"
+    else:
+        _geo_source = geodir
+    if _geo_source is not None and not _outdir_geo.exists():
         try:
-            _outdir_geo.symlink_to(geodir.resolve())
+            _outdir_geo.symlink_to(_geo_source.resolve())
         except OSError:
             import shutil as _shutil_geo
-            _shutil_geo.copytree(geodir.resolve(), _outdir_geo)
+            _shutil_geo.copytree(_geo_source.resolve(), _outdir_geo)
 comm.barrier()
 
 circulation.log.setup_logging(logging.INFO)
@@ -352,15 +458,44 @@ def get_updated_parameters():
 
     return params
 
-def run_0D(init_state, nbeats=10):
+def run_0D(init_state, nbeats=None):
     logger.info("Running 0D circulation model to steady state...")
     # Use parameters consistent with BPM
     params = get_updated_parameters()
-    model = Regazzoni2020(parameters=params)
+    requested_beats = int(nbeats if nbeats is not None else args.pre_circ_beats)
+    max_beats = max(int(args.pre_circ_max_beats), requested_beats)
+    tol = float(args.pre_circ_convergence_tol)
+    attempted = []
 
-    history = model.solve(num_beats=nbeats, initial_state=init_state)
-    state = dict(zip(model.state_names(), model.state))
-    return history, state
+    while True:
+        logger.info(f"0D pre-run attempt: {requested_beats} beats")
+        model = Regazzoni2020(parameters=params)
+        history = model.solve(num_beats=requested_beats, initial_state=init_state)
+        state = dict(zip(model.state_names(), model.state))
+        diagnostics = summarize_history(history, RR_INTERVAL)
+        diagnostics["requested_beats"] = int(requested_beats)
+        diagnostics["convergence_tol"] = tol
+        diagnostics["max_beats"] = int(max_beats)
+        attempted.append(
+            {
+                "beats": int(requested_beats),
+                "max_volume_cycle_rel_change": diagnostics["max_volume_cycle_rel_change"],
+                "V_LV_final_cycle_delta": diagnostics.get("V_LV", {}).get("final_cycle_delta"),
+                "V_RV_final_cycle_delta": diagnostics.get("V_RV", {}).get("final_cycle_delta"),
+            }
+        )
+
+        if tol <= 0.0 or diagnostics["max_volume_cycle_rel_change"] <= tol or requested_beats >= max_beats:
+            diagnostics["attempts"] = attempted
+            diagnostics["converged"] = bool(tol <= 0.0 or diagnostics["max_volume_cycle_rel_change"] <= tol)
+            return history, state, diagnostics
+
+        next_beats = min(max_beats, max(requested_beats + 5, int(np.ceil(requested_beats * 1.5))))
+        if next_beats == requested_beats:
+            diagnostics["attempts"] = attempted
+            diagnostics["converged"] = False
+            return history, state, diagnostics
+        requested_beats = next_beats
 
 init_state_circ = {
    "V_LV": lvv_target * volume2ml * circulation.units.ureg("mL"),
@@ -370,23 +505,47 @@ init_state_circ = {
 if not RESTART_MODE:
     # --- FRESH RUN: run standalone 0D to get initial circulation state ---
     if comm.rank == 0:
+        preload_circ_dir = outdir / "circulation"
+        preload_circ_dir.mkdir(exist_ok=True)
         # Use converged ICs from JSON if available, otherwise model defaults
         ic_0d = _json_initial_state
         if ic_0d is not None:
             logger.info(f"Using initial_state from JSON for 0D pre-run")
         else:
             logger.info(f"No initial_state in JSON, using model defaults for 0D pre-run")
-        history, circ_state = run_0D(init_state=ic_0d)
+        history, circ_state, pre_circ_diagnostics = run_0D(init_state=ic_0d)
+        if pre_circ_diagnostics["max_volume_cycle_rel_change"] > 0.01:
+            logger.warning(
+                "0D pre-run final-cycle volume drift is %.2f%% "
+                "(V_LV d=%.3f mL, V_RV d=%.3f mL).",
+                100.0 * pre_circ_diagnostics["max_volume_cycle_rel_change"],
+                pre_circ_diagnostics.get("V_LV", {}).get("final_cycle_delta", 0.0),
+                pre_circ_diagnostics.get("V_RV", {}).get("final_cycle_delta", 0.0),
+            )
         np.save(outdir / "state.npy", circ_state, allow_pickle=True)
         np.save(outdir / "history.npy", history, allow_pickle=True)
+        np.save(preload_circ_dir / "preload_state.npy", circ_state, allow_pickle=True)
+        np.save(preload_circ_dir / "preload_history.npy", history, allow_pickle=True)
+        with open(preload_circ_dir / "preload_diagnostics.json", "w") as f:
+            json.dump(pre_circ_diagnostics, f, indent=2, default=custom_json)
     comm.Barrier()
 
     history = np.load(outdir / "history.npy", allow_pickle=True).item()
     circ_state = np.load(outdir / "state.npy", allow_pickle=True).item()
+    if comm.rank == 0:
+        with open(outdir / "circulation" / "preload_diagnostics.json") as f:
+            pre_circ_diagnostics = json.load(f)
+    else:
+        pre_circ_diagnostics = None
+    pre_circ_diagnostics = comm.bcast(pre_circ_diagnostics, root=0)
 else:
     # --- RESTART: extract 0D state and ratios from old simulation ---
-    logger.info("RESTART: Skipping 0D pre-run (will use state from previous coupled simulation)")
-    history = None  # Will be replaced by coupled_history
+    logger.info("RESTART: Extracting 0D state from previous coupled simulation")
+    history = None  # Will be replaced by coupled_history unless restart-pre-circ is enabled
+    pre_circ_diagnostics = {
+        "restart_mode": True,
+        "restart_pre_circ": bool(args.restart_pre_circ),
+    }
 
     # Extract final 0D state from old coupled history
     restart_history_tmp = np.load(RESTART_DIR / "circulation" / "history.npy", allow_pickle=True).item()
@@ -394,6 +553,37 @@ else:
                         "p_AR_PUL", "p_VEN_PUL", "Q_AR_SYS", "Q_VEN_SYS", "Q_AR_PUL", "Q_VEN_PUL"]
     circ_state = {k: float(restart_history_tmp[k][-1]) for k in circ_state_names if k in restart_history_tmp}
     logger.info(f"RESTART: Extracted 0D state from old history (V_LV={circ_state['V_LV']:.2f}, V_RV={circ_state['V_RV']:.2f})")
+
+    if args.restart_pre_circ:
+        if comm.rank == 0:
+            preload_circ_dir = outdir / "circulation"
+            preload_circ_dir.mkdir(exist_ok=True)
+            ic_0d = _json_initial_state if _json_initial_state is not None else circ_state
+            source = "target JSON initial_state" if _json_initial_state is not None else "previous coupled state"
+            logger.info(f"RESTART: Running target-parameter 0D pre-run from {source}")
+            history, circ_state, pre_circ_diagnostics = run_0D(init_state=ic_0d)
+            pre_circ_diagnostics["restart_mode"] = True
+            pre_circ_diagnostics["restart_pre_circ"] = True
+            np.save(outdir / "state.npy", circ_state, allow_pickle=True)
+            np.save(outdir / "history.npy", history, allow_pickle=True)
+            np.save(preload_circ_dir / "restart_preload_state.npy", circ_state, allow_pickle=True)
+            np.save(preload_circ_dir / "restart_preload_history.npy", history, allow_pickle=True)
+            with open(preload_circ_dir / "restart_preload_diagnostics.json", "w") as f:
+                json.dump(pre_circ_diagnostics, f, indent=2, default=custom_json)
+        comm.Barrier()
+
+        history = np.load(outdir / "history.npy", allow_pickle=True).item()
+        circ_state = np.load(outdir / "state.npy", allow_pickle=True).item()
+        if comm.rank == 0:
+            with open(outdir / "circulation" / "restart_preload_diagnostics.json") as f:
+                pre_circ_diagnostics = json.load(f)
+        else:
+            pre_circ_diagnostics = None
+        pre_circ_diagnostics = comm.bcast(pre_circ_diagnostics, root=0)
+        logger.info(
+            f"RESTART: Target 0D pre-run state selected "
+            f"(V_LV={circ_state['V_LV']:.2f}, V_RV={circ_state['V_RV']:.2f})"
+        )
 
     # Store restart targets for the inflation ramp (used after problem setup)
     last_V_LV_0D = circ_state["V_LV"]
@@ -623,7 +813,50 @@ def setup_problem(
     return model, robin, dirichlet_bcs, Ta
 
 
+def apply_region_material_scales(material_params, markers_mt, lv_scale=1.0, rv_scale=1.0, septum_scale=1.0):
+    """Return HO params with selected a-like parameters represented as DG0 fields."""
+    scales = {
+        1: float(lv_scale),       # LDRB LV
+        2: float(rv_scale),       # LDRB RV
+        3: float(septum_scale),   # LDRB septum
+    }
+    if all(np.isclose(scale, 1.0) for scale in scales.values()):
+        return material_params
+
+    V0 = dolfinx.fem.functionspace(geometry.mesh, ("DG", 0))
+    tag_values = np.asarray(markers_mt.values, dtype=np.int32)
+    scaled_params = dict(material_params)
+
+    for name in ("a", "a_f", "a_s", "a_fs"):
+        base_var = material_params[name]
+        base_value = float(base_var.value)
+        field = dolfinx.fem.Function(V0, name=f"material_{name}_regional")
+        n = min(len(field.x.array), len(tag_values))
+        field.x.array[:n] = base_value
+        values = field.x.array[:n]
+        for tag, scale in scales.items():
+            values[tag_values[:n] == tag] = base_value * scale
+        field.x.scatter_forward()
+        scaled_params[name] = pulse.Variable(field, base_var.original_unit)
+
+    return scaled_params
+
+
 material_params = pulse.HolzapfelOgden.transversely_isotropic_parameters()
+material_region_scales = {
+    "LV": float(args.lv_material_scale),
+    "RV": float(args.rv_material_scale),
+    "Septum": float(args.septum_material_scale),
+}
+material_params = apply_region_material_scales(
+    material_params,
+    geo.additional_data["markers_mt"],
+    lv_scale=material_region_scales["LV"],
+    rv_scale=material_region_scales["RV"],
+    septum_scale=material_region_scales["Septum"],
+)
+if comm.rank == 0 and any(not np.isclose(v, 1.0) for v in material_region_scales.values()):
+    logger.info(f"Regional material scaling enabled: {material_region_scales}")
 # Use Compressible for Prestressing always (Hybrid Strategy)
 model, robin, dirichlet_bcs, Ta = setup_problem(
     geometry=geometry, f0=geo.f0, s0=geo.s0, material_params=material_params,
@@ -641,7 +874,24 @@ else:
     p_LV_ED = mmHg_to_kPa(history["p_LV"][-1])
     p_RV_ED = mmHg_to_kPa(history["p_RV"][-1])
 
-logger.info(f"Target ED Pressures: p_LV={p_LV_ED:.2f} kPa, p_RV={p_RV_ED:.2f} kPa")
+p_LV_ED_raw = float(p_LV_ED)
+p_RV_ED_raw = float(p_RV_ED)
+rv_edp_adjustments = {
+    "scale": float(args.rv_edp_scale),
+    "max_mmhg": args.rv_edp_max_mmhg,
+    "override_mmhg": args.rv_edp_override_mmhg,
+}
+if not RESTART_MODE:
+    p_RV_ED *= float(args.rv_edp_scale)
+    if args.rv_edp_max_mmhg is not None:
+        p_RV_ED = min(p_RV_ED, mmHg_to_kPa(args.rv_edp_max_mmhg))
+    if args.rv_edp_override_mmhg is not None:
+        p_RV_ED = mmHg_to_kPa(args.rv_edp_override_mmhg)
+
+logger.info(
+    f"Target ED Pressures: p_LV={p_LV_ED:.2f} kPa, p_RV={p_RV_ED:.2f} kPa "
+    f"(raw p_LV={p_LV_ED_raw:.2f} kPa, raw p_RV={p_RV_ED_raw:.2f} kPa)"
+)
 
 pressure_lv = pulse.Variable(dolfinx.fem.Constant(geometry.mesh, 0.0), "kPa")
 pressure_rv = pulse.Variable(dolfinx.fem.Constant(geometry.mesh, 0.0), "kPa")
@@ -664,7 +914,34 @@ solver_dir = outdir / "solver"
 viz_dir = outdir / "visualization"
 
 # For restart: copy cached prestress files from old results dir (rank 0 only to avoid race)
-if RESTART_MODE and comm.rank == 0:
+if LOAD_UNLOADED_FROM is not None and comm.rank == 0:
+    logger.info(f"Using pre-computed unloaded reference from {LOAD_UNLOADED_FROM}")
+    _src = LOAD_UNLOADED_FROM
+    _dst = solver_dir / "prestress_inverse.bp"
+    if _dst.exists():
+        if _dst.is_dir():
+            shutil.rmtree(_dst)
+        else:
+            _dst.unlink()
+    if _src.is_dir():
+        shutil.copytree(_src, _dst)
+    else:
+        shutil.copy2(_src, _dst)
+
+    _back_src = _src.parent / "prestress_backward.bp"
+    _back_dst = solver_dir / "prestress_backward.bp"
+    if _back_src.exists():
+        if _back_dst.exists():
+            if _back_dst.is_dir():
+                shutil.rmtree(_back_dst)
+            else:
+                _back_dst.unlink()
+        if _back_src.is_dir():
+            shutil.copytree(_back_src, _back_dst)
+        else:
+            shutil.copy2(_back_src, _back_dst)
+        logger.info(f"Copied prestress_backward.bp from {_back_src}")
+elif RESTART_MODE and comm.rank == 0:
     import shutil as _shutil
     for _pf in ["prestress_inverse.bp", "prestress_backward.bp"]:
         _src = RESTART_DIR / "solver" / _pf
@@ -675,11 +952,13 @@ if RESTART_MODE and comm.rank == 0:
             else:
                 _shutil.copy2(_src, _dst)
             logger.info(f"RESTART: Copied {_pf} from old results")
-if RESTART_MODE:
+if RESTART_MODE or LOAD_UNLOADED_FROM is not None:
     comm.barrier()
 
 prestress_fname = solver_dir / "prestress_inverse.bp"
-if not prestress_fname.exists():
+if LOAD_UNLOADED_FROM is not None and not prestress_fname.exists():
+    raise FileNotFoundError(f"Failed to stage shared unloaded reference at {prestress_fname}")
+if LOAD_UNLOADED_FROM is None and not prestress_fname.exists():
     logger.info("Start prestressing (Using Compressible Formulation for Stability)...")
     prestress_problem = pulse.unloading.PrestressProblem(
         geometry=geometry,
@@ -737,6 +1016,97 @@ rvv_unloaded = comm.allreduce(geometry.volume(rv_marker), op=MPI.SUM)
 
 logger.info(f"Unloaded volumes: LV={lvv_unloaded * volume2ml:.2f} mL, RV={rvv_unloaded * volume2ml:.2f} mL")
 
+unloading_diagnostics = {
+    "p_LV_ED_kPa": float(p_LV_ED),
+    "p_RV_ED_kPa": float(p_RV_ED),
+    "p_LV_ED_raw_kPa": float(p_LV_ED_raw),
+    "p_RV_ED_raw_kPa": float(p_RV_ED_raw),
+    "p_LV_ED_mmhg": float(p_LV_ED / 0.133322) if p_LV_ED else 0.0,
+    "p_RV_ED_mmhg": float(p_RV_ED / 0.133322) if p_RV_ED else 0.0,
+    "p_LV_ED_raw_mmhg": float(p_LV_ED_raw / 0.133322) if p_LV_ED_raw else 0.0,
+    "p_RV_ED_raw_mmhg": float(p_RV_ED_raw / 0.133322) if p_RV_ED_raw else 0.0,
+    "rv_edp_adjustments": rv_edp_adjustments,
+    "lvv_target_mL": float(lvv_target * volume2ml),
+    "rvv_target_mL": float(rvv_target * volume2ml),
+    "lvv_unloaded_mL": float(lvv_unloaded * volume2ml),
+    "rvv_unloaded_mL": float(rvv_unloaded * volume2ml),
+    "lv_unloaded_fraction_of_ED": float(lvv_unloaded / lvv_target) if lvv_target else None,
+    "rv_unloaded_fraction_of_ED": float(rvv_unloaded / rvv_target) if rvv_target else None,
+    "lv_shrink_percent": float(100.0 * (1.0 - lvv_unloaded / lvv_target)) if lvv_target else None,
+    "rv_shrink_percent": float(100.0 * (1.0 - rvv_unloaded / rvv_target)) if rvv_target else None,
+    "ratio_LV": float(ratio_LV),
+    "ratio_RV": float(ratio_RV),
+    "material_region_scales": material_region_scales,
+    "load_unloaded_from": str(LOAD_UNLOADED_FROM) if LOAD_UNLOADED_FROM is not None else None,
+    "used_precomputed_unloaded_reference": LOAD_UNLOADED_FROM is not None,
+}
+
+
+def build_simulation_params(stage, dt_value=0.001):
+    return {
+        "stage": stage,
+        "BPM": BPM,
+        "HR_HZ": HR_HZ,
+        "RR_INTERVAL": RR_INTERVAL,
+        "dt": dt_value,
+        "mesh_unit": mesh_unit,
+        "volume2ml": volume2ml,
+        "incompressible": args.incompressible,
+        "alpha_epi": args.alpha_epi,
+        "alpha_base": args.alpha_base,
+        "base_dirichlet": args.base_dirichlet,
+        "one_sided_robin": args.one_sided_robin,
+        "stop_after_unloading": args.stop_after_unloading,
+        "restart_pre_circ": bool(args.restart_pre_circ),
+        "restart_ramp_steps": int(args.restart_ramp_steps),
+        "pre_circ": pre_circ_diagnostics,
+        "unloading": unloading_diagnostics,
+        "load_unloaded_from": str(LOAD_UNLOADED_FROM) if LOAD_UNLOADED_FROM is not None else None,
+        "used_precomputed_unloaded_reference": LOAD_UNLOADED_FROM is not None,
+        "material_region_scales": material_region_scales,
+        "rv_edp_adjustments": rv_edp_adjustments,
+        "material_params": {k: summarize_variable(v) for k, v in material_params.items()},
+        "activation": {
+            "TC": TC_ACTIVATION,
+            "TR": TR_ACTIVATION,
+            "tC": tC_ACTIVATION,
+            "peak_kPa": 100.0,
+        },
+        "ratio_LV": ratio_LV,
+        "ratio_RV": ratio_RV,
+        "lvv_unloaded_m3": float(lvv_unloaded),
+        "rvv_unloaded_m3": float(rvv_unloaded),
+        "lvv_target_m3": float(lvv_target),
+        "rvv_target_m3": float(rvv_target),
+        "p_LV_ED_kPa": float(p_LV_ED),
+        "p_RV_ED_kPa": float(p_RV_ED),
+        "p_LV_ED_raw_kPa": float(p_LV_ED_raw),
+        "p_RV_ED_raw_kPa": float(p_RV_ED_raw),
+        "geo_scale": getattr(geo, '_geo_scale', 1.0),
+        "geometry_dir": str((outdir / "geometry").resolve()) if (outdir / "geometry").exists() else (
+            str(Path(args.geometry_dir).resolve()) if args.geometry_dir else None
+        ),
+    }
+
+
+def write_simulation_params(stage, dt_value=0.001):
+    if comm.rank == 0:
+        sim_params = build_simulation_params(stage=stage, dt_value=dt_value)
+        with open(outdir / "simulation_params.json", "w") as f:
+            json.dump(sim_params, f, indent=2, default=custom_json)
+        circ_dir = outdir / "circulation"
+        circ_dir.mkdir(exist_ok=True)
+        with open(circ_dir / "unloading_diagnostics.json", "w") as f:
+            json.dump(unloading_diagnostics, f, indent=2, default=custom_json)
+        logger.info(f"Saved simulation_params.json ({stage})")
+
+
+write_simulation_params(stage="post_unloading")
+
+if args.stop_after_unloading:
+    logger.info("STOP_AFTER_UNLOADING requested; exiting before forward coupled cycle.")
+    sys.exit(0)
+
 if args.incompressible:
     logger.info("Warning: Hybrid Prestressing Strategy Active (Compressible Unloading -> Incompressible Forward)")
 
@@ -780,14 +1150,27 @@ else:
 W = dolfinx.fem.functionspace(geometry.mesh, ("DG", 1))
 I = ufl.Identity(3)
 F = ufl.variable(ufl.grad(u_disp) + I)
-C = F.T * F
+C = ufl.variable(F.T * F)
 E = 0.5 * (C - I)
 f_map = (F * f0_map) / ufl.sqrt(ufl.inner(F * f0_map, F * f0_map))
 
-# For fiber stress visualization only: Create a simple standalone material
-# (We use problem.model in MetricsCalculator for actual work calculations)
-material_viz = pulse.HolzapfelOgden(f0=f0_map, s0=f0_map, **material_params)
-T_viz = material_viz.sigma(F)  # Simple passive stress for visualization only
+# For live visualization only, use DG1 fiber fields so the expression can be
+# sampled into the DG1 output space. Offline work/stress metrics still use the
+# quadrature-fiber CardiacModel reconstructed from the checkpoint.
+material_viz = pulse.HolzapfelOgden(f0=f0_map, s0=s0_map, **material_params)
+active_viz = pulse.ActiveStress(f0_map, activation=Ta)
+if args.incompressible:
+    comp_viz = pulse.compressibility.Incompressible()
+    comp_viz.register(problem.p)
+else:
+    comp_viz = pulse.compressibility.Compressible2()
+model_viz = pulse.CardiacModel(
+    material=material_viz,
+    active=active_viz,
+    compressibility=comp_viz,
+)
+S_viz = model_viz.S(C)
+T_viz = (1.0 / ufl.det(F)) * F * S_viz * F.T
 
 fiber_stress = dolfinx.fem.Function(W, name="fiber_stress")
 fiber_stress_expr = dolfinx.fem.Expression(ufl.inner(T_viz * f_map, f_map), W.element.interpolation_points)
@@ -865,7 +1248,7 @@ else:
     vol_diff = abs(restart_lv_target - ed_lv) * volume2ml
     ta_diff = np.max(np.abs(restart_Ta_target - ed_Ta))
     if vol_diff > 0.01 or ta_diff > 0.01:  # > 0.01 mL or 0.01 kPa
-        n_ramp = 20
+        n_ramp = int(args.restart_ramp_steps)
         logger.info(f"RESTART: Ramping from ED to restart state ({n_ramp} steps, "
                      f"dV_LV={vol_diff:.2f}mL, dTa_max={ta_diff:.1f}kPa)...")
         for ri in range(n_ramp):
@@ -1094,38 +1477,7 @@ def callback(model, i: int, t: float, save=True):
 
 # --- Save simulation_params.json EARLY (before solver loop) ---
 # This ensures material/activation params survive even if SIGKILL hits during the loop.
-if comm.rank == 0:
-    sim_params = {
-        "BPM": BPM,
-        "HR_HZ": HR_HZ,
-        "RR_INTERVAL": RR_INTERVAL,
-        "dt": 0.001,  # hardcoded here because dt variable is defined later
-        "mesh_unit": mesh_unit,
-        "volume2ml": volume2ml,
-        "incompressible": args.incompressible,
-        "alpha_epi": args.alpha_epi,
-        "alpha_base": args.alpha_base,
-        "base_dirichlet": args.base_dirichlet,
-        "one_sided_robin": args.one_sided_robin,
-        "material_params": {k: {"value": float(v.value), "unit": str(v.original_unit)} for k, v in material_params.items()},
-        "activation": {
-            "TC": TC_ACTIVATION,
-            "TR": TR_ACTIVATION,
-            "tC": tC_ACTIVATION,
-            "peak_kPa": 100.0,
-        },
-        "ratio_LV": ratio_LV,
-        "ratio_RV": ratio_RV,
-        "lvv_unloaded_m3": float(lvv_unloaded),
-        "rvv_unloaded_m3": float(rvv_unloaded),
-        "lvv_target_m3": float(lvv_target),
-        "rvv_target_m3": float(rvv_target),
-        "geo_scale": getattr(geo, '_geo_scale', 1.0),
-        "geometry_dir": str(Path(args.geometry_dir).resolve()) if args.geometry_dir else None,
-    }
-    with open(outdir / "simulation_params.json", "w") as f:
-        json.dump(sim_params, f, indent=2, default=custom_json)
-    logger.info("Saved simulation_params.json (early, before solver loop)")
+write_simulation_params(stage="pre_solver", dt_value=0.001)
 
 # --- Run Simulation ---
 
@@ -1188,36 +1540,7 @@ finally:
             logger.info(f"  Pressure history saved: {len(pressure_history)} timesteps")
 
             # Save simulation parameters needed for offline reconstruction
-            sim_params = {
-                "BPM": BPM,
-                "HR_HZ": HR_HZ,
-                "RR_INTERVAL": RR_INTERVAL,
-                "dt": dt,
-                "mesh_unit": mesh_unit,
-                "volume2ml": volume2ml,
-                "incompressible": args.incompressible,
-                "alpha_epi": args.alpha_epi,
-                "alpha_base": args.alpha_base,
-                "base_dirichlet": args.base_dirichlet,
-                "one_sided_robin": args.one_sided_robin,
-                "material_params": {k: {"value": float(v.value), "unit": str(v.original_unit)} for k, v in material_params.items()},
-                "activation": {
-                    "TC": TC_ACTIVATION,
-                    "TR": TR_ACTIVATION,
-                    "tC": tC_ACTIVATION,
-                    "peak_kPa": 100.0,
-                },
-                "ratio_LV": ratio_LV,
-                "ratio_RV": ratio_RV,
-                "lvv_unloaded_m3": float(lvv_unloaded),
-                "rvv_unloaded_m3": float(rvv_unloaded),
-                "lvv_target_m3": float(lvv_target),
-                "rvv_target_m3": float(rvv_target),
-                "geo_scale": getattr(geo, '_geo_scale', 1.0),
-                "geometry_dir": str(Path(args.geometry_dir).resolve()) if args.geometry_dir else None,
-            }
-            with open(outdir / "simulation_params.json", "w") as f:
-                json.dump(sim_params, f, indent=2, default=custom_json)
+            write_simulation_params(stage="final", dt_value=dt)
             logger.info("  Simulation parameters saved")
             logger.info("  Run postprocess_metrics.py on this directory to compute all metrics")
         except Exception as e:

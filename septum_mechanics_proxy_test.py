@@ -86,7 +86,9 @@ def masks(pc: np.lib.npyio.NpzFile) -> dict[str, np.ndarray]:
 
 
 def septal_pressure_candidates(pc: np.lib.npyio.NpzFile, strain_suffix: str) -> dict[str, np.ndarray]:
-    tau = pc["lv_rv_scalar"] if "lv_rv_scalar" in pc.files else pc["tau"]
+    # Canonical convention for pressure choices: tau=0 on the LV side and
+    # tau=1 on the RV side. The saved Laplace scalar has the opposite orientation.
+    tau = 1.0 - pc["lv_rv_scalar"] if "lv_rv_scalar" in pc.files else pc["tau"]
     plv = pc[f"proxy_PLV_{strain_suffix}"]
     prv = pc[f"proxy_PRV_{strain_suffix}"]
     return {
@@ -105,7 +107,7 @@ def case_values() -> list[dict[str, object]]:
         pc = np.load(find_run(job_id) / "per_cell_data.npz", allow_pickle=True)
         region_masks = masks(pc)
         sept = region_masks["Septum"]
-        tau = pc["lv_rv_scalar"] if "lv_rv_scalar" in pc.files else pc["tau"]
+        tau = 1.0 - pc["lv_rv_scalar"] if "lv_rv_scalar" in pc.files else pc["tau"]
 
         base: dict[str, object] = {
             "case": case,
@@ -270,7 +272,7 @@ def layer_rows() -> list[dict[str, object]]:
             continue
         pc = np.load(find_run(job_id) / "per_cell_data.npz", allow_pickle=True)
         sept = pc["is_geometric_septum"].astype(bool)
-        tau = pc["lv_rv_scalar"] if "lv_rv_scalar" in pc.files else pc["tau"]
+        tau = 1.0 - pc["lv_rv_scalar"] if "lv_rv_scalar" in pc.files else pc["tau"]
         q = np.quantile(tau[sept], [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0])
         layers = [
             ("LV-side third", q[0], q[1]),

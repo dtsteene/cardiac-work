@@ -24,6 +24,7 @@ Usage:
   python3 analyze_sweep.py --percase results/sims/2026-04-12/UKB_6beats_run_*
 """
 import argparse
+import csv
 import json
 import sys
 from pathlib import Path
@@ -33,6 +34,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.stats import pearsonr
+
+KPA = 1e-3
+PROXY_NAMES = ["PLV", "PRV", "Trans", "Mean", "Dominant"]
+SELECTED_T_MM = [-10, -5, -2, 0, 2, 5, 10, 20]
 
 parser = argparse.ArgumentParser()
 parser.add_argument("result_dirs", nargs="+", type=Path)
@@ -44,9 +49,15 @@ parser.add_argument("--percase", action="store_true",
                     help="Load per_cell_data_percase.npz instead of per_cell_data.npz "
                          "(uses per-case prestressed-mesh tagging instead of the "
                          "canonical u_pre permutation)")
+parser.add_argument("--include-epi", action="store_true",
+                    help="Use an epi-inclusive sweep envelope: d_sum <= d_sum_max. "
+                         "The default keeps the historical envelope "
+                         "d_sum <= d_sum_max AND NOT touches_epi.")
 args = parser.parse_args()
 PC_FILE = "per_cell_data_percase.npz" if args.percase else "per_cell_data.npz"
-MODE = "per-case (prestressed tagging)" if args.percase else "canonical (u_pre permutation)"
+TAG_MODE = "per-case (prestressed tagging)" if args.percase else "canonical (u_pre permutation)"
+ENVELOPE_MODE = "epi-inclusive" if args.include_epi else "epi-excluded"
+MODE = f"{TAG_MODE}, {ENVELOPE_MODE} envelope"
 
 # ── Load cases ───────────────────────────────────────────────────────────────
 
@@ -68,23 +79,30 @@ def load_case(d):
         if pres.ndim == 2 and pres.shape[1] >= 2:
             rv_esp = float(pres[:, 1].max())
 
-    # Reconstruct envelope from raw fields: only d_sum_max + ~touches_epi
-    # (the saved "envelope" field may use the old overly-restrictive definition)
+    # Reconstruct the sweep envelope from raw fields. The historical/default
+    # version excludes cells topologically touching the epicardium; --include-epi
+    # keeps those cells eligible so the relaxed septum can grow all the way to
+    # the epicardial side where the geometric parametrization permits it.
     d_sum_max_mm = float(pc.get("envelope_d_sum_max_mm", 22.0))
     et_sample = pc["entry_t"][pc["envelope"]] if pc["envelope"].sum() > 0 else pc["entry_t"]
     mesh_to_mm_local = 1000.0 if (len(et_sample) > 0 and abs(et_sample.max()) < 0.1) else 1.0
     d_sum_max = d_sum_max_mm / mesh_to_mm_local
-    envelope = (pc["d_sum"] <= d_sum_max) & ~pc["touches_epi"]
+    touches_epi = pc["touches_epi"].astype(bool)
+    envelope_base = pc["d_sum"] <= d_sum_max
+    envelope = envelope_base if args.include_epi else (envelope_base & ~touches_epi)
 
     return {
         "label": label,
         "rv_esp": rv_esp,
         "dir": d,
         "tau": pc["tau"],
+        "cell_volumes": pc["cell_volumes"],
+        "region_tags": pc["region_tags"],
         "envelope": envelope,
+        "n_epi_eligible": int((envelope_base & touches_epi).sum()),
         "entry_t": pc["entry_t"],
-        "is_geometric_septum": pc["is_geometric_septum"],
-        "is_ldrb_septum": pc.get("is_ldrb_septum", np.zeros_like(pc["tau"], dtype=bool)),
+        "is_geometric_septum": pc["is_geometric_septum"].astype(bool),
+        "is_ldrb_septum": pc.get("is_ldrb_septum", np.zeros_like(pc["tau"], dtype=bool)).astype(bool),
         "w_total": pc["w_total"],
         "proxy_PLV_ll": pc["proxy_PLV_ll"],
         "proxy_PRV_ll": pc["proxy_PRV_ll"],
@@ -110,7 +128,8 @@ for c in cases:
     n_env = int(c["envelope"].sum())
     n_geo = int(c["is_geometric_septum"].sum())
     print(f"  {c['label']:<18} RV_ESP={c['rv_esp'] or '?':>5}  "
-          f"n_cells={len(c['tau'])}  envelope={n_env}  geometric={n_geo}")
+          f"n_cells={len(c['tau'])}  envelope={n_env}  "
+          f"epi_eligible={c['n_epi_eligible']}  geometric={n_geo}")
 
 # ── Output directory ─────────────────────────────────────────────────────────
 if args.output_dir:
@@ -164,11 +183,189 @@ def safe_pearsonr(x, y):
         return np.nan
     return pearsonr(x, y)[0]
 
+
+def positive_density(case, mask, values):
+    arr = case[values] if isinstance(values, str) else values
+    volume = float(case["cell_volumes"][mask].sum())
+    if volume <= 0:
+        return np.nan
+    return float(-arr[mask].sum() / volume * KPA)
+
+
+def finite_pair(x, y):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    keep = np.isfinite(x) & np.isfinite(y)
+    return x[keep], y[keep]
+
+
+def slope_through_origin(x, y):
+    x, y = finite_pair(x, y)
+    denom = float(np.dot(x, x))
+    if len(x) < 2 or denom == 0:
+        return np.nan
+    return float(np.dot(x, y) / denom)
+
+
+def ratio_error_stats(true_ratio, proxy_ratio):
+    true_ratio, proxy_ratio = finite_pair(true_ratio, proxy_ratio)
+    keep = (true_ratio != 0) & (proxy_ratio != 0)
+    true_ratio = true_ratio[keep]
+    proxy_ratio = proxy_ratio[keep]
+    if len(true_ratio) == 0:
+        return {
+            "mean_abs_ratio_error": np.nan,
+            "median_abs_ratio_error": np.nan,
+            "max_abs_ratio_error": np.nan,
+            "mean_signed_relative_ratio_error": np.nan,
+            "mean_abs_relative_ratio_error": np.nan,
+            "median_abs_relative_ratio_error": np.nan,
+            "mean_abs_log_ratio_error": np.nan,
+            "median_abs_log_ratio_error": np.nan,
+            "max_abs_log_ratio_error": np.nan,
+            "proxy_over_true_ratio_mean": np.nan,
+            "proxy_over_true_ratio_median": np.nan,
+        }
+
+    raw_err = proxy_ratio - true_ratio
+    rel_err = proxy_ratio / true_ratio - 1.0
+    log_err = np.abs(np.log(np.abs(proxy_ratio / true_ratio)))
+    ratio = proxy_ratio / true_ratio
+    return {
+        "mean_abs_ratio_error": float(np.mean(np.abs(raw_err))),
+        "median_abs_ratio_error": float(np.median(np.abs(raw_err))),
+        "max_abs_ratio_error": float(np.max(np.abs(raw_err))),
+        "mean_signed_relative_ratio_error": float(np.mean(rel_err)),
+        "mean_abs_relative_ratio_error": float(np.mean(np.abs(rel_err))),
+        "median_abs_relative_ratio_error": float(np.median(np.abs(rel_err))),
+        "mean_abs_log_ratio_error": float(np.mean(log_err)),
+        "median_abs_log_ratio_error": float(np.median(log_err)),
+        "max_abs_log_ratio_error": float(np.max(log_err)),
+        "proxy_over_true_ratio_mean": float(np.mean(ratio)),
+        "proxy_over_true_ratio_median": float(np.median(ratio)),
+    }
+
+
+def write_csv(path, rows):
+    if not rows:
+        return
+    fieldnames = list(rows[0].keys())
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
 r_PLV = np.array([safe_pearsonr(W_true[i], W_PLV[i]) for i in range(args.n_steps)])
 r_PRV = np.array([safe_pearsonr(W_true[i], W_PRV[i]) for i in range(args.n_steps)])
 r_Trans = np.array([safe_pearsonr(W_true[i], W_Trans[i]) for i in range(args.n_steps)])
 r_mean = np.array([safe_pearsonr(W_true[i], W_mean[i]) for i in range(args.n_steps)])
 r_dom = np.array([safe_pearsonr(W_true[i], W_dom[i]) for i in range(args.n_steps)])
+
+# ── Magnitude/ratio metrics ─────────────────────────────────────────────────
+# The correlation curve answers whether a proxy ranks the severity cases like
+# tensor work. For the thesis story we also need to know whether the proxy keeps
+# the septum/free-wall magnitude relation. Use the same positive-density
+# convention as analyze_h5_sweep_core.py: -integral / volume, reported in kPa.
+D_true = np.full((args.n_steps, n_cases), np.nan)
+D_PLV = np.full((args.n_steps, n_cases), np.nan)
+D_PRV = np.full((args.n_steps, n_cases), np.nan)
+D_Trans = np.full((args.n_steps, n_cases), np.nan)
+D_mean = np.full((args.n_steps, n_cases), np.nan)
+D_dom = np.full((args.n_steps, n_cases), np.nan)
+R_true = np.full((args.n_steps, n_cases), np.nan)
+R_PLV = np.full((args.n_steps, n_cases), np.nan)
+R_PRV = np.full((args.n_steps, n_cases), np.nan)
+R_Trans = np.full((args.n_steps, n_cases), np.nan)
+R_mean = np.full((args.n_steps, n_cases), np.nan)
+R_dom = np.full((args.n_steps, n_cases), np.nan)
+fw_tensor_mean_density = np.full(n_cases, np.nan)
+fw_adjacent_ll_mean_density = np.full(n_cases, np.nan)
+
+for j, c in enumerate(cases):
+    lv_mask = c["region_tags"] == 1
+    rv_mask = c["region_tags"] == 2
+    fw_tensor_mean_density[j] = 0.5 * (
+        positive_density(c, lv_mask, "w_total") + positive_density(c, rv_mask, "w_total")
+    )
+    fw_adjacent_ll_mean_density[j] = 0.5 * (
+        positive_density(c, lv_mask, "proxy_PLV_ll") + positive_density(c, rv_mask, "proxy_PRV_ll")
+    )
+
+for i, t in enumerate(t_values):
+    for j, c in enumerate(cases):
+        mask = c["envelope"] & (c["entry_t"] < t)
+        if mask.sum() == 0:
+            continue
+
+        plv = c["proxy_PLV_ll"]
+        prv = c["proxy_PRV_ll"]
+        trans = c["proxy_Trans_ll"]
+        mean_proxy = 0.5 * (plv + prv)
+        dom_proxy = np.where(c["tau"] < 0.5, plv, prv)
+
+        D_true[i, j] = positive_density(c, mask, "w_total")
+        D_PLV[i, j] = positive_density(c, mask, plv)
+        D_PRV[i, j] = positive_density(c, mask, prv)
+        D_Trans[i, j] = positive_density(c, mask, trans)
+        D_mean[i, j] = positive_density(c, mask, mean_proxy)
+        D_dom[i, j] = positive_density(c, mask, dom_proxy)
+
+        if fw_tensor_mean_density[j] != 0:
+            R_true[i, j] = D_true[i, j] / fw_tensor_mean_density[j]
+        if fw_adjacent_ll_mean_density[j] != 0:
+            R_PLV[i, j] = D_PLV[i, j] / fw_adjacent_ll_mean_density[j]
+            R_PRV[i, j] = D_PRV[i, j] / fw_adjacent_ll_mean_density[j]
+            R_Trans[i, j] = D_Trans[i, j] / fw_adjacent_ll_mean_density[j]
+            R_mean[i, j] = D_mean[i, j] / fw_adjacent_ll_mean_density[j]
+            R_dom[i, j] = D_dom[i, j] / fw_adjacent_ll_mean_density[j]
+
+proxy_density = {
+    "PLV": D_PLV,
+    "PRV": D_PRV,
+    "Trans": D_Trans,
+    "Mean": D_mean,
+    "Dominant": D_dom,
+}
+proxy_ratio = {
+    "PLV": R_PLV,
+    "PRV": R_PRV,
+    "Trans": R_Trans,
+    "Mean": R_mean,
+    "Dominant": R_dom,
+}
+proxy_r = {
+    "PLV": r_PLV,
+    "PRV": r_PRV,
+    "Trans": r_Trans,
+    "Mean": r_mean,
+    "Dominant": r_dom,
+}
+
+boundary_rows = []
+for i, t in enumerate(t_values):
+    for proxy in PROXY_NAMES:
+        stats = ratio_error_stats(R_true[i], proxy_ratio[proxy][i])
+        d_true, d_proxy = finite_pair(D_true[i], proxy_density[proxy][i])
+        r_value = float(proxy_r[proxy][i])
+        row = {
+            "envelope_mode": ENVELOPE_MODE,
+            "tag_mode": TAG_MODE,
+            "t_mm": float(t * mesh_to_mm),
+            "n_cases": int(len(d_true)),
+            "n_cells_mean": float(np.mean(n_cells_sweep[i])),
+            "n_cells_min": int(np.min(n_cells_sweep[i])),
+            "n_cells_max": int(np.max(n_cells_sweep[i])),
+            "proxy": proxy,
+            "pearson_r": r_value,
+            "pearson_r2": float(r_value * r_value) if np.isfinite(r_value) else np.nan,
+            "true_density_mean_kPa": float(np.nanmean(D_true[i])),
+            "proxy_density_mean_kPa": float(np.nanmean(proxy_density[proxy][i])),
+            "density_slope_proxy_per_true": slope_through_origin(d_true, d_proxy),
+            "true_septum_to_fwmean_ratio_mean": float(np.nanmean(R_true[i])),
+            "proxy_septum_to_fw_adjacent_ratio_mean": float(np.nanmean(proxy_ratio[proxy][i])),
+            **stats,
+        }
+        boundary_rows.append(row)
 
 # ── Reference definitions (direct, no sweep) ────────────────────────────────
 geo_n = int(np.mean([c["is_geometric_septum"].sum() for c in cases]))
@@ -201,11 +398,27 @@ print(f"  LDRB      ({ldrb_n} cells): r_PLV={ref_ldrb['PLV']:+.4f}  r_PRV={ref_l
 t_mm = t_values * mesh_to_mm
 print(f"\n{'t (mm)':>8} {'n_cells':>8} {'r_PLV':>8} {'r_PRV':>8} {'r_Trans':>9} {'r_mean':>8} {'r_dom':>8}")
 print("-" * 65)
-for t_target in [-5, -3, -1, 0, 1, 3, 5, 10]:
+for t_target in SELECTED_T_MM:
+    if t_target < t_mm[0] - 1e-9 or t_target > t_mm[-1] + 1e-9:
+        continue
     idx = np.argmin(np.abs(t_mm - t_target))
     print(f"{t_mm[idx]:>+8.1f} {mean_cells_at_t[idx]:>8.0f} "
           f"{r_PLV[idx]:>8.3f} {r_PRV[idx]:>8.3f} {r_Trans[idx]:>9.3f} "
           f"{r_mean[idx]:>8.3f} {r_dom[idx]:>8.3f}")
+
+selected_rows = []
+for t_target in SELECTED_T_MM:
+    if t_target < t_mm[0] - 1e-9 or t_target > t_mm[-1] + 1e-9:
+        continue
+    idx = int(np.argmin(np.abs(t_mm - t_target)))
+    for row in boundary_rows:
+        if abs(row["t_mm"] - float(t_mm[idx])) < 1e-9:
+            selected_rows.append({**row, "requested_t_mm": float(t_target)})
+
+write_csv(out_dir / "boundary_metrics_by_t.csv", boundary_rows)
+write_csv(out_dir / "boundary_metrics_selected_thresholds.csv", selected_rows)
+print(f"Saved boundary metrics to {out_dir / 'boundary_metrics_by_t.csv'}")
+print(f"Saved selected thresholds to {out_dir / 'boundary_metrics_selected_thresholds.csv'}")
 
 # ── Plot (matches analyze_spectrum.py fig_spectrum_sweep style) ──────────────
 SWEEP_STYLE = {
@@ -233,7 +446,7 @@ ax.set_xlim(t_mm[0] - 0.5, t_mm[-1] + 0.5)
 ax.set_ylim(-1.05, 1.1)
 ax.set_xlabel(r"Boundary relaxation threshold $t$ (mm)   "
               r"$\;\;\mathrm{mask}(t) = \{c : \mathrm{entry}_t(c) \leq t\} "
-              r"\cap \mathrm{envelope}$",
+              rf"\cap \mathrm{{envelope}}_{{\mathrm{{{ENVELOPE_MODE}}}}}$",
               fontsize=10)
 ax.set_ylabel(f"Pearson r with $W_{{true}}$ across {n_cases} severities",
               fontsize=11)
@@ -256,16 +469,57 @@ fig.savefig(fig_path, bbox_inches="tight")
 fig.savefig(fig_path.with_suffix(".png"), dpi=160, bbox_inches="tight")
 print(f"\nSaved {fig_path}")
 
+fig2, axes = plt.subplots(2, 1, figsize=(10.5, 7.0), sharex=True, constrained_layout=True)
+for proxy, color, lw in [
+    ("PLV", "#1f77b4", 1.5),
+    ("PRV", "#d62728", 1.5),
+    ("Trans", "#2ca02c", 2.4),
+    ("Mean", "#ff7f0e", 1.8),
+    ("Dominant", "#9467bd", 1.4),
+]:
+    sub = [row for row in boundary_rows if row["proxy"] == proxy]
+    x = np.array([row["t_mm"] for row in sub], dtype=float)
+    pearson = np.array([row["pearson_r"] for row in sub], dtype=float)
+    ratio_err = np.array([row["mean_abs_log_ratio_error"] for row in sub], dtype=float)
+    axes[0].plot(x, pearson, color=color, lw=lw, label=proxy, alpha=0.9)
+    axes[1].plot(x, ratio_err, color=color, lw=lw, label=proxy, alpha=0.9)
+
+for axis in axes:
+    axis.axvline(0.0, color="gray", lw=1.0, ls="--", alpha=0.7)
+    axis.grid(alpha=0.25)
+
+axes[0].axhline(0.0, color="lightgray", lw=0.8, zorder=0)
+axes[0].set_ylabel("Pearson r")
+axes[0].set_ylim(-1.05, 1.1)
+axes[0].legend(loc="lower left", fontsize=8, ncol=5, framealpha=0.95)
+axes[1].set_ylabel("Mean absolute log ratio error")
+axes[1].set_xlabel("Boundary threshold t (mm); negative is tighter/deeper septum")
+axes[1].set_ylim(bottom=0.0)
+fig2.suptitle(f"Septum boundary sweep with ratio preservation ({MODE})", fontsize=12, fontweight="bold")
+fig2_path = out_dir / "boundary_metrics_summary.pdf"
+fig2.savefig(fig2_path, bbox_inches="tight")
+fig2.savefig(fig2_path.with_suffix(".png"), dpi=160, bbox_inches="tight")
+print(f"Saved {fig2_path}")
+
 np.savez(out_dir / "sweep_raw.npz",
          t_values=t_values, t_mm=t_mm,
          W_true=W_true, W_PLV=W_PLV, W_PRV=W_PRV,
          W_Trans=W_Trans, W_mean=W_mean, W_dom=W_dom,
+         D_true=D_true, D_PLV=D_PLV, D_PRV=D_PRV,
+         D_Trans=D_Trans, D_mean=D_mean, D_dom=D_dom,
+         R_true=R_true, R_PLV=R_PLV, R_PRV=R_PRV,
+         R_Trans=R_Trans, R_mean=R_mean, R_dom=R_dom,
+         fw_tensor_mean_density=fw_tensor_mean_density,
+         fw_adjacent_ll_mean_density=fw_adjacent_ll_mean_density,
          n_cells_sweep=n_cells_sweep,
          r_PLV=r_PLV, r_PRV=r_PRV, r_Trans=r_Trans, r_mean=r_mean, r_dom=r_dom,
          # Direct reference definitions
          ref_geo_r_PLV=ref_geo["PLV"], ref_geo_r_Trans=ref_geo["Trans"],
          ref_ldrb_r_PLV=ref_ldrb["PLV"], ref_ldrb_r_Trans=ref_ldrb["Trans"],
          geo_n=geo_n, ldrb_n=ldrb_n,
+         include_epi=args.include_epi,
+         envelope_mode=ENVELOPE_MODE,
+         n_epi_eligible=np.array([c["n_epi_eligible"] for c in cases]),
          case_labels=np.array([c["label"] for c in cases]),
          case_rv_esp=np.array([c["rv_esp"] or 0 for c in cases]))
 print(f"Saved raw data to {out_dir / 'sweep_raw.npz'}")

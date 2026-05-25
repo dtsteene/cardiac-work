@@ -27,6 +27,21 @@ ONE_SIDED_ROBIN=${ONE_SIDED_ROBIN:-0}
 COMMENT=${COMMENT:-"No description provided"}
 GEOMETRY_DIR=${GEOMETRY_DIR:-""}
 RESTART_FROM=${RESTART_FROM:-""}
+LOAD_UNLOADED_FROM=${LOAD_UNLOADED_FROM:-""}
+RESTART_PRE_CIRC=${RESTART_PRE_CIRC:-0}
+RESTART_RAMP_STEPS=${RESTART_RAMP_STEPS:-""}
+PRE_CIRC_BEATS=${PRE_CIRC_BEATS:-""}
+PRE_CIRC_MAX_BEATS=${PRE_CIRC_MAX_BEATS:-""}
+PRE_CIRC_CONVERGENCE_TOL=${PRE_CIRC_CONVERGENCE_TOL:-""}
+RUN_POSTPROCESS=${RUN_POSTPROCESS:-1}
+RESULTS_DIR_OVERRIDE=${RESULTS_DIR_OVERRIDE:-""}
+STOP_AFTER_UNLOADING=${STOP_AFTER_UNLOADING:-0}
+LV_MATERIAL_SCALE=${LV_MATERIAL_SCALE:-""}
+RV_MATERIAL_SCALE=${RV_MATERIAL_SCALE:-""}
+SEPTUM_MATERIAL_SCALE=${SEPTUM_MATERIAL_SCALE:-""}
+RV_EDP_SCALE=${RV_EDP_SCALE:-""}
+RV_EDP_MAX_MMHG=${RV_EDP_MAX_MMHG:-""}
+RV_EDP_OVERRIDE_MMHG=${RV_EDP_OVERRIDE_MMHG:-""}
 # Canonical atlas geometry_fields.npz for compute_per_cell.py. When set,
 # per-cell tags are propagated from the shared atlas, giving identical cell
 # labels across every case in a spectrum. Leave empty to use per-case
@@ -101,6 +116,9 @@ fi
 if [ -n "$CIRCULATION_PARAMS" ] && [[ "$CIRCULATION_PARAMS" != /* ]]; then
     CIRCULATION_PARAMS="${SLURM_SUBMIT_DIR}/${CIRCULATION_PARAMS}"
 fi
+if [ -n "$LOAD_UNLOADED_FROM" ] && [[ "$LOAD_UNLOADED_FROM" != /* ]]; then
+    LOAD_UNLOADED_FROM="${SLURM_SUBMIT_DIR}/${LOAD_UNLOADED_FROM}"
+fi
 
 # --- 4. Prepare Arguments for Python ---
 ARGS_STR=""
@@ -123,6 +141,19 @@ ARGS_STR="$ARGS_STR --metrics_space $METRICS_SPACE"
 [ "$ONE_SIDED_ROBIN" = "1" ] && ARGS_STR="$ARGS_STR --one-sided-robin"
 [ -n "$GEOMETRY_DIR" ] && ARGS_STR="$ARGS_STR --geometry-dir $GEOMETRY_DIR"
 [ -n "$RESTART_FROM" ] && ARGS_STR="$ARGS_STR --restart-from $RESTART_FROM"
+[ -n "$LOAD_UNLOADED_FROM" ] && ARGS_STR="$ARGS_STR --load-unloaded-from $LOAD_UNLOADED_FROM"
+[ "$RESTART_PRE_CIRC" = "1" ] && ARGS_STR="$ARGS_STR --restart-pre-circ"
+[ -n "$RESTART_RAMP_STEPS" ] && ARGS_STR="$ARGS_STR --restart-ramp-steps $RESTART_RAMP_STEPS"
+[ -n "$PRE_CIRC_BEATS" ] && ARGS_STR="$ARGS_STR --pre-circ-beats $PRE_CIRC_BEATS"
+[ -n "$PRE_CIRC_MAX_BEATS" ] && ARGS_STR="$ARGS_STR --pre-circ-max-beats $PRE_CIRC_MAX_BEATS"
+[ -n "$PRE_CIRC_CONVERGENCE_TOL" ] && ARGS_STR="$ARGS_STR --pre-circ-convergence-tol $PRE_CIRC_CONVERGENCE_TOL"
+[ "$STOP_AFTER_UNLOADING" = "1" ] && ARGS_STR="$ARGS_STR --stop-after-unloading"
+[ -n "$LV_MATERIAL_SCALE" ] && ARGS_STR="$ARGS_STR --lv-material-scale $LV_MATERIAL_SCALE"
+[ -n "$RV_MATERIAL_SCALE" ] && ARGS_STR="$ARGS_STR --rv-material-scale $RV_MATERIAL_SCALE"
+[ -n "$SEPTUM_MATERIAL_SCALE" ] && ARGS_STR="$ARGS_STR --septum-material-scale $SEPTUM_MATERIAL_SCALE"
+[ -n "$RV_EDP_SCALE" ] && ARGS_STR="$ARGS_STR --rv-edp-scale $RV_EDP_SCALE"
+[ -n "$RV_EDP_MAX_MMHG" ] && ARGS_STR="$ARGS_STR --rv-edp-max-mmhg $RV_EDP_MAX_MMHG"
+[ -n "$RV_EDP_OVERRIDE_MMHG" ] && ARGS_STR="$ARGS_STR --rv-edp-override-mmhg $RV_EDP_OVERRIDE_MMHG"
 
 # --- 5. Setup Directories & Logging ---
 echo "--- Job Started: $SLURM_JOB_ID ---"
@@ -131,6 +162,10 @@ date
 DATE_STR=$(date +%F)
 RESULTS_BASE="${SIM_DIR}/results/sims/${DATE_STR}"
 RESULTS_DIR="${RESULTS_BASE}/${GEO_TAG}_${BEATS}beats_run_${SLURM_JOB_ID}"
+if [ -n "$RESULTS_DIR_OVERRIDE" ]; then
+    RESULTS_DIR="$RESULTS_DIR_OVERRIDE"
+    RESULTS_BASE="$(dirname "$RESULTS_DIR")"
+fi
 LOG_DIR="${SIM_DIR}/results/log"
 
 mkdir -p ${RESULTS_BASE} ${LOG_DIR} ${RESULTS_DIR}
@@ -198,6 +233,13 @@ echo "  Geometry:  $GEO_TAG"
 echo "  Beats:     $BEATS"
 echo "  Params:    ${CIRCULATION_PARAMS:-'Default (Internal)'}"
 echo "  Restart:   ${RESTART_FROM:-'None (fresh run)'}"
+echo "  Unloaded reference: ${LOAD_UNLOADED_FROM:-'computed per case'}"
+echo "  Restart pre-0D: $RESTART_PRE_CIRC ramp_steps=${RESTART_RAMP_STEPS:-default}"
+echo "  Stop unload only: $STOP_AFTER_UNLOADING"
+echo "  Run postprocess: $RUN_POSTPROCESS"
+echo "  Pre-0D:    beats=${PRE_CIRC_BEATS:-default} max=${PRE_CIRC_MAX_BEATS:-default} tol=${PRE_CIRC_CONVERGENCE_TOL:-off}"
+echo "  Material scales: LV=${LV_MATERIAL_SCALE:-1} RV=${RV_MATERIAL_SCALE:-1} Sept=${SEPTUM_MATERIAL_SCALE:-1}"
+echo "  RV EDP knobs: scale=${RV_EDP_SCALE:-1} max=${RV_EDP_MAX_MMHG:-none} override=${RV_EDP_OVERRIDE_MMHG:-none}"
 echo "  Save Dir:  $RESULTS_DIR"
 
 # Trap EXIT so data transfer happens even on SIGTERM/timeout.
@@ -215,6 +257,9 @@ transfer_and_cleanup() {
         RESULTS_WORK=$(find . -maxdepth 1 -type d -name "results_*" | grep -v "geometry" | head -1)
         if [ -d "$RESULTS_WORK" ]; then
             cp -r "$RESULTS_WORK"/* ${RESULTS_DIR}/ 2>/dev/null || true
+            if [ -n "${RESTART_FROM:-}" ] && [ ! -e "${RESULTS_DIR}/geometry" ] && [ -e "${RESTART_FROM}/geometry" ]; then
+                ln -s "${RESTART_FROM}/geometry" "${RESULTS_DIR}/geometry" 2>/dev/null || true
+            fi
             echo "Data saved to ${RESULTS_DIR}/"
         else
             echo "WARNING: No results directory found in scratch."
@@ -252,7 +297,7 @@ echo "Simulation completed (exit code $SIM_EXIT)"
 # The EXIT trap is the safety net for timeouts/crashes; this is the normal path.
 transfer_and_cleanup
 
-if [ $SIM_EXIT -eq 0 ]; then
+if [ $SIM_EXIT -eq 0 ] && [ "$RUN_POSTPROCESS" = "1" ]; then
     echo "Running Offline Metrics Computation..."
     cd ${RESULTS_DIR}
 
@@ -299,6 +344,8 @@ if [ $SIM_EXIT -eq 0 ]; then
     else
         echo "Skipping post-processing (missing checkpoint data)."
     fi
+elif [ $SIM_EXIT -eq 0 ]; then
+    echo "Skipping post-processing (RUN_POSTPROCESS=$RUN_POSTPROCESS)."
 fi
 
 # Cleanup and data transfer handled by the EXIT trap (transfer_and_cleanup)

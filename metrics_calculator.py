@@ -37,6 +37,7 @@ from pathlib import Path
 from collections import defaultdict
 from mpi4py import MPI
 import dolfinx
+import dolfinx.fem.petsc
 import ufl
 import basix.ufl
 import pulse
@@ -72,11 +73,12 @@ class MetricsCalculator:
         # --- 1. Define Function Spaces ---
         element_type = metrics_space_type[0]
         degree = metrics_space_type[1]
+        self._state_space_is_quadrature = element_type == "Quadrature"
 
         # Determine integration quadrature degree
         # For Quadrature elements, we MUST integrate with the same degree to match points.
         # For DG/Lagrange, we default to 4 (as per original code), or higher if needed.
-        if element_type == "Quadrature":
+        if self._state_space_is_quadrature:
             self.quadrature_degree = degree
             if self.rank == 0:
                  print(f"MetricsCalculator: Using Quadrature Element (Deg {degree}). Quadrature Degree for Integration: {self.quadrature_degree}")
@@ -87,7 +89,10 @@ class MetricsCalculator:
             el_tensor = basix.ufl.quadrature_element(self.mesh.topology.cell_name(), value_shape=(3,3), degree=degree)
             self.W_tensor = dolfinx.fem.functionspace(self.mesh, el_tensor)
         else:
-            self.quadrature_degree = max(4, degree + 2) # Heuristic: degree=1 -> 4, degree=0 -> 4
+            # Fibre fields are stored in degree-6 quadrature space. Keep the
+            # integration rule at least degree 6 even when stress/strain state
+            # storage is deliberately degraded to DG0/DG1 for sensitivity tests.
+            self.quadrature_degree = max(6, degree + 2)
             
             # Scalar Space (for Work Density, Strain Energy)
             self.W_scalar = dolfinx.fem.functionspace(self.mesh, (element_type, degree))
@@ -122,6 +127,7 @@ class MetricsCalculator:
         self.sigma_active = dolfinx.fem.Function(self.W_tensor, name="sigma_active")
         self.sigma_passive = dolfinx.fem.Function(self.W_tensor, name="sigma_passive")
         self.sigma_comp = dolfinx.fem.Function(self.W_tensor, name="sigma_comp")
+        self._state_projection_problems = {}
 
         # --- 3. Setup UFL Expressions ---
         self._setup_expressions()
@@ -492,6 +498,30 @@ class MetricsCalculator:
         else:
             return self.comm.allreduce(dolfinx.fem.assemble_scalar(forms), op=MPI.SUM)
 
+    def _make_state_projection_problem(self, expr, target, name, dx_proj):
+        """Build an L2 projection into the configured state-storage space.
+
+        Quadrature coefficients cannot generally be evaluated at DG interpolation
+        points. For DG0/DG1 sensitivity runs, project the stress expression into
+        the storage space instead of trying point interpolation.
+        """
+        trial = ufl.TrialFunction(self.W_tensor)
+        test = ufl.TestFunction(self.W_tensor)
+        a = ufl.inner(trial, test) * dx_proj
+        L = ufl.inner(expr, test) * dx_proj
+        return dolfinx.fem.petsc.LinearProblem(
+            a,
+            L,
+            u=target,
+            petsc_options={"ksp_type": "preonly", "pc_type": "lu"},
+            petsc_options_prefix=f"metrics_proj_{id(self)}_{name}_",
+        )
+
+    def _store_state_by_projection(self, name):
+        problem = self._state_projection_problems[name]
+        fn = problem.solve()
+        fn.x.scatter_forward()
+
     def _setup_expressions(self):
         u = self.problem.u
         I = ufl.Identity(3)
@@ -508,11 +538,27 @@ class MetricsCalculator:
 
         points = self.W_tensor.element.interpolation_points
         self.expr_E = dolfinx.fem.Expression(E, points)
-        self.expr_S_total = dolfinx.fem.Expression(self.S_tot_ufl, points)
-        self.expr_S_active = dolfinx.fem.Expression(self.S_act_ufl, points)
-        self.expr_S_passive = dolfinx.fem.Expression(self.S_pas_ufl, points)
-        self.expr_S_comp = dolfinx.fem.Expression(self.S_cmp_ufl, points)
 
+        dx_proj = ufl.Measure("dx", domain=self.mesh, metadata={"quadrature_degree": self.quadrature_degree})
+        if self._state_space_is_quadrature:
+            self.expr_S_total = dolfinx.fem.Expression(self.S_tot_ufl, points)
+            self.expr_S_active = dolfinx.fem.Expression(self.S_act_ufl, points)
+            self.expr_S_passive = dolfinx.fem.Expression(self.S_pas_ufl, points)
+            self.expr_S_comp = dolfinx.fem.Expression(self.S_cmp_ufl, points)
+        else:
+            self._state_projection_problems["S_total"] = self._make_state_projection_problem(
+                self.S_tot_ufl, self.S_total, "S_total", dx_proj
+            )
+            if self.enable_regional_internal:
+                self._state_projection_problems["S_active"] = self._make_state_projection_problem(
+                    self.S_act_ufl, self.S_active, "S_active", dx_proj
+                )
+                self._state_projection_problems["S_passive"] = self._make_state_projection_problem(
+                    self.S_pas_ufl, self.S_passive, "S_passive", dx_proj
+                )
+                self._state_projection_problems["S_comp"] = self._make_state_projection_problem(
+                    self.S_cmp_ufl, self.S_comp, "S_comp", dx_proj
+                )
 
         # --- Cauchy Stress Expressions (Push Forward) ---
         J = ufl.det(F)
@@ -524,10 +570,24 @@ class MetricsCalculator:
         sigma_pas_ufl = push_forward(self.S_pas_ufl)
         sigma_cmp_ufl = push_forward(self.S_cmp_ufl)
 
-        self.expr_sigma_total = dolfinx.fem.Expression(sigma_tot_ufl, points)
-        self.expr_sigma_active = dolfinx.fem.Expression(sigma_act_ufl, points)
-        self.expr_sigma_passive = dolfinx.fem.Expression(sigma_pas_ufl, points)
-        self.expr_sigma_comp = dolfinx.fem.Expression(sigma_cmp_ufl, points)
+        if self._state_space_is_quadrature:
+            self.expr_sigma_total = dolfinx.fem.Expression(sigma_tot_ufl, points)
+            self.expr_sigma_active = dolfinx.fem.Expression(sigma_act_ufl, points)
+            self.expr_sigma_passive = dolfinx.fem.Expression(sigma_pas_ufl, points)
+            self.expr_sigma_comp = dolfinx.fem.Expression(sigma_cmp_ufl, points)
+        elif self.enable_decomp:
+            self._state_projection_problems["sigma_total"] = self._make_state_projection_problem(
+                sigma_tot_ufl, self.sigma_total, "sigma_total", dx_proj
+            )
+            self._state_projection_problems["sigma_active"] = self._make_state_projection_problem(
+                sigma_act_ufl, self.sigma_active, "sigma_active", dx_proj
+            )
+            self._state_projection_problems["sigma_passive"] = self._make_state_projection_problem(
+                sigma_pas_ufl, self.sigma_passive, "sigma_passive", dx_proj
+            )
+            self._state_projection_problems["sigma_comp"] = self._make_state_projection_problem(
+                sigma_cmp_ufl, self.sigma_comp, "sigma_comp", dx_proj
+            )
 
     def update_state(self):
         """Called at the END of a timestep to shift Current -> Prev."""
@@ -554,24 +614,38 @@ class MetricsCalculator:
         # E_cur and S_total are needed by every path (PS loops, boundary work
         # via shared _u_prev, regional work).
         self.E_cur.interpolate(self.expr_E)
-        self.S_total.interpolate(self.expr_S_total)
+        if self._state_space_is_quadrature:
+            self.S_total.interpolate(self.expr_S_total)
+        else:
+            self._store_state_by_projection("S_total")
 
         # S_active / S_passive / S_comp are needed by _calculate_incremental_work
         # (regional internal work). Cauchy stresses are only needed by the
         # directional decomposition of state variables.
         if self.enable_regional_internal:
-            self.S_active.interpolate(self.expr_S_active)
-            self.S_passive.interpolate(self.expr_S_passive)
-            self.S_comp.interpolate(self.expr_S_comp)
+            if self._state_space_is_quadrature:
+                self.S_active.interpolate(self.expr_S_active)
+                self.S_passive.interpolate(self.expr_S_passive)
+                self.S_comp.interpolate(self.expr_S_comp)
+            else:
+                self._store_state_by_projection("S_active")
+                self._store_state_by_projection("S_passive")
+                self._store_state_by_projection("S_comp")
 
         if self.enable_decomp:
             # Cauchy push-forwards: only used by mean_sigma_* assemble below.
             # Interpolating these tensor functions is expensive; skip entirely
             # when the decomp forms do not exist.
-            self.sigma_total.interpolate(self.expr_sigma_total)
-            self.sigma_active.interpolate(self.expr_sigma_active)
-            self.sigma_passive.interpolate(self.expr_sigma_passive)
-            self.sigma_comp.interpolate(self.expr_sigma_comp)
+            if self._state_space_is_quadrature:
+                self.sigma_total.interpolate(self.expr_sigma_total)
+                self.sigma_active.interpolate(self.expr_sigma_active)
+                self.sigma_passive.interpolate(self.expr_sigma_passive)
+                self.sigma_comp.interpolate(self.expr_sigma_comp)
+            else:
+                self._store_state_by_projection("sigma_total")
+                self._store_state_by_projection("sigma_active")
+                self._store_state_by_projection("sigma_passive")
+                self._store_state_by_projection("sigma_comp")
 
         # --- B. Integration using pre-compiled forms ---
         data = {}
@@ -1086,6 +1160,23 @@ class MetricsCalculator:
                 print(f"STATS | t={t:.3f} | W_Tot={w_tot:.4e} | PS_Idx={ps_idx:.4e}")
 
         elif not self.has_previous_state:
+            # Pressure-strain work is a loop over strain increments. Clinical
+            # strain is zeroed at the start of the analysed beat, so the first
+            # sampled FEM strain state must become the previous state for the
+            # next increment rather than allowing the first work step to jump
+            # from an artificial zero-strain unloaded reference.
+            for strain_key in ("E_ff", "E_ll"):
+                prefix = f"mean_{strain_key}_"
+                for key, value in state_data.items():
+                    if key.startswith(prefix):
+                        self._eps_prev[f"{strain_key}_{key[len(prefix):]}"] = value
+            self.eps_LV_prev = self._eps_prev.get("E_ff_LV", 0.0)
+            self.eps_RV_prev = self._eps_prev.get("E_ff_RV", 0.0)
+            self.eps_Septum_prev = self._eps_prev.get("E_ff_Septum", 0.0)
+            self.eps_ll_LV_prev = self._eps_prev.get("E_ll_LV", 0.0)
+            self.eps_ll_RV_prev = self._eps_prev.get("E_ll_RV", 0.0)
+            self.eps_ll_Septum_prev = self._eps_prev.get("E_ll_Septum", 0.0)
+
             # Initialize all work keys to 0.0 at Step 0 to "reserve" the CSV columns.
             # We perform a dummy call to get the keys, but we don't use the values.
             # Note: This requires temporary state setup or manual key definition.

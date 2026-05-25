@@ -221,7 +221,7 @@ def plot_convergence(all_results, outdir):
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
     fig.suptitle("Beat-to-Beat Convergence Analysis", fontsize=14, fontweight="bold")
 
-    colors = plt.cm.viridis(np.linspace(0.1, 0.9, n_cases))
+    colors = plt.cm.coolwarm(np.linspace(0.1, 0.9, n_cases))
 
     # Row 1: PV loop L2 norms
     for i, chamber in enumerate(["LV", "RV"]):
