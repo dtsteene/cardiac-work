@@ -19,7 +19,7 @@
 #   sbatch --export=RESULTS_DIR="/path/to/results_dir",GEOMETRY_DIR="/path/to/src/geometry" run_postprocess_only.sbatch
 
 if [ -z "$RESULTS_DIR" ]; then
-    echo "ERROR: RESULTS_DIR not set. Use: sbatch --export=RESULTS_DIR=... run_postprocess_only.sbatch"
+    echo "ERROR: RESULTS_DIR not set. Use: sbatch --export=RESULTS_DIR=... sbatch/run_postprocess_only.sbatch"
     exit 1
 fi
 

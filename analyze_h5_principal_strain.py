@@ -757,7 +757,7 @@ def main() -> None:
         raise SystemExit("--stride must be >= 1")
     if not args.summary_only and "SLURM_JOB_ID" not in os.environ and not args.allow_local:
         raise SystemExit(
-            "Refusing checkpoint replay outside SLURM. Submit run_h5_principal_strain.sbatch "
+            "Refusing checkpoint replay outside SLURM. Submit sbatch/run_h5_principal_strain.sbatch "
             "or pass --allow-local only for a tiny interactive smoke test."
         )
 

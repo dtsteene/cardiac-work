@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-WORK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+WORK_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 DATA_DIR="${WORK_DIR}/data/ukb_circ_v12_exp"
 GEOM_DIR="${WORK_DIR}/data/mesh_convergence/ukb_L5/ukb/geometry"
 GEOM_FIELDS="${GEOM_DIR}/geometry_fields.npz"
@@ -71,7 +71,7 @@ for case_name in ${CASES}; do
             --job-name="cap5L5_${case_name}" \
             --time=10:00:00 \
             --export=ALL,MESH=UKB,BPM=75,BEATS=6,POST_FULL=0,RUN_POSTPROCESS=1,CHAR_LENGTH=5.0,METRICS_SPACE=DG1,CIRCULATION_PARAMS="${json}",GEOMETRY_DIR="${GEOM_DIR}",GEOMETRY_FIELDS="${GEOM_FIELDS}",RV_EDP_MAX_MMHG=5.0,PRE_CIRC_BEATS=30,PRE_CIRC_MAX_BEATS=80,PRE_CIRC_CONVERGENCE_TOL=0.002,RESULTS_DIR_OVERRIDE="${result_dir}",COMMENT="${comment}" \
-            run_sim_and_post.sbatch)
+            "${WORK_DIR}/sbatch/run_sim_and_post.sbatch")
     fi
 
     if [ -n "${jid}" ]; then

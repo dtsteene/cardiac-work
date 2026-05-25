@@ -45,7 +45,7 @@ for sev in $CASES; do
     JID=$(sbatch --parsable \
         --export=ALL,MESH=UKB,BEATS=6,POST_FULL=1,\
 CIRCULATION_PARAMS="$JSON",COMMENT="spectrum_v12exp_extra_${sev}_6bt" \
-        run_sim_and_post.sbatch)
+        "$WORK_DIR/sbatch/run_sim_and_post.sbatch")
     if [ -n "$JID" ]; then
         JOB_IDS+=("$JID")
         echo "    → job $JID"

@@ -79,7 +79,7 @@ for case_name in ${CASES}; do
             --job-name="sharedunload_${case_name}" \
             --time=10:00:00 \
             --export=ALL,MESH=UKB,BPM=75,BEATS=6,POST_FULL=0,RUN_POSTPROCESS=1,CHAR_LENGTH=5.0,METRICS_SPACE=DG1,CIRCULATION_PARAMS="${json}",GEOMETRY_DIR="${GEOM_DIR}",GEOMETRY_FIELDS="${GEOM_FIELDS}",LOAD_UNLOADED_FROM="${SHARED_UNLOADED_FROM}",PRE_CIRC_BEATS=30,PRE_CIRC_MAX_BEATS=80,PRE_CIRC_CONVERGENCE_TOL=0.002,RESULTS_DIR_OVERRIDE="${result_dir}",COMMENT="${comment}" \
-            "${WORK_DIR}/run_sim_and_post.sbatch")
+            "${WORK_DIR}/sbatch/run_sim_and_post.sbatch")
     fi
 
     if [ -n "${jid}" ]; then
