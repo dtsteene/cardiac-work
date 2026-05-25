@@ -36,31 +36,32 @@ complete_cycle.py  →  compute_per_cell.py  →  postprocess_metrics.py  →  f
 
 ## Reproducing thesis figures
 
-Each thesis figure traces back to one of the scripts below. Most
-read the saved metrics from a results directory and need no FEniCSx
-itself — only `numpy`, `matplotlib`, and the `.npz`/`.npy` outputs.
+Every script at the project root produces (or is required to produce)
+a figure or table in the published thesis. Most read saved metrics
+from a results directory and need no FEniCSx itself — only `numpy`,
+`matplotlib`, and the `.npz`/`.npy` outputs.
 
 | Thesis figure(s)                          | Script                                                                                 |
 |-------------------------------------------|----------------------------------------------------------------------------------------|
 | 4.2, 4.6, 4.7, 4.8, 4.9, 5.0c, 5.0d, pv_standalone_vs_coupled | [`figures_thesis_pre_post_coupling_and_ps_loops.py`](figures_thesis_pre_post_coupling_and_ps_loops.py) |
-| 4.2 (alt panel)                           | [`plot_capped_primary_figures.py`](plot_capped_primary_figures.py)                     |
 | 5.0 freewall headline, 5.0 septum headline | [`generate_headline_figures.py`](generate_headline_figures.py)                         |
 | 5.0b, 5.1, 5.2, 5.2b, 5.2c, 5.3a, 5.4, 5.5 | [`plot_h5_thesis_updates.py`](plot_h5_thesis_updates.py)                               |
 | 5.3 (septum old/new ratio error), 5.3b (old/new pressure path) | [`septum_proxy_robustness_old_new.py`](septum_proxy_robustness_old_new.py) |
-| 5.3b (septum strain-direction diagnostic) | [`analyze_h5_septum_mechanism.py`](analyze_h5_septum_mechanism.py)                     |
-| cascade_loops, cascade_cumulative          | [`analyze_cascade.py`](analyze_cascade.py)                                             |
-| closure_audit                              | [`audit_three_bugs_energy_budget.py`](audit_three_bugs_energy_budget.py) → [`plot_three_bugs_audit.py`](plot_three_bugs_audit.py) |
-| stress_magnitudes                          | [`compare_buggy_active_fix.py`](compare_buggy_active_fix.py), [`plot_stress_magnitudes.py`](plot_stress_magnitudes.py) |
-| Appendix B (numerical robustness)         | [`analyze_h5_sweep_core.py`](analyze_h5_sweep_core.py), [`analyze_h5_strain_directions.py`](analyze_h5_strain_directions.py), [`analyze_h5_principal_strain.py`](analyze_h5_principal_strain.py), [`analyze_metric_space_sensitivity.py`](analyze_metric_space_sensitivity.py), [`analyze_sweep.py`](analyze_sweep.py), [`table_septum_tagging_sensitivity.py`](table_septum_tagging_sensitivity.py) |
-| Appendix C (reference-state sensitivity)  | [`summarize_unloading_ab.py`](summarize_unloading_ab.py)                               |
-| Appendix D (patient geometry)             | [`analyze_patient_mesh_pressure_sweep.py`](analyze_patient_mesh_pressure_sweep.py)     |
-| Implementation chapter (deviatoric counterfactual) | [`pulse_legacy_active_patch.py`](pulse_legacy_active_patch.py) + `*_buggy_active.py` wrappers |
-| Chapter 2 ParaView panels (mesh, fibers, tags, unloaded geometry) | [`export_static_geometry_tags.py`](export_static_geometry_tags.py), [`export_unloading_cap_paraview.py`](export_unloading_cap_paraview.py), [`export_visual_fields.py`](export_visual_fields.py) |
+| 5.3b (septum strain-direction diagnostic), 5.3c (septum layer mechanics) | [`analyze_h5_septum_mechanism.py`](analyze_h5_septum_mechanism.py) |
+| `fig_septum_lambda_scan`, `fig_septum_layer_work` | [`septum_mechanics_proxy_test.py`](septum_mechanics_proxy_test.py)                     |
+| `fig_freewall_ratio_spectrum`, `fig_freewall_single_case_ratio` | [`freewall_ratio_proxy_test.py`](freewall_ratio_proxy_test.py)                         |
+| `fig_regional_ratio_waveform`             | [`regional_ratio_waveform_test.py`](regional_ratio_waveform_test.py)                   |
+| `fig_cascade_loops`, `fig_cascade_cumulative` | [`analyze_cascade.py`](analyze_cascade.py)                                             |
+| `fig_closure_audit`                       | [`audit_three_bugs_energy_budget.py`](audit_three_bugs_energy_budget.py) (+ [`robin_reference_replay.py`](robin_reference_replay.py)) → [`plot_three_bugs_audit.py`](plot_three_bugs_audit.py) |
+| `fig_stress_magnitudes`                   | [`plot_stress_magnitudes.py`](plot_stress_magnitudes.py)                               |
+| Appendix B tables (numerical robustness)  | [`analyze_h5_sweep_core.py`](analyze_h5_sweep_core.py)                                 |
+| `fig_unloaded_cap_grid`, `fig_ed_cap_grid` (ParaView) | [`export_unloading_cap_paraview.py`](export_unloading_cap_paraview.py)             |
+| Chapter 2 mesh / fiber / tag panels (ParaView) | [`export_static_geometry_tags.py`](export_static_geometry_tags.py)                |
 
-The remaining chapter 1, 2, and 4 figures (regazzoni PV loops,
-Klotz EDPVR, Holzapfel-Ogden, circulation-network diagrams) are
-generated from inside the thesis repository (`RV/scripts/`) and are
-not produced here.
+Chapter 1, 2, and 4 figures that are pure matplotlib illustrations
+(regazzoni PV loops, Klotz EDPVR, Holzapfel-Ogden, circulation-
+network diagrams) are generated from inside the thesis repository
+(`RV/scripts/`) and are not produced here.
 
 ## Running simulations
 
@@ -74,7 +75,8 @@ sbatch sbatch/run_sim_and_post.sbatch
 # Postprocess only (replays from saved checkpoint)
 sbatch --export=RESULTS_DIR=results/sims/<dir> sbatch/run_postprocess_only.sbatch
 
-# Per-cell work in canonical-tagging mode
+# Per-cell work (ED tagging mode, then canonical/reference mode)
+sbatch --export=RESULTS_DIR=results/sims/<dir> sbatch/run_per_cell.sbatch
 sbatch --export=RESULTS_DIR=results/sims/<dir> sbatch/run_per_cell_canonical.sbatch
 
 # Capped RV-EDP shared-L5 production sweep (16 cases — the main thesis sweep)
@@ -83,12 +85,21 @@ bash sbatch/submit_capped_shared_l5_sweep.sh
 # Shared-unloaded-reference sweep (Design B — only 0D circulation varies)
 bash sbatch/submit_shared_unloaded_l5_sweep.sh
 
-# Patient-mesh sweep (appendix D)
+# v12 EXP-extra spectrum dispatcher (uses pre-tuned 0D JSONs in data/)
+sbatch sbatch/submit_spectrum_v12_exp_extra.sbatch
+
+# Patient-mesh FEM sweep
 sbatch sbatch/submit_patient_mesh_fem.sbatch
 
 # Unloading-only sensitivity sweeps (appendix C reference-state)
 bash sbatch/submit_unloading_ab.sh
 bash sbatch/submit_unloading_stiffness_sweep.sh
+
+# Robin reference-config replay (input for the closure-audit figure)
+sbatch --export=RESULTS_DIR=results/sims/<dir> sbatch/run_robin_reference_replay.sbatch
+
+# Postprocess recovery (rerun postprocessing for a finished sim if outputs are missing)
+sbatch --export=RESULTS_DIR=results/sims/<dir> sbatch/run_repost_if_missing.sbatch
 ```
 
 ## Geometry
@@ -117,18 +128,20 @@ arrays), `geometry_fields.xdmf` (ParaView).
 - [circulation](https://github.com/ComputationalPhysiology/circulation) for the
   closed-loop 0D Windkessel model.
 - [adios4dolfinx](https://github.com/jorgensd/adios4dolfinx) for
-  checkpoint I/O, [Optuna](https://optuna.org) for 0D parameter
-  calibration, GMSH for meshing.
+  checkpoint I/O, GMSH for meshing.
 
 Install via the upstream FEniCSx conda channel; this repo carries
-no pinned environment file.
+no pinned environment file. Pre-tuned 0D circulation parameter
+JSONs are checked in under `data/ukb_circ_v12_exp/` and
+`data/patient_mesh_circ_v12_exp/` — Optuna is not required to
+reproduce the thesis sweeps.
 
 ## Data
 
-Simulation outputs (~2.2 TB of checkpoints, per-beat metrics, and
+Simulation outputs (~2 TB of checkpoints, per-beat metrics, and
 ParaView bundles) are not in the repository. The thesis figures
 are reproducible from a 16-case capped shared-L5 sweep — see
-[`submit_capped_shared_l5_sweep.sh`](submit_capped_shared_l5_sweep.sh)
+[`sbatch/submit_capped_shared_l5_sweep.sh`](sbatch/submit_capped_shared_l5_sweep.sh)
 for the exact case list.
 
 ## Tests
