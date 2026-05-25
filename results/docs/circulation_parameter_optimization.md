@@ -256,5 +256,5 @@ Clinical trend correlations:
 - Modified circulation library: `/home/dtsteene/D1/circulation/` (pip install -e)
 - Result JSONs: `/global/D1/homes/dtsteene/cardiac-work/data/ukb_circ_v2/`
 - Optuna databases: `/global/D1/homes/dtsteene/circulation/examples/results_mesh_ukb/`
-- Slurm submission: `/global/D1/homes/dtsteene/cardiac-work/run_circ_optim.sbatch`
+- Slurm submission: `/global/D1/homes/dtsteene/cardiac-work/run_circ_optim_v12_exp_extra.sbatch`
 - Backup of v6 PAH results: `/global/D1/homes/dtsteene/cardiac-work/data/ukb_circ_v6_backup/`
