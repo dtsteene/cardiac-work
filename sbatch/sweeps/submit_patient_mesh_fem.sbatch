@@ -72,7 +72,7 @@ for SEV in $CASES; do
     JID=$(sbatch --parsable \
         --export=ALL,MESH="$RUN_MESH",BEATS="$BEATS",POST_FULL=1,\
 CIRCULATION_PARAMS="$JSON",COMMENT="$COMMENT" \
-        "$WORK_DIR/sbatch/run_sim_and_post.sbatch")
+        "$WORK_DIR/sbatch/jobs/run_sim_and_post.sbatch")
     if [ -n "$JID" ]; then
         JOB_IDS+=("$JID")
         printf "%s\t%s\t%s\t%s\n" "$MESH_KEY" "$SEV" "$JID" "$JSON" >> "$MANIFEST"

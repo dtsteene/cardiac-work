@@ -18,7 +18,7 @@
 #SBATCH --error=robin_replay_%j.err
 
 if [ -z "$RESULTS_DIR" ]; then
-    echo "ERROR: RESULTS_DIR not set. Use: sbatch --export=RESULTS_DIR=... sbatch/run_robin_reference_replay.sbatch"
+    echo "ERROR: RESULTS_DIR not set. Use: sbatch --export=RESULTS_DIR=... sbatch/jobs/run_robin_reference_replay.sbatch"
     exit 1
 fi
 

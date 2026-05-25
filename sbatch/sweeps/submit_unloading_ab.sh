@@ -47,7 +47,7 @@ submit_one() {
         --time="${TIME_LIMIT}" \
         --ntasks="${NTASKS}" \
         --export="${export_vars}" \
-        "${WORK_DIR}/sbatch/run_sim_and_post.sbatch")
+        "${WORK_DIR}/sbatch/jobs/run_sim_and_post.sbatch")
 
     printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
         "$(date -Is)" "${case_name}" "${variant}" "${job_id}" \

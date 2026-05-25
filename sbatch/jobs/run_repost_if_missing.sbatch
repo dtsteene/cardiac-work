@@ -77,4 +77,4 @@ fi
 
 export SIM_DIR RESULTS_DIR GEOMETRY_FIELDS
 echo "Running scratch-based recovery postprocessing..."
-bash "${SIM_DIR}/sbatch/recover_postprocess_run.sbatch"
+bash "${SIM_DIR}/sbatch/jobs/recover_postprocess_run.sbatch"

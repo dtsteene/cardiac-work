@@ -12,14 +12,14 @@
 #SBATCH --error=postprocess_%j.err
 
 # Usage:
-#   sbatch --export=RESULTS_DIR="/path/to/results_dir" run_postprocess_only.sbatch
-#   sbatch --export=RESULTS_DIR="/path/to/results_dir",RETAG_SEPTUM=1 run_postprocess_only.sbatch
-#   sbatch --export=RESULTS_DIR="/path/to/results_dir",RETAG_SEPTUM_ED=1 run_postprocess_only.sbatch
-#   sbatch --export=RESULTS_DIR="/path/to/results_dir",LAST_BEAT=1 run_postprocess_only.sbatch
-#   sbatch --export=RESULTS_DIR="/path/to/results_dir",GEOMETRY_DIR="/path/to/src/geometry" run_postprocess_only.sbatch
+#   sbatch --export=RESULTS_DIR="/path/to/results_dir" sbatch/jobs/run_postprocess_only.sbatch
+#   sbatch --export=RESULTS_DIR="/path/to/results_dir",RETAG_SEPTUM=1 sbatch/jobs/run_postprocess_only.sbatch
+#   sbatch --export=RESULTS_DIR="/path/to/results_dir",RETAG_SEPTUM_ED=1 sbatch/jobs/run_postprocess_only.sbatch
+#   sbatch --export=RESULTS_DIR="/path/to/results_dir",LAST_BEAT=1 sbatch/jobs/run_postprocess_only.sbatch
+#   sbatch --export=RESULTS_DIR="/path/to/results_dir",GEOMETRY_DIR="/path/to/src/geometry" sbatch/jobs/run_postprocess_only.sbatch
 
 if [ -z "$RESULTS_DIR" ]; then
-    echo "ERROR: RESULTS_DIR not set. Use: sbatch --export=RESULTS_DIR=... sbatch/run_postprocess_only.sbatch"
+    echo "ERROR: RESULTS_DIR not set. Use: sbatch --export=RESULTS_DIR=... sbatch/jobs/run_postprocess_only.sbatch"
     exit 1
 fi
 
