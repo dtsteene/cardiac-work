@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
-"""Core h=5 corrected-sweep analysis harness.
+"""Cross-simulation sweep analysis.
 
-This is intentionally small and rerunnable. It reads the h=5 sweep manifest,
-detects which jobs have completed postprocessing, and writes the key tables
-needed to decide whether the h=5 sweep preserves the thesis story.
+The headline question: across a sweep of simulations, does each pressure-strain
+proxy *follow* the ground-truth stress-strain work? That is answered here by
+correlating per-simulation scalar QoIs (loop areas / total integrals) BETWEEN
+simulations — not within a single beat. Ratio preservation across the sweep is
+the second output.
+
+It reads a sweep manifest, detects which jobs have completed postprocessing,
+reduces each run to scalar QoIs (region work, proxy work, ratios), then writes:
+  - sweep_septum_proxy_correlations.csv   proxy-vs-tensor work correlation across sims (headline)
+  - sweep_septum_ratio_preservation.csv   septum/free-wall ratio error across sims
+  - sweep_case_values.csv                 the per-case scalar table everything is built from
+  - plus free-wall, work-component, RV-bridge, and h10-vs-h5 mesh-convergence tables
+
+Intentionally small, pure-NumPy, and rerunnable; the statistics themselves live
+in analysis_core.py.
 """
 
 from __future__ import annotations
@@ -15,24 +27,34 @@ from pathlib import Path
 from typing import Iterable
 
 import numpy as np
-from scipy.stats import pearsonr
+
+from analysis_core import (
+    KPA,
+    COMPONENTS,
+    STRAINS,
+    PRESSURE_CHOICES as PROXIES,
+    region_masks,
+    region_density,
+    pressure_candidates,
+    tau_from_per_cell,
+    pearson_r,
+    ratio_preservation,
+)
 
 
 ROOT = Path("/home/dtsteene/D1/cardiac-work")
 SIM_ROOT = ROOT / "results" / "sims"
-OUT = Path(os.environ.get("H5_SWEEP_OUT", ROOT / "results" / "analysis" / "h5_sweep"))
+OUT = Path(os.environ.get("SWEEP_OUT", ROOT / "results" / "analysis" / "sweep"))
 MANIFEST = Path(
     os.environ.get(
-        "H5_SWEEP_MANIFEST",
+        "SWEEP_MANIFEST",
         ROOT / "results" / "analysis" / "h5_sweep_submission" / "h5_corrected_sweep_cases.tsv",
     )
 )
+# Coarser reference mesh (h=10 mm) used only for the mesh-convergence QoI diff.
 H10_MANIFEST = ROOT / "results" / "important_sims" / "manifests" / "new_sweep_v12_exp_n16.csv"
-KPA = 1e-3
 
-PROXIES = ["PLV", "PRV", "Trans", "Mean", "NearestSide", "TauWeighted"]
-STRAINS = ["ll", "ff"]
-COMPONENTS = ["ff", "ss", "nn", "cross"]
+# KPA, PROXIES (=PRESSURE_CHOICES), STRAINS, COMPONENTS now come from analysis_core.
 RV_BRIDGE_CANDIDATES = [
     ("rv_ps_ll_density_kPa", "RV pressure x longitudinal strain"),
     ("rv_ps_ff_density_kPa", "RV pressure x fibre strain"),
@@ -116,41 +138,21 @@ def has_canonical_per_cell(run: Path) -> bool:
 
 def density(pc: np.lib.npyio.NpzFile, mask: np.ndarray, values: str | np.ndarray) -> float:
     arr = pc[values] if isinstance(values, str) else values
-    volume = float(pc["cell_volumes"][mask].sum())
-    return float(-arr[mask].sum() / volume * KPA)
+    return region_density(arr, mask, pc["cell_volumes"])
 
 
 def masks(pc: np.lib.npyio.NpzFile) -> dict[str, np.ndarray]:
-    tags = pc["region_tags"]
-    return {
-        "LV": tags == 1,
-        "RV": tags == 2,
-        "Septum": pc["is_geometric_septum"].astype(bool),
-    }
+    return region_masks(pc["region_tags"], pc["is_geometric_septum"])
 
 
 def candidate_arrays(pc: np.lib.npyio.NpzFile, suffix: str) -> dict[str, np.ndarray]:
-    # Canonical convention for pressure choices: tau=0 on the LV side and
-    # tau=1 on the RV side. The saved Laplace scalar has the opposite orientation.
-    tau = 1.0 - pc["lv_rv_scalar"] if "lv_rv_scalar" in pc.files else pc["tau"]
-    plv = pc[f"proxy_PLV_{suffix}"]
-    prv = pc[f"proxy_PRV_{suffix}"]
-    return {
-        "PLV": plv,
-        "PRV": prv,
-        "Trans": plv - prv,
-        "Mean": 0.5 * (plv + prv),
-        "NearestSide": np.where(tau < 0.5, plv, prv),
-        "TauWeighted": (1.0 - tau) * plv + tau * prv,
-    }
+    return pressure_candidates(
+        pc[f"proxy_PLV_{suffix}"], pc[f"proxy_PRV_{suffix}"], tau_from_per_cell(pc)
+    )
 
 
 def corr(x: list[float], y: list[float]) -> float:
-    x_arr = np.asarray(x, dtype=float)
-    y_arr = np.asarray(y, dtype=float)
-    if len(x_arr) < 3 or np.std(x_arr) == 0 or np.std(y_arr) == 0:
-        return float("nan")
-    return float(pearsonr(x_arr, y_arr)[0])
+    return pearson_r(x, y)
 
 
 def last_beat_pressure(run: Path) -> tuple[float, float]:
@@ -255,17 +257,16 @@ def ratio_preservation_rows(rows: list[dict[str, object]]) -> list[dict[str, obj
     tensor = np.asarray([float(row["Septum_to_FWmean_tensor_ratio"]) for row in rows])
     for proxy in PROXIES:
         vals = np.asarray([float(row[f"Septum_{proxy}_ll_to_FW_adjacent_ratio"]) for row in rows])
-        log_err = np.abs(np.log(np.abs(vals / tensor)))
-        raw_err = np.abs(vals - tensor)
+        rp = ratio_preservation(vals, tensor)
         out.append(
             {
-                "n": len(rows),
+                "n": rp["n"],
                 "strain": "ll",
                 "proxy": proxy,
-                "mean_abs_raw_error": float(np.mean(raw_err)),
-                "max_abs_raw_error": float(np.max(raw_err)),
-                "mean_abs_log_error": float(np.mean(log_err)),
-                "max_abs_log_error": float(np.max(log_err)),
+                "mean_abs_raw_error": rp["mean_abs_raw_error"],
+                "max_abs_raw_error": rp["max_abs_raw_error"],
+                "mean_abs_log_error": rp["mean_abs_log_error"],
+                "max_abs_log_error": rp["max_abs_log_error"],
             }
         )
     return out
@@ -559,7 +560,7 @@ def markdown_summary(
         else:
             lines.append("- Completed h=5 cases have geometric septum volumes matching the tag-3 septum.")
         lines.append("")
-    lines.append("Generated by `analyze_h5_sweep_core.py`.")
+    lines.append("Generated by `sweep_analysis.py`.")
     lines.append("")
     return "\n".join(lines)
 
@@ -568,31 +569,31 @@ def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     manifest = read_tsv(MANIFEST)
     status = status_rows(manifest)
-    write_csv(OUT / "h5_sweep_case_status.csv", status)
+    write_csv(OUT / "sweep_case_status.csv", status)
 
-    h5_rows = []
+    case_rows = []
     for row in status:
         if row["status"] != "complete_post":
             continue
         run = Path(str(row["result_dir"]))
-        h5_rows.append(case_values(str(row["case"]), str(row["job_id"]), run))
+        case_rows.append(case_values(str(row["case"]), str(row["job_id"]), run))
 
-    if h5_rows:
-        write_csv(OUT / "h5_sweep_case_values.csv", h5_rows)
-        freewall = freewall_summary_rows(h5_rows)
-        septum_corr = correlation_rows(h5_rows)
-        septum_ratio = ratio_preservation_rows(h5_rows)
-        components = component_summary_rows(h5_rows)
-        rv_bridge = rv_bridge_case_rows(h5_rows)
+    if case_rows:
+        write_csv(OUT / "sweep_case_values.csv", case_rows)
+        freewall = freewall_summary_rows(case_rows)
+        septum_corr = correlation_rows(case_rows)
+        septum_ratio = ratio_preservation_rows(case_rows)
+        components = component_summary_rows(case_rows)
+        rv_bridge = rv_bridge_case_rows(case_rows)
         rv_bridge_corr = rv_bridge_correlation_rows(rv_bridge)
-        h10_diff = h10_comparison_rows(h5_rows)
-        masks_out = mask_diagnostic_rows(h5_rows)
-        write_csv(OUT / "h5_freewall_ratio_summary.csv", freewall)
-        write_csv(OUT / "h5_septum_proxy_correlations.csv", septum_corr)
-        write_csv(OUT / "h5_septum_ratio_preservation.csv", septum_ratio)
-        write_csv(OUT / "h5_work_component_summary.csv", components)
-        write_csv(OUT / "h5_rv_bridge_case_values.csv", rv_bridge)
-        write_csv(OUT / "h5_rv_bridge_correlations.csv", rv_bridge_corr)
+        h10_diff = h10_comparison_rows(case_rows)
+        masks_out = mask_diagnostic_rows(case_rows)
+        write_csv(OUT / "sweep_freewall_ratio_summary.csv", freewall)
+        write_csv(OUT / "sweep_septum_proxy_correlations.csv", septum_corr)
+        write_csv(OUT / "sweep_septum_ratio_preservation.csv", septum_ratio)
+        write_csv(OUT / "sweep_work_component_summary.csv", components)
+        write_csv(OUT / "sweep_rv_bridge_case_values.csv", rv_bridge)
+        write_csv(OUT / "sweep_rv_bridge_correlations.csv", rv_bridge_corr)
         write_csv(OUT / "h10_to_h5_key_qoi_differences.csv", h10_diff)
         write_csv(OUT / "septum_mask_diagnostics.csv", masks_out)
     else:
@@ -601,8 +602,8 @@ def main() -> None:
         rv_bridge_corr = []
         h10_diff = []
 
-    (OUT / "h5_sweep_summary.md").write_text(
-        markdown_summary(status, h5_rows, septum_corr, septum_ratio, rv_bridge_corr, h10_diff)
+    (OUT / "sweep_summary.md").write_text(
+        markdown_summary(status, case_rows, septum_corr, septum_ratio, rv_bridge_corr, h10_diff)
     )
     print(f"Wrote {OUT}")
     print(f"Complete postprocessed cases: {sum(row['status'] == 'complete_post' for row in status)} / {len(status)}")

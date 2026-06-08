@@ -30,30 +30,21 @@ cardiac-work/
 ├── metrics_calculator.py               stress / strain / work decomposition library
 ├── geometry_generator.py               UKB mesh + LDRB fibers + region tags + per-cell geometric fields
 ├── clinical_frame.py                   clinical-frame direction helpers (longitudinal projection)
+├── geometry_utils.py                   pure point-to-surface geometry primitives (shared, no FEniCSx)
+│
+│   ── analysis (read precomputed metrics; pure NumPy, no FEniCSx) ──
+├── analysis_core.py                    THE stats core: per-region work, swappable-pressure proxy,
+│                                       ratios, correlations, log-MAE (see tests/test_analysis_core.py)
+├── sweep_analysis.py                   cross-sim sweep: proxy↔truth correlation + ratio across sims
 ├── run_postprocessing.py               beat-slice orchestrator (calls eval_proxies + plot_loops)
 ├── eval_proxies.py                     proxy R² / error tables per sim
 ├── plot_loops.py                       PV / PS / SS debug loops
 ├── plot_utils.py                       shared matplotlib utilities
 │
-│   ── figure producers (one or more published thesis figures each) ──
-├── figures_thesis_pre_post_coupling_and_ps_loops.py
-├── generate_headline_figures.py
-├── plot_h5_thesis_updates.py
-├── analyze_h5_septum_mechanism.py
-├── analyze_h5_sweep_core.py
-├── septum_proxy_robustness_old_new.py
-├── septum_mechanics_proxy_test.py
-├── freewall_ratio_proxy_test.py
-├── regional_ratio_waveform_test.py
-├── analyze_cascade.py
-├── plot_stress_magnitudes.py
-├── audit_three_bugs_energy_budget.py   ─┐ together produce fig_closure_audit
-├── robin_reference_replay.py            │
-├── plot_three_bugs_audit.py            ─┘
-│
 │   ── ParaView field exporters ──
 ├── export_static_geometry_tags.py      ch. 2 mesh / fiber / tag panels
-└── export_unloading_cap_paraview.py    fig_unloaded_cap_grid, fig_ed_cap_grid
+├── export_unloading_cap_paraview.py    fig_unloaded_cap_grid, fig_ed_cap_grid
+└── export_production_sweep_for_animation.py   time-series field export for animations
 ```
 
 ## Pipeline
@@ -62,38 +53,44 @@ Simulation and analysis are decoupled — change a metric, rerun
 postprocessing, no re-simulation needed.
 
 ```
-complete_cycle.py  →  compute_per_cell.py  →  postprocess_metrics.py  →  figure scripts
-  (FEM + 0D solver)    (per-cell work/proxies)   (regional metrics)
+complete_cycle.py  →  compute_per_cell.py  →  postprocess_metrics.py  →  analysis_core.py
+  (FEM + 0D solver)    (per-cell work/proxies)   (regional metrics)        (stats: ratios,
+                                                                            correlations, proxy)
 ```
+
+## Analysis core
+
+`analysis_core.py` is the one home for the per-region statistics the
+project cares about. It is pure NumPy/SciPy (no FEniCSx), reads the
+precomputed `per_cell_data.npz` / `metrics_downsample_*.npy`, and
+provides:
+
+- `region_masks`, `region_density` — ground-truth S:dE work per LV / RV / septum
+- `pressure_candidates` — the swappable septal pressure (P_LV, P_RV,
+  transmural P_LV−P_RV, mean, nearest-side, tau-weighted)
+- `pearson_r`, `correlation_stats` — proxy↔truth correlation (r, R², slope)
+- `ratio_preservation`, `log_mae` — proxy-vs-truth ratio error
+
+These definitions are lifted verbatim from the thesis sweep harness and
+pinned by `tests/test_analysis_core.py` (run on the login node —
+pure NumPy, no FEniCSx needed). Every analysis script delegates here.
 
 ## Reproducing thesis figures
 
-Every figure-producing script at the root is here because at least
-one published figure depends on it. Most read saved metrics from a
-results directory and need no FEniCSx itself — only `numpy`,
-`matplotlib`, and the `.npz` / `.npy` outputs.
+The standalone scripts that produced the (now frozen) thesis figures
+were removed after the defense to slim the working set; their reusable
+math lives in `analysis_core.py`. The original figure producers remain
+in git history — recover any of them with:
 
-| Thesis figure(s)                                          | Script                                                                                                  |
-|-----------------------------------------------------------|---------------------------------------------------------------------------------------------------------|
-| 4.2, 4.6, 4.7, 4.8, 4.9, 5.0c, 5.0d, `pv_standalone_vs_coupled` | [`figures_thesis_pre_post_coupling_and_ps_loops.py`](figures_thesis_pre_post_coupling_and_ps_loops.py)  |
-| 5.0 freewall / septum headlines                           | [`generate_headline_figures.py`](generate_headline_figures.py)                                          |
-| 5.0b, 5.1, 5.2, 5.2b, 5.2c, 5.3a, 5.4, 5.5                | [`plot_h5_thesis_updates.py`](plot_h5_thesis_updates.py)                                                |
-| 5.3 septum old/new ratio error, 5.3b old/new pressure path | [`septum_proxy_robustness_old_new.py`](septum_proxy_robustness_old_new.py)                              |
-| 5.3b septum strain-direction, 5.3c septum layer mechanics | [`analyze_h5_septum_mechanism.py`](analyze_h5_septum_mechanism.py)                                      |
-| `fig_septum_lambda_scan`, `fig_septum_layer_work`         | [`septum_mechanics_proxy_test.py`](septum_mechanics_proxy_test.py)                                      |
-| `fig_freewall_ratio_spectrum`, `fig_freewall_single_case_ratio` | [`freewall_ratio_proxy_test.py`](freewall_ratio_proxy_test.py)                                          |
-| `fig_regional_ratio_waveform`                             | [`regional_ratio_waveform_test.py`](regional_ratio_waveform_test.py)                                    |
-| `fig_cascade_loops`, `fig_cascade_cumulative`             | [`analyze_cascade.py`](analyze_cascade.py)                                                              |
-| `fig_closure_audit`                                       | [`audit_three_bugs_energy_budget.py`](audit_three_bugs_energy_budget.py) (+ [`robin_reference_replay.py`](robin_reference_replay.py)) → [`plot_three_bugs_audit.py`](plot_three_bugs_audit.py) |
-| `fig_stress_magnitudes`                                   | [`plot_stress_magnitudes.py`](plot_stress_magnitudes.py)                                                |
-| Appendix B tables (numerical robustness)                  | [`analyze_h5_sweep_core.py`](analyze_h5_sweep_core.py)                                                  |
-| `fig_unloaded_cap_grid`, `fig_ed_cap_grid` (ParaView)     | [`export_unloading_cap_paraview.py`](export_unloading_cap_paraview.py)                                  |
-| Chapter 2 mesh / fiber / tag panels (ParaView)            | [`export_static_geometry_tags.py`](export_static_geometry_tags.py)                                      |
+```bash
+git show a0af112:freewall_ratio_proxy_test.py        # view
+git checkout a0af112 -- analyze_h5_septum_mechanism.py  # restore
+```
 
-Chapter 1, 2, and 4 figures that are pure matplotlib illustrations
-(Regazzoni PV loops, Klotz EDPVR, Holzapfel-Ogden, circulation-
-network diagrams) are generated from inside the thesis repository
-(`RV/scripts/`) — not produced here.
+(`a0af112` is the last commit before the post-defense cleanup; see its
+README for the full figure→script map.) Chapter 1, 2, and 4 pure
+matplotlib illustrations are generated from the thesis repo
+(`RV/scripts/`), not here.
 
 ## Running on SLURM
 
@@ -114,11 +111,8 @@ sbatch --export=RESULTS_DIR=results/sims/<dir> sbatch/jobs/run_postprocess_only.
 sbatch --export=RESULTS_DIR=results/sims/<dir> sbatch/jobs/run_per_cell.sbatch
 sbatch --export=RESULTS_DIR=results/sims/<dir> sbatch/jobs/run_per_cell_canonical.sbatch
 
-# Robin reference-config replay (writes the V0 input the closure-audit figure needs)
-sbatch --export=RESULTS_DIR=results/sims/<dir> sbatch/jobs/run_robin_reference_replay.sbatch
-
-# Sweep-level h=5 core analysis (writes appendix-B tables)
-sbatch sbatch/jobs/run_h5_sweep_core_analysis.sbatch
+# Cross-simulation sweep analysis (proxy↔truth correlation + ratio tables)
+sbatch sbatch/jobs/run_sweep_analysis.sbatch
 
 # Postprocess recovery if outputs are missing for a finished sim
 sbatch --export=RESULTS_DIR=results/sims/<dir> sbatch/jobs/run_repost_if_missing.sbatch

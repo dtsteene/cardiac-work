@@ -19,6 +19,7 @@ Usage:
 """
 
 import json
+import os
 import sys
 import logging
 from pathlib import Path
@@ -28,7 +29,6 @@ from mpi4py import MPI
 import dolfinx
 import dolfinx.fem.petsc
 import ufl
-import scifem
 import adios4dolfinx
 import basix.ufl
 import pulse
@@ -37,6 +37,7 @@ import cardiac_geometries.geometry
 from scipy.spatial import cKDTree
 from petsc4py import PETSc
 from clinical_frame import tangent_project_longitudinal
+from geometry_utils import closest_points_to_surface as _closest_points_to_surface
 
 # pyvista is used for point-to-facet distance (more accurate than
 # nearest-vertex on coarse meshes).
@@ -239,9 +240,46 @@ for k, entry in mat_params_raw.items():
     material_params[k] = pulse.Variable(entry["value"], entry["unit"])
 
 material = pulse.HolzapfelOgden(f0=f0_quad, s0=s0_quad, **material_params)
-Ta_space = scifem.create_space_of_simple_functions(mesh=mesh, cell_tag=markers_mt, tags=[1, 2, 3])
-Ta = pulse.Variable(dolfinx.fem.Function(Ta_space), "kPa")
-active_model = pulse.ActiveStress(f0_quad, activation=Ta)
+# Uniform scalar Ta + FrankStarlingActiveStress, matching the forward sim.
+# Pick up the mode from simulation_params.json if present (set by
+# complete_cycle.py when the forward sim runs), else from FS_PRELOAD_ONLY
+# env var, else default to instantaneous.
+_fs_meta = sim_params.get("frank_starling", {}) if isinstance(sim_params, dict) else {}
+_fs_meta_mode = str(_fs_meta.get("mode", "")).lower()
+USE_FRANK_STARLING = bool(_fs_meta.get("enabled", True))
+FS_RELAX_TAU_S = float(_fs_meta.get("relaxation_tau_s", 0.0) or 0.0)
+if _fs_meta_mode in ("preload_only", "instantaneous", "relaxation"):
+    FS_PRELOAD_ONLY = (_fs_meta_mode == "preload_only")
+else:
+    FS_PRELOAD_ONLY = os.environ.get("FS_PRELOAD_ONLY", "0") == "1"
+if not USE_FRANK_STARLING:
+    FS_PRELOAD_ONLY = False
+    FS_RELAX_TAU_S = 0.0
+
+def _fs_mode_kwargs():
+    if FS_RELAX_TAU_S > 0:
+        return {"relaxation_tau": FS_RELAX_TAU_S}
+    if FS_PRELOAD_ONLY:
+        return {"preload_only": True}
+    return {}
+
+_relax_dt = float(sim_params.get("dt", 0.001))
+if rank == 0:
+    _mode = ("off (constant Ta)" if not USE_FRANK_STARLING
+             else f"relaxation (tau={FS_RELAX_TAU_S*1000:.0f}ms)" if FS_RELAX_TAU_S > 0
+             else "preload_only" if FS_PRELOAD_ONLY else "instantaneous")
+    logger.info(f"Active model for replay: {_mode}")
+Ta = pulse.Variable(
+    dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(0.0)),
+    "kPa",
+)
+if USE_FRANK_STARLING:
+    active_model = pulse.FrankStarlingActiveStress(
+        f0=f0_quad, activation=Ta,
+        **_fs_mode_kwargs(),
+    )
+else:
+    active_model = pulse.ActiveStress(f0_quad, activation=Ta)
 
 if sim_params["incompressible"]:
     comp_model = pulse.compressibility.Incompressible()
@@ -295,6 +333,11 @@ problem = pulse.problem.StaticProblem(
     model=cardiac_model, geometry=geometry, bcs=bcs, cavities=cavities,
     parameters={"mesh_unit": sim_params["mesh_unit"], "u_space": "P_2"},
 )
+
+# Hand FrankStarlingActiveStress the displacement so g(lambda) matches
+# the forward sim on replay. (Plain ActiveStress has no register / needs none.)
+if USE_FRANK_STARLING:
+    active_model.register(problem.u)
 
 if rank == 0:
     logger.info("Problem reconstructed")
@@ -372,71 +415,6 @@ def _surface_triangles_global(tag_ids):
     if not nonempty:
         return np.empty((0, 3, 3), dtype=float)
     return np.concatenate(nonempty, axis=0)
-
-
-def _closest_point_on_triangle(point, tri):
-    # Ericson, Real-Time Collision Detection, section 5.1.5.
-    a, b, c = tri
-    ab = b - a
-    ac = c - a
-    ap = point - a
-    d1 = float(np.dot(ab, ap))
-    d2 = float(np.dot(ac, ap))
-    if d1 <= 0.0 and d2 <= 0.0:
-        return a
-
-    bp = point - b
-    d3 = float(np.dot(ab, bp))
-    d4 = float(np.dot(ac, bp))
-    if d3 >= 0.0 and d4 <= d3:
-        return b
-
-    vc = d1 * d4 - d3 * d2
-    if vc <= 0.0 and d1 >= 0.0 and d3 <= 0.0:
-        return a + (d1 / (d1 - d3)) * ab
-
-    cp = point - c
-    d5 = float(np.dot(ab, cp))
-    d6 = float(np.dot(ac, cp))
-    if d6 >= 0.0 and d5 <= d6:
-        return c
-
-    vb = d5 * d2 - d1 * d6
-    if vb <= 0.0 and d2 >= 0.0 and d6 <= 0.0:
-        return a + (d2 / (d2 - d6)) * ac
-
-    va = d3 * d6 - d5 * d4
-    if va <= 0.0 and (d4 - d3) >= 0.0 and (d5 - d6) >= 0.0:
-        return b + ((d4 - d3) / ((d4 - d3) + (d5 - d6))) * (c - b)
-
-    denom = 1.0 / (va + vb + vc)
-    return a + ab * (vb * denom) + ac * (vc * denom)
-
-
-def _closest_points_to_surface(query_points, triangles, k=24):
-    if len(triangles) == 0:
-        raise RuntimeError("Cannot build geometric frame: requested surface has no triangles")
-    centers = triangles.mean(axis=1)
-    tree = cKDTree(centers)
-    k_eff = min(k, len(triangles))
-    _, nearest = tree.query(query_points, k=k_eff)
-    if nearest.ndim == 1:
-        nearest = nearest[:, None]
-
-    closest = np.empty_like(query_points)
-    distances = np.empty(len(query_points), dtype=float)
-    for i, point in enumerate(query_points):
-        best_point = None
-        best_d2 = np.inf
-        for tri_idx in nearest[i]:
-            candidate = _closest_point_on_triangle(point, triangles[int(tri_idx)])
-            d2 = float(np.dot(point - candidate, point - candidate))
-            if d2 < best_d2:
-                best_d2 = d2
-                best_point = candidate
-        closest[i] = best_point
-        distances[i] = best_d2 ** 0.5
-    return closest, distances
 
 
 def _normalize_rows(values):
@@ -1130,15 +1108,21 @@ for _current_beat_idx in beats_to_process:
     p_LV_prev = 0.0
     p_RV_prev = 0.0
 
+    # In preload-only Frank-Starling mode, freeze g(λ) at ED before the loop.
+    if FS_PRELOAD_ONLY:
+        if rank == 0:
+            logger.info(f"Freezing Frank-Starling multiplier at ED (t={timestamps[0]:.4f}s)...")
+        adios4dolfinx.read_function(checkpoint_path, problem.u, time=timestamps[0], name="displacement")
+        active_model.freeze_at(problem.u)
+
     for i in range(start_step, end_step):
         t = timestamps[i]
 
         # Load displacement
         adios4dolfinx.read_function(checkpoint_path, problem.u, time=t, name="displacement")
 
-        # Set active tension
-        Ta.assign(Ta_history[i])
-        cardiac_model.active.activation.value.x.array[:] = Ta.value.x.array[:]
+        # Set active tension (scalar; legacy [N,3] histories collapse to mean).
+        Ta.assign(float(np.mean(np.atleast_1d(Ta_history[i]))))
 
         # Interpolate state variables
         E_cur.interpolate(expr_E)
@@ -1205,6 +1189,13 @@ for _current_beat_idx in beats_to_process:
         E_prev.x.array[:] = E_cur.x.array[:]
         S_prev.interpolate(expr_S_total)
         has_previous = True
+
+        # Advance the relaxation (activation-lag) multiplier with the current
+        # displacement, after S_prev has captured g_state at this step — mirrors
+        # the forward sim so g_state follows the same trajectory. No-op unless
+        # relaxation mode.
+        if FS_RELAX_TAU_S > 0:
+            active_model.advance(_relax_dt)
 
         if rank == 0 and (i % 50 == 0 or i == end_step - 1):
             logger.info(f"  Step {i:04d}/{end_step} | t={t:.4f}s | cum_W_total={cum_w_total.sum():.4e}")
