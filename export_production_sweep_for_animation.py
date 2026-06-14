@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
-"""Export ED-deformed meshes for the production capped (L5, 5 mmHg cap)
-unloading sweep, packaged for local PyVista animation.
+"""Export ED-deformed meshes for the PAH pulmonary-windkessel sweep
+(``pah_pulmonary_20260609_prodsweep``), packaged for local PyVista animation.
 
-For each of the 16 sPAP cases in the canonical sweep:
-  results/sims/2026-05-10/capped_shared_l5_20260510_141015/sPAP*/
+Sweep layout::
 
-we read the displacement at t = 4.0 s (= start of the final beat = ED of the
-last cardiac cycle for 75 bpm, 6-beat runs), apply it to the per-case unloaded
-reference mesh, and attach every per-cell scalar already living in
-``per_cell_data.npz`` (last-beat integrated true work, decomposition, and
-P x epsilon proxies). Cells in ``per_cell_data.npz`` are in MPI-rank
-concatenation order, so we map them onto the serial DOLFINx cell ordering via
-KDTree on cell centroids (the centroids are also saved in the npz).
+    SWEEP_ROOT/<bundle>/<case>/
 
-Output layout (under paraview_exports/production_capped_sweep_ed/):
+where bundles are ``no_frank_starling``, ``frank_starling_preload``,
+``frank_starling_relax`` and cases are ``case0_rv25`` … ``case7_rv95``.
 
-    sweep.pvd                       ParaView/PyVista collection, severity as time
-    ed_meshes/sPAPxx_ed.vtu         ED-deformed volumetric mesh, all fields
-    ed_surfaces/sPAPxx_ed_surface.vtp   Outer surface extract (epi + endo), all fields
-    manifest.json                   Per-case metadata (severity, ED time, peak pressures, volumes)
-    global_ranges.json              Field min/max across the full sweep
+For each case we read the displacement at the start of the final beat (ED of
+the last cardiac cycle, derived from BPM / RR_INTERVAL saved in
+``simulation_params.json``), apply it to the per-case unloaded reference mesh,
+and attach every per-cell scalar already living in ``per_cell_data.npz``
+(last-beat integrated true work, decomposition, and P x epsilon proxies),
+together with J/m³ density variants.  Cells in ``per_cell_data.npz`` are in
+MPI-rank concatenation order, so we map them onto the serial DOLFINx cell
+ordering via KDTree on cell centroids (the centroids are also saved in the npz).
+
+Output layout (under ``DEFAULT_OUT/<bundle>/``)::
+
+    sweep.pvd                         ParaView/PyVista collection, RV sPAP as time
+    ed_meshes/<case>_ed.vtu           ED-deformed volumetric mesh, all fields
+    ed_surfaces/<case>_ed_surface.vtp Outer surface extract, all fields
+    manifest.json                     Per-case metadata
+    global_ranges.json                Field min/max across the full bundle
 """
 
 from __future__ import annotations
@@ -43,8 +48,17 @@ from scipy.spatial import cKDTree
 import paths
 SWEEP_ROOT = paths.RESULTS_ROOT / "sims/2026-06-09/pah_pulmonary_20260609_prodsweep"
 DEFAULT_OUT = paths.REPO_ROOT / "paraview_exports/pah_pulmonary_ed"
-SEVERITIES = [22, 25, 30, 35, 45, 50, 55, 60, 65, 70, 75, 80, 85, 87, 92, 95]
-ED_TIME_S = 4.0  # start of 6th beat at 75 bpm
+
+CASES = [
+    "case0_rv25",
+    "case1_rv35",
+    "case2_rv45",
+    "case3_rv55",
+    "case4_rv65",
+    "case5_rv75",
+    "case6_rv85",
+    "case7_rv95",
+]
 
 # Fields we copy verbatim from per_cell_data.npz onto each VTU. Each entry is
 # (npz_key, vtu_name, kind) where kind = "work" (J), "proxy" (J), "geom" (other).
@@ -77,27 +91,67 @@ GEOM_FIELDS = [
 ]
 
 
+def ed_time_for(case_dir: Path) -> float:
+    """Start of the final beat in seconds, derived from simulation_params.json.
+
+    Derived as ``(n_beats - 1) * RR_INTERVAL`` where ``n_beats`` is inferred
+    from the length of the pressure history file divided by RR_INTERVAL.
+    Falls back to 75 BPM / 6 beats if keys are absent.
+    """
+    sp_path = case_dir / "simulation_params.json"
+    sp: dict = {}
+    if sp_path.exists():
+        sp = json.loads(sp_path.read_text())
+
+    bpm = float(sp.get("BPM", sp.get("bpm", 75)))
+    rr = float(sp.get("RR_INTERVAL", 60.0 / bpm))
+    dt = float(sp.get("dt", 0.001))
+
+    # Infer n_beats from the pressure-history file length
+    p_hist = case_dir / "solver" / "solver_cavity_pressure_mmHg.npy"
+    if p_hist.exists():
+        n_steps = np.load(p_hist, mmap_mode="r").shape[0]
+        total_time = n_steps * dt
+        n_beats = max(1, round(total_time / rr))
+    else:
+        n_beats = int(sp.get("BEATS", sp.get("beats", 6)))
+
+    return (n_beats - 1) * rr
+
+
+def _rv_peak_mmhg(case_dir: Path, n_beats: int = 6) -> float:
+    """Peak RV pressure (mmHg) over the last beat, for use as PVD timestep."""
+    p_hist = case_dir / "solver" / "solver_cavity_pressure_mmHg.npy"
+    if not p_hist.exists():
+        return float("nan")
+    ph = np.load(p_hist)
+    last_n = max(1, ph.shape[0] // n_beats)
+    return float(ph[-last_n:, 1].max())
+
+
 @dataclass(frozen=True)
 class Case:
-    severity: int
+    name: str        # e.g. "case3_rv55"
     result_dir: Path
-    label: str
+    label: str       # same as name
 
     @classmethod
-    def from_severity(cls, sev: int) -> "Case":
-        return cls(severity=sev,
-                   result_dir=SWEEP_ROOT / f"sPAP{sev}",
-                   label=f"sPAP{sev}")
+    def from_bundle_case(cls, bundle: str, case: str) -> "Case":
+        return cls(name=case,
+                   result_dir=SWEEP_ROOT / bundle / case,
+                   label=case)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUT)
-    parser.add_argument("--ed-time", type=float, default=ED_TIME_S,
-                        help="Target ED time in seconds (default 4.0 = start of final beat at 75 bpm).")
-    parser.add_argument("--severities", type=int, nargs="*", default=None,
-                        help="Subset of sPAP values to export. Default: all 16.")
+    parser.add_argument("--bundle", default="no_frank_starling",
+                        choices=["no_frank_starling",
+                                 "frank_starling_preload",
+                                 "frank_starling_relax"],
+                        help="Which bundle (sub-directory) to export (default: no_frank_starling).")
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUT,
+                        help="Root output directory; results go into <output-dir>/<bundle>/.")
     return parser.parse_args()
 
 
@@ -116,8 +170,14 @@ def case_metadata(case: Case, ed_time_actual: float) -> dict:
     peak_lv = peak_rv = float("nan")
     if p_history.exists():
         ph = np.load(p_history)
-        # last 800 steps = last beat at dt=0.001 / 75 bpm
-        last_beat = ph[-800:]
+        # last 1/n_beats fraction of steps = last beat
+        n_steps = ph.shape[0]
+        dt = float(params.get("dt", 0.001))
+        rr = float(params.get("RR_INTERVAL", 60.0 / float(params.get("BPM", 75))))
+        total_time = n_steps * dt
+        n_beats = max(1, round(total_time / rr))
+        last_n = max(1, n_steps // n_beats)
+        last_beat = ph[-last_n:]
         peak_lv = float(last_beat[:, 0].max())
         peak_rv = float(last_beat[:, 1].max())
     volume2ml = float(params.get("volume2ml", 1e6))
@@ -132,7 +192,7 @@ def case_metadata(case: Case, ed_time_actual: float) -> dict:
 
     return {
         "label": case.label,
-        "severity_sPAP": case.severity,
+        "case_name": case.name,
         "ed_time_s": ed_time_actual,
         "peak_p_LV_mmHg": peak_lv,
         "peak_p_RV_mmHg": peak_rv,
@@ -234,6 +294,15 @@ def read_case_grid(case: Case, target_time: float) -> tuple[pv.UnstructuredGrid,
             vals_J / cell_volumes_safe
         ).astype(np.float32)
 
+    # Extra proxy density fields not already covered by PER_CELL_J_FIELDS
+    for proxy_key in ("proxy_Mean_ll", "proxy_Sum_ll"):
+        if proxy_key in pcd.files:
+            vals_J = pcd[proxy_key][mesh_to_pcd].astype(np.float64)
+            grid.cell_data[f"{proxy_key}_J"] = vals_J.astype(np.float32)
+            grid.cell_data[f"{proxy_key}_density_Pa"] = (
+                vals_J / cell_volumes_safe
+            ).astype(np.float32)
+
     # Smart "combined" proxy:
     #   LV freewall (tag=1)  -> PLV * epsilon_ll  (adjacent pressure)
     #   RV freewall (tag=2)  -> PRV * epsilon_ll  (adjacent pressure)
@@ -254,10 +323,9 @@ def read_case_grid(case: Case, target_time: float) -> tuple[pv.UnstructuredGrid,
         combined_ff_J / cell_volumes_safe
     ).astype(np.float32)
 
-    # Field-data scalars (severity, peak pressures) -- baked into the file as
-    # length-1 arrays, accessible as field_data in PyVista.
+    # Field-data scalars (peak pressures etc.) -- baked in as length-1 arrays
     meta = case_metadata(case, actual_time)
-    for key in ("severity_sPAP", "ed_time_s", "peak_p_LV_mmHg", "peak_p_RV_mmHg",
+    for key in ("ed_time_s", "peak_p_LV_mmHg", "peak_p_RV_mmHg",
                 "rv_unloaded_mL", "rv_ed_mL", "lv_unloaded_mL", "lv_ed_mL"):
         val = meta.get(key, float("nan"))
         grid.field_data[key] = np.array([float(val)], dtype=np.float32)
@@ -295,34 +363,38 @@ def update_global_ranges(global_ranges: dict, grid: pv.UnstructuredGrid) -> None
 
 def main() -> None:
     args = parse_args()
-    out_dir = args.output_dir
+    bundle = args.bundle
+    out_dir = args.output_dir / bundle
     out_dir.mkdir(parents=True, exist_ok=True)
     vol_dir = out_dir / "ed_meshes"
     surf_dir = out_dir / "ed_surfaces"
     vol_dir.mkdir(exist_ok=True)
     surf_dir.mkdir(exist_ok=True)
 
-    severities = args.severities or SEVERITIES
     manifest: list[dict] = []
     pvd_entries: list[tuple[float, Path]] = []
     surf_entries: list[tuple[float, Path]] = []
     global_ranges: dict[str, list[float]] = {}
 
-    for sev in severities:
-        case = Case.from_severity(sev)
-        print(f"[{case.label}] reading {case.result_dir}")
-        grid, meta = read_case_grid(case, args.ed_time)
+    for case_name in CASES:
+        case = Case.from_bundle_case(bundle, case_name)
+        ed_time = ed_time_for(case.result_dir)
+        print(f"[{bundle}/{case.label}] reading {case.result_dir}  (ED={ed_time:.3f}s)")
+        grid, meta = read_case_grid(case, ed_time)
 
         vol_path = vol_dir / f"{case.label}_ed.vtu"
         grid.save(vol_path)
         print(f"  -> {vol_path}  ({grid.n_cells} cells, {grid.n_points} points)")
-        pvd_entries.append((float(case.severity), vol_path))
+
+        # Use RV peak pressure as the PVD "time" axis so the animation sweeps sPAP
+        pvd_time = float(meta.get("peak_p_RV_mmHg", float("nan")))
+        pvd_entries.append((pvd_time, vol_path))
 
         # Extract surface (epi + endo); inherits all cell/point data
         surface = grid.extract_surface(pass_pointid=False, pass_cellid=False)
         surf_path = surf_dir / f"{case.label}_ed_surface.vtp"
         surface.save(surf_path)
-        surf_entries.append((float(case.severity), surf_path))
+        surf_entries.append((pvd_time, surf_path))
 
         update_global_ranges(global_ranges, grid)
         manifest.append(meta)
