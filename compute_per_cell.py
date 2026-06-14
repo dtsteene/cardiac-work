@@ -1099,6 +1099,16 @@ for _current_beat_idx in beats_to_process:
     cum_proxy_PLV_circ = np.zeros(n)
     cum_proxy_PRV_circ = np.zeros(n)
     cum_proxy_Trans_circ = np.zeros(n)
+    # Mean = (P_LV+P_RV)/2 and Sum = P_LV+P_RV septum pressure variants
+    # (Sum = 2*Mean, but both kept so loops/scatter can be plotted directly).
+    cum_proxy_Mean_ff = np.zeros(n)
+    cum_proxy_Sum_ff = np.zeros(n)
+    cum_proxy_Mean_ll = np.zeros(n)
+    cum_proxy_Sum_ll = np.zeros(n)
+    cum_proxy_Mean_radial = np.zeros(n)
+    cum_proxy_Sum_radial = np.zeros(n)
+    cum_proxy_Mean_circ = np.zeros(n)
+    cum_proxy_Sum_circ = np.zeros(n)
 
     # Cell volumes (reuse the form_vol compiled above)
     cell_vols_vec = dolfinx.fem.assemble_vector(form_vol)
@@ -1152,6 +1162,8 @@ for _current_beat_idx in beats_to_process:
             p_LV, p_RV = get_pressure_at_step(i)
             p_LV_avg = 0.5 * (p_LV + p_LV_prev)
             p_RV_avg = 0.5 * (p_RV + p_RV_prev)
+            p_Mean_avg = 0.5 * (p_LV_avg + p_RV_avg)   # (P_LV+P_RV)/2
+            p_Sum_avg = p_LV_avg + p_RV_avg            # P_LV+P_RV
 
             deps_ff_vec = dolfinx.fem.assemble_vector(form_deps_ff)
             deps_ff_arr = deps_ff_vec.array[:n]
@@ -1159,6 +1171,8 @@ for _current_beat_idx in beats_to_process:
             cum_proxy_PLV_ff += p_LV_avg * deps_ff_arr
             cum_proxy_PRV_ff += p_RV_avg * deps_ff_arr
             cum_proxy_Trans_ff += (p_LV_avg - p_RV_avg) * deps_ff_arr
+            cum_proxy_Mean_ff += p_Mean_avg * deps_ff_arr
+            cum_proxy_Sum_ff += p_Sum_avg * deps_ff_arr
 
             if form_deps_ll is not None:
                 deps_ll_vec = dolfinx.fem.assemble_vector(form_deps_ll)
@@ -1166,6 +1180,8 @@ for _current_beat_idx in beats_to_process:
                 cum_proxy_PLV_ll += p_LV_avg * deps_ll_arr
                 cum_proxy_PRV_ll += p_RV_avg * deps_ll_arr
                 cum_proxy_Trans_ll += (p_LV_avg - p_RV_avg) * deps_ll_arr
+                cum_proxy_Mean_ll += p_Mean_avg * deps_ll_arr
+                cum_proxy_Sum_ll += p_Sum_avg * deps_ll_arr
 
             if form_deps_radial is not None:
                 deps_radial_vec = dolfinx.fem.assemble_vector(form_deps_radial)
@@ -1173,6 +1189,8 @@ for _current_beat_idx in beats_to_process:
                 cum_proxy_PLV_radial += p_LV_avg * deps_radial_arr
                 cum_proxy_PRV_radial += p_RV_avg * deps_radial_arr
                 cum_proxy_Trans_radial += (p_LV_avg - p_RV_avg) * deps_radial_arr
+                cum_proxy_Mean_radial += p_Mean_avg * deps_radial_arr
+                cum_proxy_Sum_radial += p_Sum_avg * deps_radial_arr
 
             if form_deps_circ is not None:
                 deps_circ_vec = dolfinx.fem.assemble_vector(form_deps_circ)
@@ -1180,6 +1198,8 @@ for _current_beat_idx in beats_to_process:
                 cum_proxy_PLV_circ += p_LV_avg * deps_circ_arr
                 cum_proxy_PRV_circ += p_RV_avg * deps_circ_arr
                 cum_proxy_Trans_circ += (p_LV_avg - p_RV_avg) * deps_circ_arr
+                cum_proxy_Mean_circ += p_Mean_avg * deps_circ_arr
+                cum_proxy_Sum_circ += p_Sum_avg * deps_circ_arr
 
             p_LV_prev, p_RV_prev = p_LV, p_RV
         else:
@@ -1357,6 +1377,14 @@ for _current_beat_idx in beats_to_process:
     g_proxy_PLV_circ = gather_to_root(cum_proxy_PLV_circ)
     g_proxy_PRV_circ = gather_to_root(cum_proxy_PRV_circ)
     g_proxy_Trans_circ = gather_to_root(cum_proxy_Trans_circ)
+    g_proxy_Mean_ff = gather_to_root(cum_proxy_Mean_ff)
+    g_proxy_Sum_ff = gather_to_root(cum_proxy_Sum_ff)
+    g_proxy_Mean_ll = gather_to_root(cum_proxy_Mean_ll)
+    g_proxy_Sum_ll = gather_to_root(cum_proxy_Sum_ll)
+    g_proxy_Mean_radial = gather_to_root(cum_proxy_Mean_radial)
+    g_proxy_Sum_radial = gather_to_root(cum_proxy_Sum_radial)
+    g_proxy_Mean_circ = gather_to_root(cum_proxy_Mean_circ)
+    g_proxy_Sum_circ = gather_to_root(cum_proxy_Sum_circ)
     g_radial_endo_to_epi = gather_to_root(_r_endo_epi_values)
     g_cell_volumes = gather_to_root(cell_volumes)
     g_centroids = gather_to_root(centroids)
@@ -1408,6 +1436,14 @@ for _current_beat_idx in beats_to_process:
                  proxy_PLV_circ=g_proxy_PLV_circ,
                  proxy_PRV_circ=g_proxy_PRV_circ,
                  proxy_Trans_circ=g_proxy_Trans_circ,
+                 proxy_Mean_ff=g_proxy_Mean_ff,
+                 proxy_Sum_ff=g_proxy_Sum_ff,
+                 proxy_Mean_ll=g_proxy_Mean_ll,
+                 proxy_Sum_ll=g_proxy_Sum_ll,
+                 proxy_Mean_radial=g_proxy_Mean_radial,
+                 proxy_Sum_radial=g_proxy_Sum_radial,
+                 proxy_Mean_circ=g_proxy_Mean_circ,
+                 proxy_Sum_circ=g_proxy_Sum_circ,
                  cell_volumes=g_cell_volumes,
                  centroids=g_centroids,
                  radial_endo_to_epi=g_radial_endo_to_epi,

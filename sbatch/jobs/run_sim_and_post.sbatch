@@ -166,6 +166,15 @@ if [ -n "$RESULTS_DIR_OVERRIDE" ]; then
     RESULTS_DIR="$RESULTS_DIR_OVERRIDE"
     RESULTS_BASE="$(dirname "$RESULTS_DIR")"
 fi
+# Resolve RESULTS_DIR to an ABSOLUTE path. The job changes cwd during the run
+# (scratch), so a relative RESULTS_DIR makes transfer_and_cleanup copy to the
+# wrong place and the post-process `cd` fail — silently losing the checkpoint
+# after scratch is cleaned. Anchor it to the submit dir.
+case "$RESULTS_DIR" in
+    /*) ;;
+    *) RESULTS_DIR="${SLURM_SUBMIT_DIR:-$SIM_DIR}/${RESULTS_DIR}" ;;
+esac
+RESULTS_BASE="$(dirname "$RESULTS_DIR")"
 LOG_DIR="${SIM_DIR}/results/log"
 
 mkdir -p ${RESULTS_BASE} ${LOG_DIR} ${RESULTS_DIR}

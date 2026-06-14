@@ -7,7 +7,7 @@ history to compute all work/stress/strain metrics without re-running the solver.
 
 Required files in results_dir:
   - solver/checkpoint.bp         (displacement at each timestep)
-  - solver/Ta_solver_history.npy (active tension per timestep: [N, 3] for [LV, Sep, RV])
+  - solver/Ta_solver_history.npy (uniform scalar active tension per timestep, shape [N])
   - simulation_params.json       (material params, BCs, activation settings)
   - geometry/geometry.bp         (mesh, facet tags, region markers)
   - circulation/history.npy      (pressure/volume from 0D model)
@@ -18,6 +18,7 @@ Usage:
 """
 
 import json
+import os
 import sys
 import logging
 from pathlib import Path
@@ -26,7 +27,6 @@ import numpy as np
 from mpi4py import MPI
 import dolfinx
 import ufl
-import scifem
 import adios4dolfinx
 import basix.ufl
 import pulse
@@ -378,14 +378,51 @@ for k, entry in mat_params_raw.items():
 
 material = pulse.HolzapfelOgden(f0=f0_quad, s0=s0_quad, **material_params)
 
-# Active stress model (markers_mt loaded from checkpoint.bp above)
-V_Ta = scifem.create_space_of_simple_functions(
-    mesh=mesh,
-    cell_tag=markers_mt,
-    tags=[1, 2, 3]
+# Uniform scalar active tension. Frank-Starling re-creates the per-cell
+# modulation from local fiber stretch on replay, matching the forward sim.
+# The simulation-side mode (instantaneous vs preload-only) is taken from
+# simulation_params.json if present, else from FS_PRELOAD_ONLY env var, else
+# defaults to instantaneous.
+_fs_meta = sim_params.get("frank_starling", {}) if isinstance(sim_params, dict) else {}
+_fs_meta_mode = str(_fs_meta.get("mode", "")).lower()
+# Whether the forward sim used Frank-Starling at all. Default True for back-
+# compatibility with older runs that lack the key (they were all FS).
+USE_FRANK_STARLING = bool(_fs_meta.get("enabled", True))
+# Relaxation (activation-lag) tau from metadata; >0 selects relaxation mode.
+FS_RELAX_TAU_S = float(_fs_meta.get("relaxation_tau_s", 0.0) or 0.0)
+if _fs_meta_mode in ("preload_only", "instantaneous", "relaxation"):
+    FS_PRELOAD_ONLY = (_fs_meta_mode == "preload_only")
+else:
+    FS_PRELOAD_ONLY = os.environ.get("FS_PRELOAD_ONLY", "0") == "1"
+if not USE_FRANK_STARLING:
+    FS_PRELOAD_ONLY = False
+    FS_RELAX_TAU_S = 0.0
+
+def _fs_mode_kwargs():
+    if FS_RELAX_TAU_S > 0:
+        return {"relaxation_tau": FS_RELAX_TAU_S}
+    if FS_PRELOAD_ONLY:
+        return {"preload_only": True}
+    return {}
+
+if rank == 0:
+    _mode = ("off (constant Ta)" if not USE_FRANK_STARLING
+             else f"relaxation (tau={FS_RELAX_TAU_S*1000:.0f}ms)" if FS_RELAX_TAU_S > 0
+             else "preload_only" if FS_PRELOAD_ONLY else "instantaneous")
+    logger.info(f"Active model for replay: {_mode}")
+Ta = pulse.Variable(
+    dolfinx.fem.Constant(mesh, dolfinx.default_scalar_type(0.0)),
+    "kPa",
 )
-Ta = pulse.Variable(dolfinx.fem.Function(V_Ta), "kPa")
-active_model = pulse.ActiveStress(f0_quad, activation=Ta)
+if USE_FRANK_STARLING:
+    active_model = pulse.FrankStarlingActiveStress(
+        f0=f0_quad, activation=Ta,
+        **_fs_mode_kwargs(),
+    )
+else:
+    # no-FS bundle: replay must use the same plain constant-Ta active stress
+    # the forward sim used, or the recomputed S:dE work would be wrong.
+    active_model = pulse.ActiveStress(f0_quad, activation=Ta)
 
 # Compressibility
 if sim_params["incompressible"]:
@@ -455,6 +492,11 @@ problem = pulse.problem.StaticProblem(
     cavities=cavities,
     parameters={"mesh_unit": sim_params["mesh_unit"], "u_space": "P_2"},
 )
+
+if USE_FRANK_STARLING:
+    # Hand FrankStarlingActiveStress the displacement so g(lambda) is consistent
+    # with the forward sim during the replay. (Plain ActiveStress has no register.)
+    active_model.register(problem.u)
 
 if rank == 0:
     logger.info("Problem reconstructed (material + BCs + cavities)")
@@ -623,8 +665,16 @@ fiber_fields_map = {
     'c0': None,
 }
 
-# Use the same model for metrics (shares material/compressibility instances)
-active_metrics = pulse.ActiveStress(f0_quad, activation=Ta)
+# Use the same active model as the forward sim so the recomputed stress is
+# consistent. Shares material/compressibility instances.
+if USE_FRANK_STARLING:
+    active_metrics = pulse.FrankStarlingActiveStress(
+        f0=f0_quad, activation=Ta,
+        **_fs_mode_kwargs(),
+    )
+    active_metrics.register(problem.u)
+else:
+    active_metrics = pulse.ActiveStress(f0_quad, activation=Ta)
 metrics_model = pulse.CardiacModel(
     material=cardiac_model.material,
     active=active_metrics,
@@ -777,6 +827,15 @@ if rank == 0:
 
 n_steps = len(timestamps)
 
+# Timestep for the relaxation update on replay (same dt as the forward sim).
+_relax_dt = float(sim_params.get("dt", 0.001))
+if FS_RELAX_TAU_S > 0 and _args.last_beat and rank == 0:
+    logger.warning(
+        "relaxation mode + --last-beat: g_state starts un-converged at the "
+        "last-beat boundary instead of being warmed up over earlier beats. "
+        "Run the full history (no --last-beat) for a faithful relaxation replay."
+    )
+
 # Verify Ta history length matches
 if len(Ta_history) != n_steps:
     if rank == 0:
@@ -795,6 +854,18 @@ if _args.last_beat:
         logger.info(f"--last-beat: skipping to step {start_step}/{n_steps} "
                     f"(t={timestamps[start_step]:.4f}s, last beat of {timestamps[-1]/cycle_length:.0f})")
 
+# In preload-only Frank-Starling mode, snapshot g(λ) at the end-diastolic
+# configuration before the replay loop. ED = first stored timestep
+# (timestamps[0], written immediately after the forward sim's inflation
+# ramp). The frozen displacement must be set before any stress evaluation so
+# the multiplier matches the forward sim's preload-fixed g(lambda).
+if FS_PRELOAD_ONLY:
+    if rank == 0:
+        logger.info(f"Freezing Frank-Starling multiplier at ED (t={timestamps[0]:.4f}s)...")
+    adios4dolfinx.read_function(checkpoint_path, problem.u, time=timestamps[0], name="displacement")
+    active_model.freeze_at(problem.u)
+    active_metrics.freeze_at(problem.u)
+
 for i in range(start_step, n_steps):
     t = timestamps[i]
 
@@ -807,10 +878,11 @@ for i in range(start_step, n_steps):
         logger.debug(f"  [{i}] Displacement loaded. Setting Ta...")
         sys.stderr.flush()
 
-    # 2. Set active tension from saved history
-    Ta.assign(Ta_history[i])
-    # Sync to metrics model
-    metrics_model.active.activation.value.x.array[:] = Ta.value.x.array[:]
+    # 2. Set active tension from saved history (scalar).
+    # Legacy [N,3] region-aware histories collapse to their mean — the new
+    # FrankStarlingActiveStress derives per-cell variation from stretch, not Ta.
+    Ta.assign(float(np.mean(np.atleast_1d(Ta_history[i]))))
+    # metrics_model.active shares the same Ta Variable, so no sync needed.
 
     # 3. Get circulation state at this time
     current_state = get_state_at_time(t, step_idx=i)
@@ -834,18 +906,25 @@ for i in range(start_step, n_steps):
 
     # Enrich with state info
     region_metrics.update(current_state)
-    region_metrics["Ta_Solver"] = float(np.max(Ta_history[i]))
+    region_metrics["Ta_Solver"] = float(np.mean(np.atleast_1d(Ta_history[i])))
 
     # Store using relative index so arrays start at 0
     metrics_calc.store_metrics(region_metrics, i - start_step, t, downsample_factor=1)
     metrics_calc.update_state()
+
+    # Advance the relaxation (activation-lag) multiplier using the just-loaded
+    # displacement, mirroring the forward sim's per-timestep update so g_state
+    # follows the same trajectory on replay. No-op unless relaxation mode.
+    if FS_RELAX_TAU_S > 0:
+        active_model.advance(_relax_dt)
+        active_metrics.advance(_relax_dt)
 
     # Progress
     if rank == 0 and (i % 10 == 0 or i == n_steps - 1):
         w_lv = region_metrics.get("work_true_LV", 0.0)
         e_ff = region_metrics.get("mean_E_ff_LV", 0.0)
         p_lv = current_state["p_LV"]
-        ta_max = float(np.max(Ta_history[i]))
+        ta_max = float(np.mean(np.atleast_1d(Ta_history[i])))
         logger.info(f"  Step {i:04d}/{n_steps} | t={t:.3f} | Ta={ta_max:.1f} | "
                     f"p_LV={p_lv:.1f}mmHg | E_ff={e_ff:.3f} | W_LV={w_lv:.2e}")
 

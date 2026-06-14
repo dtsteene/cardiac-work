@@ -36,6 +36,12 @@ export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 export MPICH_HYDRA_LAUNCHER=fork
 
+# Per-job FFCx JIT cache on node-local scratch. Without this, many concurrent
+# postprocess jobs compile into the shared ~/.cache/fenics at once and race,
+# causing "Failed just-in-time compilation of form". Mirrors run_sim_and_post.
+export XDG_CACHE_HOME="/work/${USER}/postproc_${SLURM_JOB_ID}/.cache"
+mkdir -p "${XDG_CACHE_HOME}"
+
 cd ${RESULTS_DIR}
 
 echo "=== Postprocessing: ${RESULTS_DIR} ==="

@@ -651,7 +651,8 @@ class MetricsCalculator:
         data = {}
 
         try:
-            data["debug_Ta_internal_max"] = np.max(self.cardiac_model.active.activation.value.x.array)
+            # Ta is a uniform scalar Constant under the FrankStarlingActiveStress model.
+            data["debug_Ta_internal_max"] = float(self.cardiac_model.active.activation.value.value)
         except Exception:
             data["debug_Ta_internal_max"] = 0.0
         # debug_S_active_max reads the S_active tensor function, which is only
@@ -876,6 +877,8 @@ class MetricsCalculator:
                 data[f"work_ps_{suffix}_{region}_Trans"] = ((p_LV_avg - p_RV_avg) * dE) * vol
                 data[f"work_ps_{suffix}_{region}_PLV"] = (p_LV_avg * dE) * vol
                 data[f"work_ps_{suffix}_{region}_PRV"] = (p_RV_avg * dE) * vol
+                data[f"work_ps_{suffix}_{region}_Mean"] = (0.5 * (p_LV_avg + p_RV_avg) * dE) * vol
+                data[f"work_ps_{suffix}_{region}_Sum"] = ((p_LV_avg + p_RV_avg) * dE) * vol
                 self._eps_prev[f"{strain_key}_{region}"] = eps
 
         # Keep legacy attributes in sync
@@ -1216,6 +1219,8 @@ class MetricsCalculator:
                     metrics[f"work_ps_{suffix}_{region}_Trans"] = 0.0
                     metrics[f"work_ps_{suffix}_{region}_PLV"] = 0.0
                     metrics[f"work_ps_{suffix}_{region}_PRV"] = 0.0
+                    metrics[f"work_ps_{suffix}_{region}_Mean"] = 0.0
+                    metrics[f"work_ps_{suffix}_{region}_Sum"] = 0.0
             
             #exact work keys
             metrics["work_boundary_exact_LV"] = 0.0

@@ -1,7 +1,9 @@
-# # Complete Multiscale Simulation with Prestressing (Hybrid Version)
+# # Complete Multiscale Simulation with Prestressing
 #
-# This script combines the improved active tension implementation (scifem/spatially varying)
-# with robust MPI handling and logging suitable for compute clusters.
+# Uniform spatial active tension (single Constant) combined with
+# pulse.FrankStarlingActiveStress so the active force ramps with local
+# fiber stretch — the Frank-Starling mechanism. Robust MPI handling and
+# logging suitable for compute clusters.
 
 import json
 import os
@@ -12,7 +14,6 @@ import shutil
 from pathlib import Path
 
 # Scientific and FEniCSx imports
-import scifem
 from mpi4py import MPI
 import numpy as np
 import matplotlib.pyplot as plt
@@ -295,8 +296,6 @@ comm.barrier()
 
 circulation.log.setup_logging(logging.INFO)
 logger = logging.getLogger("pulse")
-scifem_logger = logging.getLogger("scifem")
-scifem_logger.setLevel(logging.WARNING)
 
 mpi_filter = MPIFilter(comm)
 logger.addFilter(mpi_filter)
@@ -452,6 +451,16 @@ def get_updated_parameters():
         params["chambers"][chamber]["tC"] = 0.0 * circulation.units.ureg("s")
         params["chambers"][chamber]["TC"] = TC_ACTIVATION * circulation.units.ureg("s")
         params["chambers"][chamber]["TR"] = TR_ACTIVATION * circulation.units.ureg("s")
+
+    # NOTE on atrial timing: the uniform shift above leaves atrial tC ≈ RR
+    # (≡0 mod RR), so the atrial a-wave lands during early ventricular systole
+    # rather than late diastole. We deliberately do NOT re-time it: an
+    # explicitly late-diastolic kick adds ~16 mL of extra preload that over-
+    # fills the LV past its imaged end-diastolic geometry (EDV 112→128 vs mesh
+    # ~113). Since passive filling already reaches the imaged ED, the imaged ED
+    # already embodies the in-vivo atrial contribution. The mis-timed a-wave is
+    # therefore a cosmetic LA-pressure-trace artifact only; EDV/SV/EF and the
+    # ventricular work (the proxy target) are unaffected. Documented caveat.
 
     # Update HR
     params["HR"] = circulation.units.ureg(f"{HR_HZ} Hz")
@@ -671,11 +680,76 @@ if comm.rank == 0:
     logger.info(f"  Relaxation:      {tc_shifted + TC_ACTIVATION:.4f} → {tc_shifted + TC_ACTIVATION + TR_ACTIVATION:.4f} s")
     logger.info(f"  Rest (Filling):  {tc_shifted + TC_ACTIVATION + TR_ACTIVATION:.4f} → {RR_INTERVAL:.4f} s")
 
+# Peak active tension (kPa) at the activation curve's plateau. The default
+# 100 kPa was tuned for the no-Frank-Starling sweep; with the static F-L
+# multiplier active the cycle-average effective Ta is ~half, so set
+# TA_PEAK_KPA=200 to recover the original effective amplitude.
+TA_PEAK_KPA = float(os.environ.get("TA_PEAK_KPA", 100.0))
+
+# Frank-Starling mode for the forward problem:
+#   FS_PRELOAD_ONLY=1  →  freeze g(λ) at end-diastole; multiplier held fixed
+#                         through the rest of the beat (preload-dependent F-S,
+#                         the operational definition at the whole-heart level)
+#   FS_PRELOAD_ONLY=0  →  live g(λ) recomputed on every Newton step
+#                         (instantaneous static length-tension)
+FS_PRELOAD_ONLY = os.environ.get("FS_PRELOAD_ONLY", "0") == "1"
+
+# Master switch for the active-contraction model in the FORWARD solve:
+#   USE_FRANK_STARLING=1 (default) -> pulse.FrankStarlingActiveStress, live g(λ)
+#                                     (set TA_PEAK_KPA=200 to compensate the ~0.5
+#                                      cycle-average multiplier)
+#   USE_FRANK_STARLING=0           -> plain pulse.ActiveStress, constant Ta
+#                                     (the thesis / no-Frank-Starling bundle)
+# Inverse unloading is always passive (Ta=0), so this never affects the prestress.
+USE_FRANK_STARLING = os.environ.get("USE_FRANK_STARLING", "1") == "1"
+if not USE_FRANK_STARLING:
+    # preload-only freezing only makes sense for the F-S multiplier
+    FS_PRELOAD_ONLY = False
+
+# Activation-lag (relaxation) Frank-Starling: if FS_RELAX_TAU_MS>0, g(λ) is a
+# stored field that relaxes toward the instantaneous target with time constant
+# tau, advanced once per timestep. Keeps force from collapsing as fibers
+# shorten (the "momentum" the instantaneous mode lacks). Takes precedence over
+# FS_PRELOAD_ONLY. tau->0 ≈ instantaneous, tau->inf ≈ preload-frozen.
+FS_RELAX_TAU_S = float(os.environ.get("FS_RELAX_TAU_MS", "0")) / 1000.0
+if not USE_FRANK_STARLING:
+    FS_RELAX_TAU_S = 0.0
+
+def _fs_mode_kwargs():
+    """Active-model kwargs selecting the Frank-Starling mode (relaxation >
+    preload-only > instantaneous)."""
+    if FS_RELAX_TAU_S > 0:
+        return {"relaxation_tau": FS_RELAX_TAU_S}
+    if FS_PRELOAD_ONLY:
+        return {"preload_only": True}
+    return {}
+
+# Frank-Starling g(lambda) curve shape. Defaults reproduce the original curve
+# (g=0.5 at lambda=1.0), which throttles force to ~50-70% at the operating
+# stretch and forces unphysiologically high Ta. Re-centre via env (e.g.
+# FS_STRETCH_OPTIMAL≈1.05) so peak force sits near the end-diastolic stretch →
+# physiological force at literature Ta, while preserving preload-dependence at
+# shorter (under-filled) lengths.
+FS_AMP_MIN = float(os.environ.get("FS_AMP_MIN", "0.0"))
+FS_AMP_MAX = float(os.environ.get("FS_AMP_MAX", "1.0"))
+FS_STRETCH_THRESHOLD = float(os.environ.get("FS_STRETCH_THRESHOLD", "0.85"))
+FS_STRETCH_OPTIMAL = float(os.environ.get("FS_STRETCH_OPTIMAL", "1.15"))
+
+def _fs_curve_kwargs():
+    """g(lambda) shape kwargs (only meaningful for Frank-Starling modes)."""
+    return {"amp_min": FS_AMP_MIN, "amp_max": FS_AMP_MAX,
+            "stretch_threshold": FS_STRETCH_THRESHOLD, "stretch_optimal": FS_STRETCH_OPTIMAL}
+
+
 def get_activation(t):
     """
-    Returns spatially-varying active tension [LV, Septum, RV] scaled appropriately.
+    Returns the uniform scalar active tension in kPa at time t.
+
+    Spatial uniformity is intentional: any per-region modulation comes from
+    the Frank-Starling stretch factor in pulse.FrankStarlingActiveStress,
+    not from a region-dependent Ta. Peak amplitude is set by the
+    TA_PEAK_KPA environment variable (default 100).
     """
-    # Use the configured activation parameters based on BPM
     value = circulation.time_varying_elastance.blanco_ventricle(
         EA=1.0,
         EB=0.0,
@@ -684,8 +758,7 @@ def get_activation(t):
         TR=TR_ACTIVATION,
         RR=RR_INTERVAL,
     )(t)
-    # V1 Logic: Return array for spatially varying tension
-    return np.array([100 * value, 100 * value, 100 * value])
+    return TA_PEAK_KPA * value
 
 if comm.rank == 0:
     fig, ax = plt.subplots(figsize=(12, 5))
@@ -713,7 +786,7 @@ if comm.rank == 0:
     plt.close(fig)
 
 
-# --- Setup Problem (From V1: Uses Scifem and markers_mt) ---
+# --- Setup Problem (uniform scalar Ta + Frank-Starling) ---
 
 def setup_problem(
     geometry,
@@ -724,23 +797,31 @@ def setup_problem(
     alpha_base_val=1e6,
     incompressible=False,
     base_dirichlet="x",
+    use_frank_starling=True,
 ):
     material = pulse.HolzapfelOgden(f0=f0, s0=s0, **material_params)
 
-    # Use scifem to create simple function space based on markers_mt
-    # markers_mt was saved in additional_data in geometry step
-    markers_mt = geo.additional_data["markers_mt"]
-
-    # Create function space for active tension
-    V_Ta = scifem.create_space_of_simple_functions(
-        mesh=geo.mesh,
-        cell_tag=markers_mt,
-        tags=[1, 2, 3] # Tags for LV, RV, Septum (check LDRB output for specific indices)
+    # Single uniform scalar activation. Per-region modulation comes from the
+    # Frank-Starling stretch factor below, not from a region-dependent Ta.
+    Ta = pulse.Variable(
+        dolfinx.fem.Constant(geometry.mesh, dolfinx.default_scalar_type(0.0)),
+        "kPa",
     )
+    if use_frank_starling:
+        # Frank-Starling: multiplies Ta by a piecewise-linear g(lambda) of
+        # fiber stretch. .register(u) must be called once problem.u exists.
+        # In preload-only mode the multiplier is a Function set once by
+        # freeze_at(u_ED) and held constant through the rest of the beat.
+        active_model = pulse.FrankStarlingActiveStress(
+            f0=f0, activation=Ta,
+            **_fs_mode_kwargs(), **_fs_curve_kwargs(),
+        )
+    else:
+        # Plain active stress for inverse unloading: Ta is identically 0 there
+        # so the active term contributes nothing regardless of FS multiplier,
+        # but FS would raise ValueError without a registered displacement.
+        active_model = pulse.ActiveStress(f0=f0, activation=Ta)
 
-    Ta = pulse.Variable(dolfinx.fem.Function(V_Ta), "kPa")
-    active_model = pulse.ActiveStress(f0, activation=Ta)
-    
     if incompressible:
         comp_model = pulse.compressibility.Incompressible()
         if comm.rank == 0:
@@ -810,7 +891,7 @@ def setup_problem(
     else:
         dirichlet_bcs = (dirichlet_bc,)
 
-    return model, robin, dirichlet_bcs, Ta
+    return model, robin, dirichlet_bcs, Ta, active_model
 
 
 def apply_region_material_scales(material_params, markers_mt, lv_scale=1.0, rv_scale=1.0, septum_scale=1.0):
@@ -857,11 +938,15 @@ material_params = apply_region_material_scales(
 )
 if comm.rank == 0 and any(not np.isclose(v, 1.0) for v in material_region_scales.values()):
     logger.info(f"Regional material scaling enabled: {material_region_scales}")
-# Use Compressible for Prestressing always (Hybrid Strategy)
-model, robin, dirichlet_bcs, Ta = setup_problem(
+# Use Compressible for Prestressing always (Hybrid Strategy). Skip Frank-
+# Starling here: PrestressProblem doesn't expose a forward displacement to
+# register, and Ta is zero throughout unloading so the active term is zero
+# regardless.
+model, robin, dirichlet_bcs, Ta, _active_unused = setup_problem(
     geometry=geometry, f0=geo.f0, s0=geo.s0, material_params=material_params,
     alpha_epi_val=args.alpha_epi, alpha_base_val=args.alpha_base,
     incompressible=False, base_dirichlet=args.base_dirichlet,
+    use_frank_starling=False,
 )
 
 # --- Prestressing (Inverse Elasticity) ---
@@ -1070,7 +1155,23 @@ def build_simulation_params(stage, dt_value=0.001):
             "TC": TC_ACTIVATION,
             "TR": TR_ACTIVATION,
             "tC": tC_ACTIVATION,
-            "peak_kPa": 100.0,
+            "peak_kPa": TA_PEAK_KPA,
+        },
+        "frank_starling": {
+            "enabled": USE_FRANK_STARLING,
+            "mode": (
+                "off_constant_Ta" if not USE_FRANK_STARLING
+                else "relaxation" if FS_RELAX_TAU_S > 0
+                else "preload_only" if FS_PRELOAD_ONLY
+                else "instantaneous"
+            ),
+            "relaxation_tau_s": FS_RELAX_TAU_S,
+            "amp_min": FS_AMP_MIN, "amp_max": FS_AMP_MAX,
+            "stretch_threshold": FS_STRETCH_THRESHOLD, "stretch_optimal": FS_STRETCH_OPTIMAL,
+            "amp_min": 0.0,
+            "amp_max": 1.0,
+            "stretch_threshold": 0.85,
+            "stretch_optimal": 1.15,
         },
         "ratio_LV": ratio_LV,
         "ratio_RV": ratio_RV,
@@ -1110,10 +1211,11 @@ if args.stop_after_unloading:
 if args.incompressible:
     logger.info("Warning: Hybrid Prestressing Strategy Active (Compressible Unloading -> Incompressible Forward)")
 
-model, robin, dirichlet_bcs, Ta = setup_problem(
+model, robin, dirichlet_bcs, Ta, active_model = setup_problem(
     geometry=geometry, f0=f0_quad, s0=s0_quad, material_params=material_params,
     alpha_epi_val=args.alpha_epi, alpha_base_val=args.alpha_base,
     incompressible=args.incompressible, base_dirichlet=args.base_dirichlet,
+    use_frank_starling=USE_FRANK_STARLING,
 )
 
 lv_volume = dolfinx.fem.Constant(geometry.mesh, dolfinx.default_scalar_type(lvv_unloaded))
@@ -1139,9 +1241,14 @@ problem = pulse.problem.StaticProblem(
 # Extract Displacement for Post-Processing
 if args.incompressible:
     # In mixed space, problem.u returns the displacement sub-function
-    u_disp = problem.u 
+    u_disp = problem.u
 else:
     u_disp = problem.u
+
+# Hand FrankStarlingActiveStress the displacement so g(lambda) can evaluate.
+# Plain ActiveStress (no-FS) has no register() and needs no displacement.
+if USE_FRANK_STARLING:
+    active_model.register(u_disp)
 
 # Setup Stress/Strain Post-processing - kinematics
 # FIXED: Use full CardiacModel (material + compressibility) instead of material only
@@ -1158,7 +1265,14 @@ f_map = (F * f0_map) / ufl.sqrt(ufl.inner(F * f0_map, F * f0_map))
 # sampled into the DG1 output space. Offline work/stress metrics still use the
 # quadrature-fiber CardiacModel reconstructed from the checkpoint.
 material_viz = pulse.HolzapfelOgden(f0=f0_map, s0=s0_map, **material_params)
-active_viz = pulse.ActiveStress(f0_map, activation=Ta)
+if USE_FRANK_STARLING:
+    active_viz = pulse.FrankStarlingActiveStress(
+        f0=f0_map, activation=Ta,
+        **_fs_mode_kwargs(), **_fs_curve_kwargs(),
+    )
+    active_viz.register(u_disp)
+else:
+    active_viz = pulse.ActiveStress(f0_map, activation=Ta)
 if args.incompressible:
     comp_viz = pulse.compressibility.Incompressible()
     comp_viz.register(problem.p)
@@ -1183,7 +1297,7 @@ vtx_u = dolfinx.io.VTXWriter(geometry.mesh.comm, viz_dir / "displacement.bp", [u
 vtx_p = None
 if args.incompressible:
     vtx_p = dolfinx.io.VTXWriter(geometry.mesh.comm, viz_dir / "pressure.bp", [problem.p], engine="BP4")
-vtx_stress = dolfinx.io.VTXWriter(geometry.mesh.comm, viz_dir / "stress_strain.bp", [fiber_stress, fiber_strain, Ta.value], engine="BP4")
+vtx_stress = dolfinx.io.VTXWriter(geometry.mesh.comm, viz_dir / "stress_strain.bp", [fiber_stress, fiber_strain], engine="BP4")
 
 # --- Inflation (Reference -> End-Diastole) ---
 
@@ -1208,8 +1322,18 @@ if not RESTART_MODE:
         vtx_p.write(0.0)
     vtx_stress.write(0.0)
 
-    # Store old values (handling Array for Ta due to scifem/V1)
-    problem.old_Ta = Ta.value.x.array.copy()
+    # In preload-only Frank-Starling mode, freeze g(λ) at the end-diastolic
+    # configuration we just inflated to. Both the forward solver's active
+    # model and the visualization active model share Ta but are separate
+    # FS instances and must each be frozen.
+    if FS_PRELOAD_ONLY:
+        active_model.freeze_at(u_disp)
+        active_viz.freeze_at(u_disp)
+        if comm.rank == 0:
+            logger.info("Frank-Starling multiplier frozen at end-diastole (preload-only mode)")
+
+    # Store old values (scalar Ta is just a float).
+    problem.old_Ta = float(Ta.value.value)
     problem.old_lv_volume = lv_volume.value.copy()
     problem.old_rv_volume = rv_volume.value.copy()
 else:
@@ -1232,25 +1356,34 @@ else:
         if comm.rank == 0:
             logger.info(f"Inflation Step {i + 1}/{ramp_steps}: pLV={plv:.2f} kPa, pRV={prv:.2f} kPa")
 
-    problem.old_Ta = Ta.value.x.array.copy()
+    # Restart path also needs freeze_at(u_ED) before any active-stress ramp.
+    if FS_PRELOAD_ONLY:
+        active_model.freeze_at(u_disp)
+        active_viz.freeze_at(u_disp)
+        if comm.rank == 0:
+            logger.info("RESTART: Frank-Starling multiplier frozen at end-diastole (preload-only mode)")
+
+    problem.old_Ta = float(Ta.value.value)
     problem.old_lv_volume = lv_volume.value.copy()
     problem.old_rv_volume = rv_volume.value.copy()
 
     # Now ramp from ED to the restart state (volumes + activation)
     restart_lv_target = (last_V_LV_0D * ratio_LV) / volume2ml
     restart_rv_target = (last_V_RV_0D * ratio_RV) / volume2ml
-    restart_Ta_target = old_Ta_solver_history[-1]
+    # Old solver Ta history may be either [N,3] (legacy region-aware) or [N]
+    # (uniform); collapse to a scalar either way.
+    restart_Ta_target = float(np.mean(np.atleast_1d(old_Ta_solver_history[-1])))
     ed_lv = lv_volume.value.copy()
     ed_rv = rv_volume.value.copy()
-    ed_Ta = Ta.value.x.array.copy()
+    ed_Ta = float(Ta.value.value)
 
     # Only ramp if the restart state differs from ED
     vol_diff = abs(restart_lv_target - ed_lv) * volume2ml
-    ta_diff = np.max(np.abs(restart_Ta_target - ed_Ta))
+    ta_diff = abs(restart_Ta_target - ed_Ta)
     if vol_diff > 0.01 or ta_diff > 0.01:  # > 0.01 mL or 0.01 kPa
         n_ramp = int(args.restart_ramp_steps)
         logger.info(f"RESTART: Ramping from ED to restart state ({n_ramp} steps, "
-                     f"dV_LV={vol_diff:.2f}mL, dTa_max={ta_diff:.1f}kPa)...")
+                     f"dV_LV={vol_diff:.2f}mL, dTa={ta_diff:.1f}kPa)...")
         for ri in range(n_ramp):
             frac = (ri + 1) / n_ramp
             lv_volume.value = ed_lv + frac * (restart_lv_target - ed_lv)
@@ -1259,9 +1392,9 @@ else:
             problem.solve()
         problem.old_lv_volume = lv_volume.value.copy()
         problem.old_rv_volume = rv_volume.value.copy()
-        problem.old_Ta = Ta.value.x.array.copy()
+        problem.old_Ta = float(Ta.value.value)
         logger.info(f"RESTART: Ramp complete. V_LV={lv_volume.value*volume2ml:.2f}mL, "
-                     f"Ta_max={np.max(Ta.value.x.array):.1f}")
+                     f"Ta={float(Ta.value.value):.1f}")
     else:
         logger.info("RESTART: State at ED matches restart state, no ramp needed")
 
@@ -1292,13 +1425,13 @@ def p_BiV_func(V_LV, V_RV, t):
     tol = 1e-12
 
     # Skip FEM solve entirely if nothing changed (e.g. rest phase)
-    if abs(dLV) > tol or abs(dRV) > tol or np.max(np.abs(dTa)) > tol:
+    if abs(dLV) > tol or abs(dRV) > tol or abs(dTa) > tol:
 
         # Iteration tracking: these advance as sub-steps succeed,
         # giving us a "checkpoint" to reset to on failure
         old_lv_it = old_lv_volume.copy()
         old_rv_it = old_rv_volume.copy()
-        old_Ta_it = old_Ta.copy()
+        old_Ta_it = float(old_Ta)
 
         converged = False
         num_failures = 0
@@ -1336,7 +1469,7 @@ def p_BiV_func(V_LV, V_RV, t):
                     converged = True
                     old_lv_it = lv_volume.value.copy()
                     old_rv_it = rv_volume.value.copy()
-                    old_Ta_it = Ta.value.x.array.copy()
+                    old_Ta_it = float(Ta.value.value)
 
             # All sub-steps succeeded, we're done
             if converged:
@@ -1357,13 +1490,13 @@ def p_BiV_func(V_LV, V_RV, t):
             msg = (
                 f"Failed to converge after {num_failures} attempts. "
                 f"LV: {new_value_LV}, RV: {new_value_RV}, "
-                f"Ta remaining: {np.max(np.abs(new_value_Ta - old_Ta_it)):.4f}"
+                f"Ta remaining: {abs(new_value_Ta - old_Ta_it):.4f}"
             )
             logger.error(msg)
             raise RuntimeError(msg)
 
     # --- Save state for next coupling call ---
-    problem.old_Ta = Ta.value.x.array.copy()
+    problem.old_Ta = float(Ta.value.value)
     problem.old_lv_volume = lv_volume.value.copy()
     problem.old_rv_volume = rv_volume.value.copy()
 
@@ -1433,13 +1566,13 @@ def callback(model, i: int, t: float, save=True):
     # Apply time offset for restart continuations
     t_abs = t + restart_time_offset
 
-    # 1. Record activation for postprocessing
-    raw_activation_vec = get_activation(t)
-    Ta_history.append(raw_activation_vec)
+    # 1. Record activation for postprocessing (scalar Ta).
+    Ta_history.append(float(get_activation(t)))
 
-    # Also record the actual solver Ta (may differ slightly due to substep convergence)
-    solver_ta_array = Ta.value.x.array[:]
-    Ta_solver_history.append(solver_ta_array.copy())
+    # Also record the actual solver Ta (may differ from get_activation by the
+    # substep convergence residual).
+    solver_ta_value = float(Ta.value.value)
+    Ta_solver_history.append(solver_ta_value)
 
     # Record solver cavity pressures (the Lagrange multiplier — exact surface traction).
     # These are the pressures actually applied to the FEM boundary, NOT the 0D ODE
@@ -1449,13 +1582,18 @@ def callback(model, i: int, t: float, save=True):
     rv_p_Pa = float(problem.cavity_pressures[1].x.array[0])
     pressure_history.append([lv_p_Pa * 1e-3 / 0.133322, rv_p_Pa * 1e-3 / 0.133322])  # Pa -> mmHg
 
-    max_ta_solver = np.max(solver_ta_array)
+    # 1b. Advance the relaxation (activation-lag) Frank-Starling multiplier by
+    # one timestep using the just-converged displacement (explicit update).
+    # Once per accepted step; no-op unless relaxation mode is active.
+    if FS_RELAX_TAU_S > 0:
+        active_model.advance(dt)
+        active_viz.advance(dt)
 
     # 2. Console Feedback (lightweight — no metrics computation)
     if comm.rank == 0 and (i % 10 == 0 or CI_MODE):
         lv_p_kPa = problem.cavity_pressures[0].x.array[0] * 1e-3
         v_lv_ml = float(lv_volume.value * volume2ml)
-        print(f"STEP {i:04d} | t={t_abs:.3f} | Ta={max_ta_solver:.1f} | V_LV={v_lv_ml:.1f}mL")
+        print(f"STEP {i:04d} | t={t_abs:.3f} | Ta={solver_ta_value:.1f} | V_LV={v_lv_ml:.1f}mL")
 
     # 3. Save checkpoint data (displacement only — all metrics computed offline)
     if save:
@@ -1532,7 +1670,8 @@ finally:
     if comm.rank == 0:
         logger.info("Saving simulation checkpoint data for offline postprocessing...")
         try:
-            # Save Ta history: [N_timesteps, 3] array with [LV, Septum, RV] activation (kPa)
+            # Save Ta history: [N_timesteps] scalar array (kPa).
+            # Spatial uniformity is intentional — see get_activation() docstring.
             np.save(solver_dir / "Ta_history.npy", np.array(Ta_history))
             np.save(solver_dir / "Ta_solver_history.npy", np.array(Ta_solver_history))
             np.save(solver_dir / "solver_cavity_pressure_mmHg.npy", np.array(pressure_history))

@@ -1,0 +1,151 @@
+{
+  "description": "PAH pulmonary sweep case2: RVsys~45 mmHg target; PUL R_AR=0.237 C_AR=1.39 (RC=0.33s, conserved); on baseline_linear_v2 (shared 8/5 unloaded ref).",
+  "mesh_volumes_mL": {
+    "LV_EDV": 111.46,
+    "RV_EDV": 76.83
+  },
+  "severity": "sPAP22",
+  "bsa_m2": 1.75,
+  "edpvr_model": "exponential_klotz",
+  "pressure_targets": {
+    "RV_ESP": 22.0,
+    "RV_EDP": 5.0,
+    "LV_ESP": 120.0,
+    "LV_EDP": 8.0,
+    "Ao_DBP": 80.0,
+    "LA_P_MEAN": 8.0
+  },
+  "physiology_guardrails": {
+    "LV_EF_floor": 0.55,
+    "RV_EF_target": 0.65,
+    "CI_target": 2.75
+  },
+  "metrics_achieved": {
+    "LV_ESP": 120.72086391046072,
+    "LV_EDP": 6.000593836187327,
+    "SV": 64.48723217175635,
+    "RV_ESP": 26.90311734538954,
+    "RV_EDP": 5.248030779436675,
+    "Ao_DBP": 81.58425236664294,
+    "LA_P_MEAN": 8.159754027557794,
+    "RV_EDV": 79.04015992407133,
+    "LV_EDV": 113.22759716079145
+  },
+  "derived_hemodynamics": {
+    "LV_EF_pct": 56.95363479292047,
+    "RV_EF_pct": 76.31384894945509,
+    "CO_Lpm": 4.836542412881726,
+    "CI_Lpm_m2": 2.7637385216467005,
+    "RV_SV": 60.31858825386353
+  },
+  "parameters": {
+    "HR": 1.25,
+    "chambers": {
+      "LA": {
+        "EA": 0.02682176131348717,
+        "EB": 0.016833264971731456,
+        "TC": 0.17,
+        "TR": 0.17,
+        "tC": 0.9,
+        "V0": 4.0
+      },
+      "LV": {
+        "EA": 4.762265222994446,
+        "EB": 0.09147254537452593,
+        "TC": 0.20976698905499078,
+        "TR": 0.3177253735923454,
+        "tC": 0.1,
+        "V0": 24.042064209050533
+      },
+      "RA": {
+        "EA": 0.06,
+        "EB": 0.07,
+        "TC": 0.17,
+        "TR": 0.17,
+        "tC": 0.9,
+        "V0": 4.0
+      },
+      "RV": {
+        "EA": 1.8363849555691583,
+        "EB": 0.0783301455010624,
+        "TC": 0.3454297841151852,
+        "TR": 0.4406644745660575,
+        "tC": 0.1,
+        "V0": 13.06761506038331
+      }
+    },
+    "valves": {
+      "MV": {
+        "Rmin": 0.001367472690807744,
+        "Rmax": 75006.2
+      },
+      "AV": {
+        "Rmin": 0.0075,
+        "Rmax": 75006.2
+      },
+      "TV": {
+        "Rmin": 0.0075,
+        "Rmax": 75006.2
+      },
+      "PV": {
+        "Rmin": 0.0075,
+        "Rmax": 75006.2
+      }
+    },
+    "circulation": {
+      "SYS": {
+        "R_AR": 0.8179281509877434,
+        "C_AR": 1.361117154982466,
+        "R_VEN": 0.32,
+        "C_VEN": 91.71268837223514,
+        "L_AR": 0.005,
+        "L_VEN": 0.0005
+      },
+      "PUL": {
+        "R_AR": 0.237,
+        "C_AR": 1.394,
+        "R_VEN": 0.010624051514867712,
+        "C_VEN": 6.437906223740119,
+        "L_AR": 0.0005,
+        "L_VEN": 0.0005
+      },
+      "external": {
+        "start_withdrawal": 0.0,
+        "end_withdrawal": 0.0,
+        "start_infusion": 0.0,
+        "end_infusion": 0.0,
+        "flow_withdrawal": 0.0,
+        "flow_infusion": 0.0
+      }
+    }
+  },
+  "initial_state": {
+    "V_LA": 87.183,
+    "V_LV": 118.52,
+    "V_RA": 86.833,
+    "V_RV": 166.177,
+    "p_AR_SYS": 87.675,
+    "p_VEN_SYS": 36.24087859010897,
+    "p_AR_PUL": 19.545,
+    "p_VEN_PUL": 15.004,
+    "Q_AR_SYS": 71.104,
+    "Q_VEN_SYS": 94.039,
+    "Q_AR_PUL": 94.084,
+    "Q_VEN_PUL": 473.279
+  },
+  "edpvr": "linear",
+  "refit_EB_mmHg_per_mL": {
+    "LV": 0.09147254537452593,
+    "RV": 0.0783301455010624
+  },
+  "mesh_ed_targets": {
+    "LV": {
+      "EDV": 111.5,
+      "EDP": 8.0
+    },
+    "RV": {
+      "EDV": 76.9,
+      "EDP": 5.0
+    }
+  }
+}

@@ -12,6 +12,44 @@ This is the simulation code for the MSc thesis
 Element Study* (Daniel Steeneveldt, University of Oslo). The thesis
 itself lives at [github.com/dtsteene/RV](https://github.com/dtsteene/RV).
 
+## Start here
+
+The job: run biventricular heart simulations and ask whether clinical
+pressure-strain proxies actually track the true mechanical work of the
+myocardium. We compute ground-truth work `∫ S:dE` from the stress/strain
+tensors and compare it against proxy work `∮ P dε`, region by region
+(LV free wall, RV free wall, septum).
+
+Simulation and analysis are **decoupled**: `complete_cycle.py` saves
+displacement checkpoints, and everything downstream replays them — so changing
+a metric means rerunning postprocessing, never re-simulating.
+
+```
+complete_cycle.py ─▶ compute_per_cell.py ─▶ postprocess_metrics.py ─▶ analysis_core.py ─▶ sweep_analysis.py
+  FEM + 0D solver     per-cell S, E, work      regional metrics          per-region stats     cross-sim
+  → checkpoint.bp     → per_cell_data.npz      → metrics_*.npy           (proxy, ratio,        correlation
+                                                                          correlation, area)   + ratio
+```
+
+**If you read three files:** `complete_cycle.py` (the solver),
+`analysis_core.py` (the reusable per-region statistics), and
+`sweep_analysis.py` (the headline result — does the proxy follow the truth
+*across* simulations).
+
+## How do I…?
+
+| I want to… | Where |
+|---|---|
+| Run one simulation + postprocessing | `sbatch sbatch/jobs/run_sim_and_post.sbatch` |
+| Add or change a work / strain metric | `metrics_calculator.py` (FEM), then rerun postprocessing |
+| Add or change a proxy statistic (correlation, ratio, density) | `analysis_core.py` (+ `tests/test_analysis_core.py`) |
+| Swap which pressure the septum proxy uses | `analysis_core.pressure_candidates` (PLV / PRV / transmural / mean / …) |
+| Get the headline cross-simulation result | `sweep_analysis.py` → `results/analysis/sweep/sweep_*.csv` |
+| Sanity-check one sim's proxy loop areas | `eval_proxies.py` |
+| Toggle Frank-Starling activation | `USE_FRANK_STARLING` env var (`1`=on default, `0`=constant Ta) |
+| Tune the 0D circulation parameters | `pah_pulmonary_batch/` |
+| Run the fast unit tests (no FEniCSx, login-node safe) | `python3 tests/test_analysis_core.py && python3 tests/test_geometry_utils.py` |
+
 ## Layout
 
 ```
@@ -37,7 +75,7 @@ cardiac-work/
 │                                       ratios, correlations, log-MAE (see tests/test_analysis_core.py)
 ├── sweep_analysis.py                   cross-sim sweep: proxy↔truth correlation + ratio across sims
 ├── run_postprocessing.py               beat-slice orchestrator (calls eval_proxies + plot_loops)
-├── eval_proxies.py                     proxy R² / error tables per sim
+├── eval_proxies.py                     per-sim proxy loop-area + ratio check
 ├── plot_loops.py                       PV / PS / SS debug loops
 ├── plot_utils.py                       shared matplotlib utilities
 │
@@ -45,17 +83,6 @@ cardiac-work/
 ├── export_static_geometry_tags.py      ch. 2 mesh / fiber / tag panels
 ├── export_unloading_cap_paraview.py    fig_unloaded_cap_grid, fig_ed_cap_grid
 └── export_production_sweep_for_animation.py   time-series field export for animations
-```
-
-## Pipeline
-
-Simulation and analysis are decoupled — change a metric, rerun
-postprocessing, no re-simulation needed.
-
-```
-complete_cycle.py  →  compute_per_cell.py  →  postprocess_metrics.py  →  analysis_core.py
-  (FEM + 0D solver)    (per-cell work/proxies)   (regional metrics)        (stats: ratios,
-                                                                            correlations, proxy)
 ```
 
 ## Analysis core
@@ -184,6 +211,17 @@ production sweep is reproducible from
 — it lists every case name and the exact env-var settings used.
 
 ## Tests
+
+The analysis layer has fast, pure-NumPy unit tests that need no FEniCSx and run
+on the login node (the `analysis_core` suite also checks equivalence against the
+original thesis numbers):
+
+```bash
+python3 tests/test_analysis_core.py     # per-region stats: correlation, ratio, proxy, density
+python3 tests/test_geometry_utils.py    # point-to-surface geometry primitives
+```
+
+FEM-dependent checks (run inside the FEniCSx env / a SLURM allocation):
 
 ```bash
 python3 tests/test_syntax.py                          # file-level syntax sanity

@@ -37,3 +37,17 @@ paraview_exports/
 
 # Local FEniCS/JIT caches
 .fenics-cache*/
+
+# PAH batch: large unloaded-reference simulation data + transient 0D diagnostics
+# and exploratory circulation-parameter probes (canonical baseline_linear_v2 +
+# case*_rv*.json are tracked; the rest are reproducible scratch).
+pah_pulmonary_batch/shared_unloaded_*/
+pah_pulmonary_batch/*_diag.json
+pah_pulmonary_batch/baseline_compare_0d.json
+pah_pulmonary_batch/sweep_summary_0d.json
+pah_pulmonary_batch/sweep_manifest.json
+pah_pulmonary_batch/circ_params/_archive_oldbaseline/
+pah_pulmonary_batch/circ_params/pulcal_*.json
+pah_pulmonary_batch/circ_params/remap_*.json
+pah_pulmonary_batch/circ_params/ext_*.json
+pah_pulmonary_batch/circ_params/baseline_linear.json
