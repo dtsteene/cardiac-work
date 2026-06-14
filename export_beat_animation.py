@@ -12,26 +12,29 @@ Output layout::
     <output_dir>/<bundle>/<case>/step_NNN.vtu   one deformed mesh per timestep
     <output_dir>/<bundle>/<case>/beat.pvd        PVD collection (timestep = beat phase)
 
-Usage (single case, development)::
+Usage::
 
     python export_beat_animation.py --bundle no_frank_starling --cases case0_rv25
 
-Usage (MPI, production)::
-
-    mpirun -n 8 -launcher fork python export_beat_animation.py \\
-        --bundle no_frank_starling
-
 Design
 ------
-Per-cell DG0 assembly (the expensive part) runs in parallel across all MPI ranks.
-VTU writing is handled entirely on rank 0 via a lightweight serial mesh loaded
-once with ``COMM_SELF``; the per-cell arrays are gathered from all ranks before
-each write. This avoids the complexity of parallel VTU DOF ownership.
+This exporter runs **serially** (single rank, COMM_SELF). Running serial removes
+the cell-ordering problem at the root: the DG0 per-cell assembly vectors are in
+the serial DOLFINx cell order, which is exactly the same order as the pyvista
+``UnstructuredGrid`` built from that same serial mesh. So per-cell density fields
+are assigned to ``grid.cell_data`` directly — no MPI gather, no KDTree mapping.
+The workload is light (2 cases x ~600 cheap timesteps), so serial is fine.
 
-compute_per_cell.py was refactored to guard its script body inside ``_main()``
-so that ``import compute_per_cell`` is now instantaneous (no replay on import).
-This exporter does NOT import compute_per_cell — it independently reconstructs
-the minimal subset of forms needed for the animation.
+The longitudinal proxy strain uses the saved LDRB apex direction ``l0`` projected
+into the wall tangent plane via ``clinical_frame.tangent_project_longitudinal``
+(the same safe, |v|-guarded normalization compute_per_cell.py uses), rather than a
+raw ``l0 / sqrt(inner(l0, l0))`` that could divide by zero.
+
+compute_per_cell.py was refactored to guard its script body inside ``_main()`` so
+that ``import compute_per_cell`` is instantaneous (no replay on import). This
+exporter does NOT import compute_per_cell — it independently reconstructs the
+minimal subset of forms needed for the animation, but reuses the shared helpers
+in clinical_frame.py for the longitudinal direction.
 """
 
 from __future__ import annotations
@@ -118,64 +121,18 @@ def write_pvd(pvd_path: Path, entries: list[tuple[float, Path]]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# VTU writer (rank 0 only, serial mesh)
-# ---------------------------------------------------------------------------
-
-def _build_serial_vtk_mesh(checkpoint_path: Path):
-    """Load mesh serially on rank 0 for VTU construction.
-
-    Returns ``(topology, cell_types, points_ref, W1_serial, u1_serial,
-    mesh_serial)`` where ``W1_serial`` / ``u1_serial`` are a serial P1
-    function space and function for reading displacement at each timestep.
-    """
-    import dolfinx
-    import dolfinx.fem
-    import dolfinx.plot
-    import adios4dolfinx
-    import pyvista as pv
-
-    mesh_serial = adios4dolfinx.read_mesh(checkpoint_path, MPI.COMM_SELF)
-    topology, cell_types, points_ref = dolfinx.plot.vtk_mesh(
-        mesh_serial, mesh_serial.topology.dim
-    )
-    cell_types = np.full_like(cell_types, pv.CellType.TETRA, dtype=np.uint8)
-
-    # P2 → P1 interpolation space (same as export_production_sweep_for_animation.py)
-    W2_s = dolfinx.fem.functionspace(mesh_serial, ("P", 2, (3,)))
-    W1_s = dolfinx.fem.functionspace(mesh_serial, ("P", 1, (3,)))
-    u2_s = dolfinx.fem.Function(W2_s)
-    u1_s = dolfinx.fem.Function(W1_s)
-
-    return topology, cell_types, points_ref, W2_s, W1_s, u2_s, u1_s, mesh_serial
-
-
-def _read_serial_displacement(
-    checkpoint_path: Path,
-    t: float,
-    u2_s,
-    u1_s,
-) -> np.ndarray:
-    """Read displacement at time ``t`` into serial P1 function; return (N,3) array."""
-    import adios4dolfinx
-
-    adios4dolfinx.read_function(
-        checkpoint_path, u2_s, time=t, name="displacement"
-    )
-    u1_s.interpolate(u2_s)
-    return u1_s.x.array.reshape((-1, 3)).copy()
-
-
-# ---------------------------------------------------------------------------
-# Per-case beat replay
+# Per-case beat replay (serial)
 # ---------------------------------------------------------------------------
 
 def export_case_beat(
     results_dir: Path,
     case_out_dir: Path,
-    comm: MPI.Comm,
     logger: logging.Logger,
 ) -> None:
     """Replay the last beat of one simulation case and write step_NNN.vtu + beat.pvd.
+
+    Runs serially on ``MPI.COMM_SELF`` — the DG0 per-cell assembly order matches
+    the pyvista grid cell order, so density fields are assigned directly.
 
     Parameters
     ----------
@@ -185,13 +142,9 @@ def export_case_beat(
         simulation_params.json, and geometry/).
     case_out_dir:
         Directory where step_NNN.vtu files and beat.pvd will be written.
-    comm:
-        MPI communicator.
     logger:
         Caller's logger instance.
     """
-    rank = comm.rank
-
     # ── Heavy imports (deferred so CLI parsing is fast) ─────────────────────
     import dolfinx
     import dolfinx.fem
@@ -204,6 +157,14 @@ def export_case_beat(
     import cardiac_geometries
     import cardiac_geometries.geometry
     import pyvista as pv
+
+    from clinical_frame import (
+        build_radial_endo_to_epi_dg0,
+        tangent_project_longitudinal,
+    )
+
+    # Serial communicator — single rank, no partitioning.
+    comm = MPI.COMM_SELF
 
     MMHG_TO_PA = 133.322
 
@@ -226,10 +187,9 @@ def export_case_beat(
     cycle_length = 60.0 / bpm
     steps_per_beat = int(round(cycle_length / dt))
 
-    if rank == 0:
-        logger.info(f"  BPM={bpm}, dt={dt}, steps_per_beat={steps_per_beat}")
+    logger.info(f"  BPM={bpm}, dt={dt}, steps_per_beat={steps_per_beat}")
 
-    # ── Load mesh + fibers from checkpoint (parallel) ───────────────────────
+    # ── Load mesh + fibers from checkpoint (serial) ─────────────────────────
     mesh = adios4dolfinx.read_mesh(checkpoint_path, comm)
     ffun = adios4dolfinx.read_meshtags(checkpoint_path, mesh, meshtag_name="ffun")
 
@@ -248,11 +208,9 @@ def export_case_beat(
     try:
         l0_quad = dolfinx.fem.Function(Q_vec)
         adios4dolfinx.read_function(checkpoint_path, l0_quad, time=0.0, name="l0")
-        if rank == 0:
-            logger.info("  l0 loaded for longitudinal proxy")
+        logger.info("  l0 loaded for longitudinal proxy")
     except Exception:
-        if rank == 0:
-            logger.warning("  l0 not found — proxy_PLV_ll will be zero")
+        logger.warning("  l0 not found — proxy_PLV_ll will be zero")
 
     # ── Reconstruct pulse problem (mirrors compute_per_cell.py) ─────────────
     geo_dir = results_dir / "geometry"
@@ -370,8 +328,7 @@ def export_case_beat(
     if USE_FRANK_STARLING:
         active_model.register(problem.u)
 
-    if rank == 0:
-        logger.info("  Problem reconstructed")
+    logger.info("  Problem reconstructed")
 
     # ── DG0 forms for per-cell work and proxy ───────────────────────────────
     u = problem.u
@@ -406,13 +363,19 @@ def export_case_beat(
     form_w_total = dolfinx.fem.form(wd_total * v_dg0 * dx_q)
 
     # Proxy: P_LV * d(epsilon_ll) — longitudinal Green-Lagrange strain increment.
+    # Build a SAFE unit longitudinal direction via clinical_frame's helpers (the
+    # same projection compute_per_cell.py uses), which guard against |l0| ~ 0.
     # If l0 is unavailable, form_deps_ll stays None and cum_ps stays zero.
     form_deps_ll = None
     if l0_quad is not None:
-        l0_norm = ufl.sqrt(ufl.inner(l0_quad, l0_quad))
-        l0_unit = l0_quad / l0_norm
+        radial_dg0, _radial_values = build_radial_endo_to_epi_dg0(
+            mesh, ffun, geometry_obj.markers, comm
+        )
+        # tangent_project_longitudinal returns a |v|-guarded unit UFL vector
+        l0_unit = tangent_project_longitudinal(l0_quad, radial_dg0)
         deps_ll = ufl.inner(ufl.dot(dE, l0_unit), l0_unit)
         form_deps_ll = dolfinx.fem.form(deps_ll * v_dg0 * dx_q)
+        logger.info("  Longitudinal proxy direction built (tangent-projected, guarded)")
 
     # Cell volumes (assembled once; time-independent in Lagrangian frame)
     form_vol = dolfinx.fem.form(
@@ -420,13 +383,12 @@ def export_case_beat(
     )
     cell_vols_vec = dolfinx.fem.assemble_vector(form_vol)
     imap_3 = mesh.topology.index_map(3)
-    n_local = imap_3.size_local
-    cell_volumes = cell_vols_vec.array[:n_local].copy()
+    n_cells = imap_3.size_local  # serial: size_local == total cell count
+    cell_volumes = cell_vols_vec.array[:n_cells].copy()
     # guard divide-by-zero with np.nan (as specified)
     cell_volumes_safe = np.where(cell_volumes > 0, cell_volumes, np.nan)
 
-    if rank == 0:
-        logger.info("  DG0 forms compiled")
+    logger.info(f"  DG0 forms compiled ({n_cells} cells)")
 
     # ── Determine last beat timestep slice ───────────────────────────────────
     timestamps = adios4dolfinx.read_timestamps(checkpoint_path, comm, "displacement")
@@ -437,29 +399,26 @@ def export_case_beat(
     beat_steps = list(range(start_step, end_step))
     n_beat_steps = len(beat_steps)
 
-    if rank == 0:
-        logger.info(
-            f"  Replaying beat {n_beats - 1}: steps {start_step}–{end_step - 1} "
-            f"({n_beat_steps} steps, "
-            f"t={timestamps[start_step]:.4f}–{timestamps[end_step - 1]:.4f}s)"
-        )
+    logger.info(
+        f"  Replaying beat {n_beats - 1}: steps {start_step}–{end_step - 1} "
+        f"({n_beat_steps} steps, "
+        f"t={timestamps[start_step]:.4f}–{timestamps[end_step - 1]:.4f}s)"
+    )
 
-    # ── Serial mesh on rank 0 for VTU deformed-mesh writing ─────────────────
-    # Each step, rank 0 reads displacement via COMM_SELF to build the pyvista
-    # grid. This avoids the complexity of gathering partitioned P1 DOF arrays
-    # across MPI ranks (shared DOFs at partition boundaries).
-    if rank == 0:
-        (
-            topology_vtk, cell_types_vtk, points_ref,
-            _u2_s, _W1_s, _u2_s_fn, _u1_s_fn, _mesh_s,
-        ) = _build_serial_vtk_mesh(checkpoint_path)
-        logger.info(
-            f"  Serial VTK mesh: {_mesh_s.geometry.x.shape[0]} nodes, "
-            f"{topology_vtk.shape[0]} cells"
-        )
-    else:
-        topology_vtk = cell_types_vtk = points_ref = None
-        _u2_s_fn = _u1_s_fn = None
+    # ── pyvista grid scaffolding (built once from the serial mesh) ──────────
+    # vtk_mesh cell order == serial DOLFINx cell order == DG0 assembly order.
+    topology_vtk, cell_types_vtk, points_ref = dolfinx.plot.vtk_mesh(
+        mesh, mesh.topology.dim
+    )
+    cell_types_vtk = np.full_like(cell_types_vtk, pv.CellType.TETRA, dtype=np.uint8)
+
+    # P2 -> P1 interpolation for clean deformed-mesh vertices
+    W1 = dolfinx.fem.functionspace(mesh, ("P", 1, (3,)))
+    u1 = dolfinx.fem.Function(W1)
+
+    logger.info(
+        f"  VTK grid: {points_ref.shape[0]} nodes, {topology_vtk.shape[0]} cells"
+    )
 
     # ── Preload Frank-Starling at ED if needed ───────────────────────────────
     if FS_PRELOAD_ONLY:
@@ -470,12 +429,11 @@ def export_case_beat(
         active_model.freeze_at(problem.u)
 
     # ── Output directory ─────────────────────────────────────────────────────
-    if rank == 0:
-        case_out_dir.mkdir(parents=True, exist_ok=True)
+    case_out_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Replay loop ──────────────────────────────────────────────────────────
-    cum_w = np.zeros(n_local)   # J per cell (true internal work), local partition
-    cum_ps = np.zeros(n_local)  # J per cell (P_LV * d_eps_ll proxy), local partition
+    cum_w = np.zeros(n_cells)   # J per cell (true internal work), serial order
+    cum_ps = np.zeros(n_cells)  # J per cell (P_LV * d_eps_ll proxy), serial order
     has_previous = False
     p_LV_prev = 0.0
 
@@ -484,7 +442,7 @@ def export_case_beat(
     for beat_idx, global_step in enumerate(beat_steps):
         t = float(timestamps[global_step])
 
-        # Load displacement into the parallel problem (P2 field for mechanics)
+        # Load displacement (P2 field for mechanics)
         adios4dolfinx.read_function(
             checkpoint_path, problem.u, time=t, name="displacement"
         )
@@ -496,7 +454,7 @@ def export_case_beat(
         if has_previous:
             # Accumulate true work increment (trapezoidal, via DG0 form)
             w_vec = dolfinx.fem.assemble_vector(form_w_total)
-            cum_w += w_vec.array[:n_local]
+            cum_w += w_vec.array[:n_cells]
 
             # Accumulate proxy increment: P_LV_avg * deps_ll per cell
             p_LV = float(solver_cavity_pressure_mmHg[global_step, 0]) * MMHG_TO_PA
@@ -504,7 +462,7 @@ def export_case_beat(
 
             if form_deps_ll is not None:
                 deps_ll_vec = dolfinx.fem.assemble_vector(form_deps_ll)
-                cum_ps += p_LV_avg * deps_ll_vec.array[:n_local]
+                cum_ps += p_LV_avg * deps_ll_vec.array[:n_cells]
 
             p_LV_prev = p_LV
         else:
@@ -520,52 +478,41 @@ def export_case_beat(
         if USE_FRANK_STARLING and FS_RELAX_TAU_S > 0:
             active_model.advance(dt)
 
-        # ── Gather per-cell arrays to rank 0 ────────────────────────────────
-        gathered_w = comm.gather(np.ascontiguousarray(cum_w), root=0)
-        gathered_ps = comm.gather(np.ascontiguousarray(cum_ps), root=0)
-        gathered_vols = comm.gather(np.ascontiguousarray(cell_volumes_safe), root=0)
+        # ── Build deformed grid and write VTU ───────────────────────────────
+        # Per-cell densities (Pa = J / m³); guard with np.nan for zero-volume cells.
+        cum_work_density_Pa = cum_w / cell_volumes_safe
+        cum_ps_density_Pa = cum_ps / cell_volumes_safe
 
-        # ── Write VTU on rank 0 ──────────────────────────────────────────────
-        if rank == 0:
-            g_w = np.concatenate(gathered_w)
-            g_ps = np.concatenate(gathered_ps)
-            g_vols = np.concatenate(gathered_vols)
+        u1.interpolate(problem.u)
+        u_vec = u1.x.array.reshape((-1, 3)).copy()
 
-            # Per-cell densities (Pa = J / m³); guard with np.nan for zero-volume cells
-            cum_work_density_Pa = g_w / g_vols
-            cum_ps_density_Pa = g_ps / g_vols
+        grid = pv.UnstructuredGrid(
+            topology_vtk, cell_types_vtk, points_ref + u_vec
+        )
+        # Serial cell order matches DG0 assembly order — direct assignment.
+        grid.cell_data["cum_work_density_Pa"] = cum_work_density_Pa.astype(np.float32)
+        grid.cell_data["cum_ps_density_Pa"] = cum_ps_density_Pa.astype(np.float32)
+        grid.field_data["beat_step"] = np.array([beat_idx], dtype=np.int32)
+        grid.field_data["beat_time_s"] = np.array([t], dtype=np.float64)
 
-            # Load displacement serially for deformed mesh vertices
-            u_s = _read_serial_displacement(checkpoint_path, t, _u2_s_fn, _u1_s_fn)
+        vtu_name = f"step_{beat_idx:03d}.vtu"
+        vtu_path = case_out_dir / vtu_name
+        grid.save(vtu_path)
 
-            # Build deformed pyvista grid
-            grid = pv.UnstructuredGrid(
-                topology_vtk, cell_types_vtk, points_ref + u_s
+        # Beat phase ∈ [0, 1] as PVD timestep
+        beat_phase = float(beat_idx) / max(1, n_beat_steps - 1)
+        pvd_entries.append((beat_phase, vtu_path))
+
+        if beat_idx % 50 == 0 or beat_idx == n_beat_steps - 1:
+            logger.info(
+                f"  step {beat_idx:03d}/{n_beat_steps} | t={t:.4f}s | "
+                f"cum_W_sum={cum_w.sum():.4e} J"
             )
-            grid.cell_data["cum_work_density_Pa"] = cum_work_density_Pa.astype(np.float32)
-            grid.cell_data["cum_ps_density_Pa"] = cum_ps_density_Pa.astype(np.float32)
-            grid.field_data["beat_step"] = np.array([beat_idx], dtype=np.int32)
-            grid.field_data["beat_time_s"] = np.array([t], dtype=np.float64)
 
-            vtu_name = f"step_{beat_idx:03d}.vtu"
-            vtu_path = case_out_dir / vtu_name
-            grid.save(vtu_path)
-
-            # Beat phase ∈ [0, 1] as PVD timestep
-            beat_phase = float(beat_idx) / max(1, n_beat_steps - 1)
-            pvd_entries.append((beat_phase, vtu_path))
-
-            if beat_idx % 50 == 0 or beat_idx == n_beat_steps - 1:
-                logger.info(
-                    f"  step {beat_idx:03d}/{n_beat_steps} | t={t:.4f}s | "
-                    f"cum_W_sum={g_w.sum():.4e} J"
-                )
-
-    # Write PVD on rank 0
-    if rank == 0:
-        pvd_path = case_out_dir / "beat.pvd"
-        write_pvd(pvd_path, pvd_entries)
-        logger.info(f"  Wrote {len(pvd_entries)} VTU files + {pvd_path}")
+    # Write PVD
+    pvd_path = case_out_dir / "beat.pvd"
+    write_pvd(pvd_path, pvd_entries)
+    logger.info(f"  Wrote {len(pvd_entries)} VTU files + {pvd_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -574,11 +521,9 @@ def export_case_beat(
 
 def main() -> None:
     args = parse_args()
-    comm = MPI.COMM_WORLD
-    rank = comm.rank
 
     logging.basicConfig(
-        level=logging.INFO if rank == 0 else logging.WARNING,
+        level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
     logger = logging.getLogger("beat_anim")
@@ -588,30 +533,26 @@ def main() -> None:
     sweep_root = args.sweep
     out_dir = args.output_dir
 
-    if rank == 0:
-        logger.info(f"export_beat_animation: bundle={bundle}, cases={cases}")
-        logger.info(f"  sweep root: {sweep_root}")
-        logger.info(f"  output dir: {out_dir}")
+    logger.info(f"export_beat_animation (serial): bundle={bundle}, cases={cases}")
+    logger.info(f"  sweep root: {sweep_root}")
+    logger.info(f"  output dir: {out_dir}")
 
     for case_name in cases:
         results_dir = sweep_root / bundle / case_name
         case_out_dir = out_dir / bundle / case_name
 
-        if rank == 0:
-            logger.info(f"\n{'='*60}")
-            logger.info(f"Case: {bundle}/{case_name}")
-            logger.info(f"  results_dir: {results_dir}")
-            logger.info(f"  case_out_dir: {case_out_dir}")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"Case: {bundle}/{case_name}")
+        logger.info(f"  results_dir: {results_dir}")
+        logger.info(f"  case_out_dir: {case_out_dir}")
 
         if not results_dir.exists():
-            if rank == 0:
-                logger.error(f"  SKIP — results_dir does not exist: {results_dir}")
+            logger.error(f"  SKIP — results_dir does not exist: {results_dir}")
             continue
 
-        export_case_beat(results_dir, case_out_dir, comm, logger)
+        export_case_beat(results_dir, case_out_dir, logger)
 
-    if rank == 0:
-        logger.info("\nDone.")
+    logger.info("\nDone.")
 
 
 if __name__ == "__main__":

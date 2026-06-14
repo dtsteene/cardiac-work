@@ -4,6 +4,11 @@
 # per-cell cumulative work density and pressure-strain proxy density,
 # and writes step_NNN.vtu + beat.pvd for each requested case.
 #
+# Runs SERIALLY (single rank): the exporter assigns per-cell density fields in
+# serial DOLFINx cell order, which matches the pyvista grid cell order — so MPI
+# partitioning is intentionally avoided to keep cell ordering correct. The
+# workload is light (2 cases x ~600 cheap timesteps), so serial is fine.
+#
 # Optional env vars (set via --export or environment):
 #   BUNDLE=no_frank_starling | frank_starling_preload | frank_starling_relax
 #           (default: no_frank_starling)
@@ -12,7 +17,7 @@
 #SBATCH --job-name=beat_anim
 #SBATCH --partition=habanaq
 #SBATCH --nodes=1
-#SBATCH --ntasks=8
+#SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --time=2:00:00
 #SBATCH --output=slurm-%j.out
@@ -47,8 +52,8 @@ if [ -n "${CASES}" ]; then
 fi
 
 cd $SIM_DIR
-time $CONDA_PREFIX/bin/mpirun -n ${SLURM_NTASKS} -launcher fork \
-    $CONDA_PREFIX/bin/python ${SIM_DIR}/export_beat_animation.py \
+# Serial run (single rank) — see header note on cell ordering.
+time $CONDA_PREFIX/bin/python ${SIM_DIR}/export_beat_animation.py \
     --bundle "${BUNDLE:-no_frank_starling}" ${CASES_ARG}
 
 EXIT=$?
