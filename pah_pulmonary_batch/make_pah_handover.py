@@ -58,6 +58,13 @@ PCHOICES = [
     ("Affine",r"affine $P(\lambda)\times\varepsilon_{ll}$"),
 ]
 
+def frame_strain(E, frame):
+    """Reference-shift a Green-Lagrange strain trace.
+    'unloaded' = raw E (relative to the stress-free reference);
+    'clinical' = re-zeroed at end-diastole (most-stretched instant)."""
+    E = np.asarray(E, float)
+    return E - E.max() if frame == "clinical" else E
+
 def style(ax):
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -255,8 +262,8 @@ def fig_pv_0d(df, bundle, out):
     fig.suptitle("0D circulation-model pressure-volume loops", fontsize=12)
     savefig(fig, out / "loops_pv_0d")
 
-def fig_stress_pressure_strain(df, bundle, out):
-    """3 rows (LV/RV/Septum) x 2 cols: fibre stress-strain | pressure-strain. Strain zeroed at ED."""
+def fig_stress_pressure_strain(df, bundle, out, frame):
+    """3 rows (LV/RV/Septum) x 2 cols: fibre stress-strain | pressure-strain."""
     sev = df["sev"]; norm = Normalize(sev.min(), sev.max())
     regs = ["LV", "RV", "Septum"]
     pkey = {"LV": 0, "RV": 1, "Septum": 0}   # septum uses LV pressure axis for the PS panel
@@ -267,9 +274,9 @@ def fig_stress_pressure_strain(df, bundle, out):
         nm = len(np.asarray(m["mean_E_ff_LV"])); lbm = last_beat_slice(nm)   # last beat only
         nsp = sp.shape[0]; lbp = last_beat_slice(nsp)
         for ri, reg in enumerate(regs):
-            Eff = np.asarray(m[f"mean_E_ff_{reg}"])[lbm]; Eff = Eff - Eff.max()
+            Eff = frame_strain(np.asarray(m[f"mean_E_ff_{reg}"])[lbm], frame)
             Sff = np.asarray(m[f"mean_S_ff_{reg}"])[lbm] * PA_TO_KPA
-            Ell = np.asarray(m[f"mean_E_ll_{reg}"])[lbm]; Ell = (Ell - Ell.max()) * 100.0
+            Ell = frame_strain(np.asarray(m[f"mean_E_ll_{reg}"])[lbm], frame) * 100.0
             P = sp[:, pkey[reg]][lbp]
             L = min(len(Eff), len(P))
             axes[ri, 0].plot(Eff[:L], Sff[:L], color=col, lw=1.4, alpha=0.85)
@@ -284,7 +291,9 @@ def fig_stress_pressure_strain(df, bundle, out):
         for col_i in range(2): style(axes[ri, col_i])
     sm = ScalarMappable(cmap=CMAP, norm=norm); sm.set_array([])
     cb = fig.colorbar(sm, ax=axes, shrink=0.5, pad=0.02, aspect=40); cb.set_label(SEV, fontsize=9)
-    fig.suptitle("Coupled fibre stress-strain and pressure-strain loops (strain zeroed at ED)", fontsize=12)
+    fig.suptitle(f"Coupled fibre stress-strain and pressure-strain loops "
+                 f"({frame} frame: strain {'zeroed at ED' if frame=='clinical' else 'from unloaded reference'})",
+                 fontsize=12)
     savefig(fig, out / "loops_stress_pressure_strain")
 
 # --------------------------------------------------------------------------- #
@@ -323,7 +332,10 @@ def main():
             allr[region] = fig_region_correlation(df, region, cdir)
         fig_r_summary(allr, cdir)
         fig_ratio_spectrum(df, rdir); fig_ratio_scatter(df, rdir); fig_septum_ratio(df, rdir)
-        fig_pv_coupled(df, bundle, qdir); fig_pv_0d(df, bundle, qdir); fig_stress_pressure_strain(df, bundle, qdir)
+        fig_pv_coupled(df, bundle, qdir); fig_pv_0d(df, bundle, qdir)
+        for frame in ("clinical", "unloaded"):
+            fdir2 = qdir / frame; fdir2.mkdir(parents=True, exist_ok=True)
+            fig_stress_pressure_strain(df, bundle, fdir2, frame)
         write_tables(df, allr, ddir)
         summary[bundle] = allr
         print(f"   correlation: {', '.join(f'{r}:best={max(PCHOICES,key=lambda kc: abs(allr[r][kc[0]]))[0]}' for r in REG)}")
