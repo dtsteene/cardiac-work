@@ -40,9 +40,9 @@ from mpi4py import MPI
 from scipy.spatial import cKDTree
 
 
-REPO = Path(__file__).resolve().parent
-SWEEP_ROOT = REPO / "results/sims/2026-05-10/capped_shared_l5_20260510_141015"
-DEFAULT_OUT = REPO / "paraview_exports/production_capped_sweep_ed"
+import paths
+SWEEP_ROOT = paths.RESULTS_ROOT / "sims/2026-06-09/pah_pulmonary_20260609_prodsweep"
+DEFAULT_OUT = paths.REPO_ROOT / "paraview_exports/pah_pulmonary_ed"
 SEVERITIES = [22, 25, 30, 35, 45, 50, 55, 60, 65, 70, 75, 80, 85, 87, 92, 95]
 ED_TIME_S = 4.0  # start of 6th beat at 75 bpm
 

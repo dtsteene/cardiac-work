@@ -25,9 +25,11 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize
 from matplotlib.cm import ScalarMappable
 
-ROOT = Path("/home/dtsteene/D1/cardiac-work")
-SWEEP = ROOT / "results/sims/2026-06-09/pah_pulmonary_20260609_prodsweep"
-OUT = ROOT / "results/handover/pah_pulmonary_paper_20260611"
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root on path
+import paths
+SWEEP = paths.RESULTS_ROOT / "sims/2026-06-09/pah_pulmonary_20260609_prodsweep"
+OUT = paths.RESULTS_ROOT / "handover/pah_pulmonary_paper_20260611"
 CASES = ["case0_rv25","case1_rv35","case2_rv45","case3_rv55",
          "case4_rv65","case5_rv75","case6_rv85","case7_rv95"]
 BUNDLES = {
