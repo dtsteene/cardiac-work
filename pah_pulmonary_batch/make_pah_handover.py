@@ -10,8 +10,9 @@ Per bundle the figures are split into three categories:
                           per region (LV / RV / Septum), over pressure choices
                           P_LV / P_RV / Trans / Mean / Sum / Affine(lambda).
   <bundle>/ratio/         LV/RV free-wall ratio spectrum + scatter; septum ratio.
-  <bundle>/circulation/   Qualitative: 0D PV loops, coupled PV loops, coupled
-                          fibre stress-strain and pressure-strain loops.
+  <bundle>/loops/         standalone-0D + coupled PV loops; per-frame (ED/unloaded)
+                          fibre stress-strain & pressure-strain loops; septum
+                          candidate-pressure grid.
   <bundle>/data/          scalar csv + correlation tables.
 
 Run:  python3 pah_pulmonary_batch/make_pah_handover.py
@@ -48,22 +49,27 @@ C_WITHOUT= "#d6604d"   # P_LV everywhere
 HILITE   = "#fff3d4"
 SEV = "peak RV systolic pressure (mmHg)"
 
-# pressure choices for the correlation grids (longitudinal strain)
+# pressure choices for the correlation grids (longitudinal strain).
+# Affine(lambda) is still computed in aggregate() and kept in the raw CSV, but is
+# left out of the figures/tables for now to cut clutter (easy to re-add here).
 PCHOICES = [
     ("PLV",   r"$P_{LV}\times\varepsilon_{ll}$"),
     ("PRV",   r"$P_{RV}\times\varepsilon_{ll}$"),
     ("Trans", r"$(P_{LV}{-}P_{RV})\times\varepsilon_{ll}$"),
     ("Mean",  r"$\frac{1}{2}(P_{LV}{+}P_{RV})\times\varepsilon_{ll}$"),
     ("Sum",   r"$(P_{LV}{+}P_{RV})\times\varepsilon_{ll}$"),
-    ("Affine",r"affine $P(\lambda)\times\varepsilon_{ll}$"),
 ]
+
+# short pressure labels for compact panels (heatmap / story scatters)
+SHORT = {"PLV": "$P_{LV}$", "PRV": "$P_{RV}$", "Trans": "$P_{LV}{-}P_{RV}$",
+         "Mean": "mean $P$", "Sum": "sum $P$", "Affine": "affine $P(\\lambda)$"}
 
 def frame_strain(E, frame):
     """Reference-shift a Green-Lagrange strain trace.
     'unloaded' = raw E (relative to the stress-free reference);
-    'clinical' = re-zeroed at end-diastole (most-stretched instant)."""
+    'ED' = re-zeroed at end-diastole (most-stretched instant; what speckle-tracking sees)."""
     E = np.asarray(E, float)
-    return E - E.max() if frame == "clinical" else E
+    return E - E.max() if frame == "ED" else E
 
 def style(ax):
     ax.spines["top"].set_visible(False)
@@ -116,56 +122,144 @@ def aggregate(bundle):
     keys = rows[0].keys()
     return {k: np.array([r[k] for r in rows], dtype=object if k == "case" else float) for k in keys}
 
-def scatter_fit(ax, x, y, sev, norm):
-    ax.scatter(x, y, c=sev, cmap=CMAP, norm=norm, s=80, ec="k", lw=0.6, zorder=3)
+def scatter_fit(ax, x, y, sev, norm, title=None):
+    """Severity-coloured scatter + least-squares line; r shown as a corner badge."""
+    ax.scatter(x, y, c=sev, cmap=CMAP, norm=norm, s=70, ec="k", lw=0.5, zorder=3)
     if np.std(x) > 0:
         b, a = np.polyfit(x, y, 1)
         xs = np.linspace(min(x), max(x), 50)
-        ax.plot(xs, a + b * xs, "-", color="0.35", lw=1.3, zorder=2)
+        ax.plot(xs, a + b * xs, "-", color="0.4", lw=1.2, zorder=2)
     r = r_value(x, y)
-    ax.set_title(f"r = {r:+.3f}", fontsize=11, fontweight="bold")
+    ax.text(0.05, 0.94, f"r = {r:+.2f}", transform=ax.transAxes, fontsize=11,
+            fontweight="bold", va="top",
+            bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="0.7", alpha=0.9))
+    if title is not None:
+        ax.set_title(title, fontsize=11)
+    ax.locator_params(axis="x", nbins=5); ax.locator_params(axis="y", nbins=6)
+    style(ax)
+    return r
 
 # --------------------------------------------------------------------------- #
 # Correlation (headline)
 # --------------------------------------------------------------------------- #
 def fig_region_correlation(df, region, out):
-    """One region: 2x3 grid of true SS work vs each ll pressure-strain proxy."""
+    """One region: grid of true SS work vs each ll pressure-strain proxy.
+    Proxy formula is the panel title; r is a corner badge; one shared y-axis label.
+    No 'best' is crowned: across this monotonic sweep every non-transmural pressure is
+    collinear (r within ~0.02), so correlation cannot distinguish them — only transmural
+    differs. Crowning a winner would over-claim; see fig_rv_proxy_confound."""
     sev = df["sev"]; norm = Normalize(sev.min(), sev.max())
     y = df[f"{region}_W"]
     rs = {k: r_value(df[f"{region}_{k}"], y) for k, _ in PCHOICES}
-    best = max(PCHOICES, key=lambda kc: abs(rs[kc[0]]) if not np.isnan(rs[kc[0]]) else -1)[0]
-    fig, axes = plt.subplots(2, 3, figsize=(13.5, 8.4), constrained_layout=True)
-    for ax, (key, lab) in zip(axes.ravel(), PCHOICES):
-        if key == best:
-            ax.set_facecolor(HILITE)
-        scatter_fit(ax, df[f"{region}_{key}"], y, sev, norm)
-        ax.set_xlabel(lab + "  (proxy work, a.u.)")
-        ax.set_ylabel(f"SS work  $\\oint S{{:}}dE$  ({region})")
-        style(ax)
+    nontrans = [abs(rs[k]) for k, _ in PCHOICES if k != "Trans" and np.isfinite(rs[k])]
+    spread = max(nontrans) - min(nontrans) if nontrans else float("nan")
+    n = len(PCHOICES); ncol = 3; nrow = int(np.ceil(n / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(4.3 * ncol, 3.9 * nrow),
+                             constrained_layout=True, sharey=True)
+    axf = axes.ravel()
+    for ax, (key, lab) in zip(axf, PCHOICES):
+        scatter_fit(ax, df[f"{region}_{key}"], y, sev, norm, title=lab)
+        ax.set_xlabel("proxy work (a.u.)")
+    for ax in axf[n:]:
+        ax.set_visible(False)
+    fig.supylabel(f"true SS work  $\\oint S{{:}}dE$   ({region}, a.u.)", fontsize=12)
     sm = ScalarMappable(cmap=CMAP, norm=norm); sm.set_array([])
-    cb = fig.colorbar(sm, ax=axes, shrink=0.55, pad=0.02, aspect=30); cb.set_label(SEV, fontsize=9)
-    fig.suptitle(f"{region}: stress-strain work vs longitudinal pressure-strain proxy "
-                 f"(n=8 sweep)   best: {best}", fontsize=13)
+    cb = fig.colorbar(sm, ax=axes, shrink=0.6, pad=0.02, aspect=30); cb.set_label(SEV, fontsize=9)
+    fig.suptitle(f"{region}: true work vs each pressure-strain proxy   "
+                 f"(non-transmural r spread {spread:.2f} — indistinguishable)",
+                 fontsize=12.5, fontweight="bold")
     savefig(fig, out / f"correlation_{region}")
     return rs
 
-def fig_r_summary(allr, out):
-    """Bar chart: Pearson r per pressure choice, grouped by region."""
-    fig, ax = plt.subplots(figsize=(10, 4.8))
-    keys = [k for k, _ in PCHOICES]
-    width = 0.26
-    xpos = np.arange(len(keys))
+def fig_true_vs_proxy_range(df, out):
+    """Per region across the sweep: true SS work (left axis) vs the matched pressure-strain
+    proxy (right axis, different scale). Shows that for the septum/LV the proxy is NOT flat
+    like the truth — it varies a lot because it tracks the rising pressure, so it would
+    falsely report work changes that the true work does not have."""
+    o = np.argsort(df["sev"]); x = df["sev"][o]
+    matched = {"LV": "PLV", "RV": "PRV", "Septum": "PLV"}     # clinical adjacent-wall pressure
+    plab = {"PLV": "$P_{LV}$", "PRV": "$P_{RV}$"}
+    pcol = {"LV": "#4575b4", "RV": "#d73027", "Septum": "#762a83"}
+
+    def rng(a):
+        a = np.asarray(a, float); return 100 * (a.max() - a.min()) / abs(a.mean())
+
+    fig, axes = plt.subplots(1, 3, figsize=(14.5, 4.8), constrained_layout=True)
+    for ax, reg in zip(axes, REG):
+        W = df[f"{reg}_W"][o]; pk = matched[reg]; Pw = df[f"{reg}_{pk}"][o]
+        ax.plot(x, W, "-o", color="#222", lw=2.4, ms=5,
+                label=f"true work  (range {rng(W):.0f}%)")
+        ax.set_ylabel("true SS work (a.u.)")
+        axr = ax.twinx()
+        axr.plot(x, Pw, "--s", color=pcol[reg], lw=2.0, ms=5,
+                 label=f"proxy {plab[pk]}  (range {rng(Pw):.0f}%)")
+        axr.set_ylabel("proxy work (a.u.)")
+        axr.spines["top"].set_visible(False)
+        ax.set_title(reg, fontweight="bold"); ax.set_xlabel(SEV); style(ax)
+        h1, l1 = ax.get_legend_handles_labels(); h2, l2 = axr.get_legend_handles_labels()
+        ax.legend(h1 + h2, l1 + l2, frameon=False, fontsize=8.5, loc="upper left")
+    fig.suptitle("True work vs matched pressure-strain proxy across the sweep", fontsize=12)
+    savefig(fig, out / "true_vs_proxy_range")
+
+def fig_direction_recovers(out, bundle="no_frank_starling"):
+    """Both clinically-measurable strain directions cancel in the septum: longitudinal (GLS)
+    partially, circumferential almost completely. Only the local fibre (helical) direction —
+    which follows the through-wall fibre rotation and is NOT measurable in vivo — is coherent.
+    (a) directional coherence |net|/gross per region (1 = no cancellation);
+    (b) septal signed coherence net/gross across the sweep (fibre pinned at -1, GLS wobbles,
+        circumferential ~0). signed because septal P*deps is net-negative (shortening)."""
+    DIRS = [("ll", "longitudinal (GLS)", "#762a83"),
+            ("circ", "circumferential", "#e6ab02"),
+            ("ff", "fibre (helical)", "#1b7837")]
+    regs = list(REG)
+    cohacc = {d: {r: [] for r in regs} for d, _, _ in DIRS}
+    septsig = {d: [] for d, _, _ in DIRS}
+    sev = []
+    for c in CASES:
+        z = np.load(SWEEP / bundle / c / "per_cell_data.npz")
+        tags = z["region_tags"]; sev.append(rv_systolic(SWEEP / bundle / c))
+        for d, _, _ in DIRS:
+            va = z[f"proxy_PLV_{d}"]
+            for r in regs:
+                v = va[tags == REG[r]]; g = v[v > 0].sum() - v[v < 0].sum()
+                cohacc[d][r].append(abs(v.sum()) / g if g > 0 else np.nan)
+            vs = va[tags == REG["Septum"]]; gs = vs[vs > 0].sum() - vs[vs < 0].sum()
+            septsig[d].append(vs.sum() / gs if gs > 0 else np.nan)
+    o = np.argsort(sev); x = np.array(sev)[o]
+    fig, (axb, axc) = plt.subplots(1, 2, figsize=(13.5, 4.8), constrained_layout=True)
+    xp = np.arange(len(regs)); w = 0.27
+    for i, (d, lab, col) in enumerate(DIRS):
+        axb.bar(xp + (i - 1) * w, [np.nanmean(cohacc[d][r]) for r in regs], w, label=lab, color=col)
+    axb.set_xticks(xp); axb.set_xticklabels(regs); axb.set_ylim(0, 1.05)
+    axb.set_ylabel("directional coherence   |net| / gross")
+    axb.legend(frameon=False, fontsize=8.5); style(axb)
+    axb.set_title("(a) cancellation by strain direction", fontweight="bold")
+    for d, lab, col in DIRS:
+        axc.plot(x, np.array(septsig[d])[o], "-o", color=col, lw=2.0, ms=5, label=lab)
+    axc.axhline(0, color="0.6", lw=0.8); axc.set_ylim(-1.05, 0.25)
+    axc.set_xlabel(SEV); axc.set_ylabel("septal signed coherence   net / gross")
+    axc.legend(frameon=False, fontsize=8.5); style(axc)
+    axc.set_title("(b) septal coherence across the sweep", fontweight="bold")
+    fig.suptitle("Septal proxy: longitudinal vs circumferential vs fibre strain", fontsize=12)
+    savefig(fig, out / "direction_recovers")
+
+def fig_work_dynamic_range(df, out):
+    """True work as % deviation from each region's sweep-mean. The pulmonary sweep
+    loads the RV, so only the RV has dynamic range; LV/septum are nearly flat, which
+    is why their proxy correlations are noise (and flip sign across activation models)."""
+    o = np.argsort(df["sev"]); x = df["sev"][o]
     colors = {"LV": "#4575b4", "RV": "#d73027", "Septum": "#762a83"}
-    for i, region in enumerate(REG):
-        vals = [allr[region][k] for k in keys]
-        ax.bar(xpos + (i - 1) * width, vals, width, label=region, color=colors[region], alpha=0.9)
-    ax.axhline(0, color="k", lw=0.8)
-    ax.set_xticks(xpos); ax.set_xticklabels(keys)
-    ax.set_ylabel("Pearson r  (SS work vs $P\\times\\varepsilon_{ll}$)")
-    ax.set_ylim(-1, 1.05); ax.legend(frameon=False)
-    ax.set_title("Correlation of true work with each pressure choice, by region")
-    style(fig.axes[0])
-    savefig(fig, out / "r_summary")
+    fig, ax = plt.subplots(figsize=(8.0, 4.9), constrained_layout=True)
+    ax.axhline(0, color="0.6", lw=0.8)
+    for reg in REG:
+        W = df[f"{reg}_W"][o]; dev = 100 * (W - W.mean()) / abs(W.mean())
+        rng = 100 * (W.max() - W.min()) / abs(W.mean())
+        ax.plot(x, dev, "-o", color=colors[reg], lw=2.2, ms=5,
+                label=f"{reg}  (range {rng:.0f}% of mean)")
+    ax.set_xlabel(SEV); ax.set_ylabel("true work deviation from sweep-mean (%)")
+    ax.legend(frameon=False, fontsize=9.5); style(ax)
+    ax.set_title("Dynamic range of true work by region", fontsize=12, fontweight="bold")
+    savefig(fig, out / "work_dynamic_range")
 
 # --------------------------------------------------------------------------- #
 # Ratio
@@ -247,19 +341,25 @@ def fig_pv_coupled(df, bundle, out):
     savefig(fig, out / "loops_pv_coupled")
 
 def fig_pv_0d(df, bundle, out):
+    """STANDALONE 0D PV loops from the pre-coupling warm-up (circulation/preload_history.npy),
+    NOT the coupled ode_state — the 0D model run on its own, warmed up and converged.
+    Last converged beat (RR = 0.8 s @ 75 bpm)."""
     sev = df["sev"]; norm = Normalize(sev.min(), sev.max())
     fig, axes = plt.subplots(1, 2, figsize=(10.6, 4.8), constrained_layout=True)
     for i, c in enumerate(CASES):
-        _, o, _ = load_loop(SWEEP / bundle / c)
+        ph = SWEEP / bundle / c / "circulation" / "preload_history.npy"
+        if not ph.exists():
+            continue
+        o = np.load(ph, allow_pickle=True).item()
         col = CMAP(norm(df["sev"][i]))
-        n = len(o["V_LV"]); lb = last_beat_slice(n)
-        axes[0].plot(np.asarray(o["V_LV"])[lb], np.asarray(o["p_LV"])[lb], color=col, lw=1.4, alpha=0.85)
-        axes[1].plot(np.asarray(o["V_RV"])[lb], np.asarray(o["p_RV"])[lb], color=col, lw=1.4, alpha=0.85)
-    for ax, t in zip(axes, ["LV", "RV"]):
-        ax.set_title(t, fontweight="bold"); ax.set_xlabel("Volume (mL)"); ax.set_ylabel("0D pressure (mmHg)"); style(ax)
+        t = np.asarray(o["time"]); m = t >= (t[-1] - 0.8)   # last converged warm-up beat
+        axes[0].plot(np.asarray(o["V_LV"])[m], np.asarray(o["p_LV"])[m], color=col, lw=1.4, alpha=0.85)
+        axes[1].plot(np.asarray(o["V_RV"])[m], np.asarray(o["p_RV"])[m], color=col, lw=1.4, alpha=0.85)
+    for ax, lab in zip(axes, ["LV", "RV"]):
+        ax.set_title(lab, fontweight="bold"); ax.set_xlabel("Volume (mL)"); ax.set_ylabel("0D pressure (mmHg)"); style(ax)
     sm = ScalarMappable(cmap=CMAP, norm=norm); sm.set_array([])
     cb = fig.colorbar(sm, ax=axes, shrink=0.85, pad=0.02, aspect=30); cb.set_label(SEV, fontsize=9)
-    fig.suptitle("0D circulation-model pressure-volume loops", fontsize=12)
+    fig.suptitle("Standalone 0D circulation PV loops (pre-coupling)", fontsize=12)
     savefig(fig, out / "loops_pv_0d")
 
 def fig_stress_pressure_strain(df, bundle, out, frame):
@@ -281,20 +381,55 @@ def fig_stress_pressure_strain(df, bundle, out, frame):
             L = min(len(Eff), len(P))
             axes[ri, 0].plot(Eff[:L], Sff[:L], color=col, lw=1.4, alpha=0.85)
             axes[ri, 1].plot(Ell[:L], P[:L], color=col, lw=1.4, alpha=0.85)
+    plab = {0: "$P_{LV}$", 1: "$P_{RV}$"}   # which cavity pressure drives each PS panel
     axes[0, 0].set_title("Fibre stress-strain (model)", fontweight="bold")
     axes[0, 1].set_title("Pressure-longitudinal-strain (clinical proxy)", fontweight="bold")
     for ri, reg in enumerate(regs):
+        pl = plab[pkey[reg]]
         axes[ri, 0].set_ylabel("$S_{ff}$ (kPa)"); axes[ri, 0].set_xlabel("$E_{ff}$")
-        axes[ri, 1].set_ylabel("cavity P (mmHg)"); axes[ri, 1].set_xlabel("$\\varepsilon_{ll}$ (%)")
+        # the cavity pressure for this region is communicated by the y-axis label alone
+        axes[ri, 1].set_ylabel(f"{pl} (mmHg)", fontsize=14, fontweight="bold")
+        axes[ri, 1].set_xlabel(r"$\varepsilon_{ll}$ (%)")
         axes[ri, 0].annotate(reg, xy=(-0.25, 0.5), xycoords="axes fraction", fontsize=13,
                              fontweight="bold", rotation=90, ha="center", va="center")
         for col_i in range(2): style(axes[ri, col_i])
     sm = ScalarMappable(cmap=CMAP, norm=norm); sm.set_array([])
     cb = fig.colorbar(sm, ax=axes, shrink=0.5, pad=0.02, aspect=40); cb.set_label(SEV, fontsize=9)
-    fig.suptitle(f"Coupled fibre stress-strain and pressure-strain loops "
-                 f"({frame} frame: strain {'zeroed at ED' if frame=='clinical' else 'from unloaded reference'})",
-                 fontsize=12)
     savefig(fig, out / "loops_stress_pressure_strain")
+
+def fig_septum_candidate_loops(df, bundle, out, frame):
+    """Septum only: fibre stress-strain loop + every candidate cavity-pressure
+    pressure-strain loop (P_LV, P_RV, transmural, Mean, Sum) against the SAME
+    septal longitudinal strain, so loop shape/area is comparable across choices."""
+    sev = df["sev"]; norm = Normalize(sev.min(), sev.max())
+    fig, axes = plt.subplots(2, 3, figsize=(14.0, 8.6), constrained_layout=True)
+    ax = axes.ravel()
+    for i, c in enumerate(CASES):
+        m, o, sp = load_loop(SWEEP / bundle / c)
+        col = CMAP(norm(df["sev"][i]))
+        nm = len(np.asarray(m["mean_E_ff_Septum"])); lbm = last_beat_slice(nm)
+        lbp = last_beat_slice(sp.shape[0])
+        Eff = frame_strain(np.asarray(m["mean_E_ff_Septum"])[lbm], frame)
+        Sff = np.asarray(m["mean_S_ff_Septum"])[lbm] * PA_TO_KPA
+        Ell = frame_strain(np.asarray(m["mean_E_ll_Septum"])[lbm], frame) * 100.0
+        plv = sp[:, 0][lbp]; prv = sp[:, 1][lbp]
+        L = min(len(Eff), len(plv))
+        ax[0].plot(Eff[:L], Sff[:L], color=col, lw=1.4, alpha=0.85)
+        series = [plv, prv, plv - prv, 0.5 * (plv + prv), plv + prv]
+        for k, P in enumerate(series, start=1):
+            ax[k].plot(Ell[:L], P[:L], color=col, lw=1.4, alpha=0.85)
+    ax[0].set_title("Fibre stress-strain (model)", fontweight="bold")
+    ax[0].set_xlabel("$E_{ff}$"); ax[0].set_ylabel("$S_{ff}$ (kPa)")
+    titles = ["$P_{LV}$", "$P_{RV}$", "$P_{LV}-P_{RV}$ (transmural)", "Mean $\\frac{1}{2}(P_{LV}+P_{RV})$", "Sum $P_{LV}+P_{RV}$"]
+    for k, t in enumerate(titles, start=1):
+        ax[k].set_title(t, fontweight="bold")
+        ax[k].set_xlabel(r"$\varepsilon_{ll}$ (%)"); ax[k].set_ylabel("pressure (mmHg)")
+        ax[k].axhline(0, color="0.7", lw=0.7, ls=":")
+    for a in ax:
+        style(a)
+    sm = ScalarMappable(cmap=CMAP, norm=norm); sm.set_array([])
+    cb = fig.colorbar(sm, ax=axes, shrink=0.5, pad=0.02, aspect=40); cb.set_label(SEV, fontsize=9)
+    savefig(fig, out / "loops_septum_candidates")
 
 # --------------------------------------------------------------------------- #
 def write_tables(df, allr, ddir):
@@ -323,19 +458,26 @@ def main():
     summary = {}
     for bundle, desc in BUNDLES.items():
         base = OUT / bundle
-        cdir = base / "correlation"; rdir = base / "ratio"; qdir = base / "circulation"; ddir = base / "data"
+        cdir = base / "correlation"; rdir = base / "ratio"; qdir = base / "loops"; ddir = base / "data"
         for d in (cdir, rdir, qdir, ddir): d.mkdir(parents=True, exist_ok=True)
         df = aggregate(bundle)
         print(f"[{bundle}] n={len(df['case'])}  RV sys {df['sev'].min():.0f}-{df['sev'].max():.0f} mmHg")
-        allr = {}
-        for region in REG:
-            allr[region] = fig_region_correlation(df, region, cdir)
-        fig_r_summary(allr, cdir)
+        # Correlations are only meaningful where true work has dynamic range. In this
+        # pulmonary sweep only the RV does (range ~70-95% of mean); LV and septum vary
+        # ~5-13% (CV ~2-4%) so their proxy r is noise and flips sign across bundles.
+        # -> RV-focused correlation grid + one plot that shows LV/septum are flat.
+        allr = {region: {k: r_value(df[f"{region}_{k}"], df[f"{region}_W"])
+                         for k, _ in PCHOICES} for region in REG}
+        fig_region_correlation(df, "RV", cdir)
+        fig_work_dynamic_range(df, cdir)
+        fig_true_vs_proxy_range(df, cdir)
+        fig_direction_recovers(cdir, bundle)
         fig_ratio_spectrum(df, rdir); fig_ratio_scatter(df, rdir); fig_septum_ratio(df, rdir)
         fig_pv_coupled(df, bundle, qdir); fig_pv_0d(df, bundle, qdir)
-        for frame in ("clinical", "unloaded"):
+        for frame in ("ED", "unloaded"):
             fdir2 = qdir / frame; fdir2.mkdir(parents=True, exist_ok=True)
             fig_stress_pressure_strain(df, bundle, fdir2, frame)
+            fig_septum_candidate_loops(df, bundle, fdir2, frame)
         write_tables(df, allr, ddir)
         summary[bundle] = allr
         print(f"   correlation: {', '.join(f'{r}:best={max(PCHOICES,key=lambda kc: abs(allr[r][kc[0]]))[0]}' for r in REG)}")

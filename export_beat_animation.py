@@ -4,8 +4,11 @@
 For each requested case in a bundle, replays the last cardiac beat step-by-step
 from the displacement checkpoint, accumulates per-cell cumulative work density
 (true internal work S:dE) and per-cell cumulative pressure-strain proxy density
-(P_LV * d_epsilon_ll) from end-diastole, and writes a time-series PVD so that
-importing into PyVista or ParaView shows the work building up over one heartbeat.
+(region-appropriate P * d_epsilon_ll: RV free wall uses P_RV, LV free wall and
+septum use P_LV) from end-diastole, and writes a time-series PVD so that importing
+into PyVista or ParaView shows the work building up over one heartbeat. Stress-strain
+and pressure-strain are separate cell fields (cum_work_density_Pa, cum_ps_density_Pa)
+so each can be colour-scaled independently.
 
 Output layout::
 
@@ -157,6 +160,7 @@ def export_case_beat(
     import cardiac_geometries
     import cardiac_geometries.geometry
     import pyvista as pv
+    from scipy.spatial import cKDTree
 
     from clinical_frame import (
         build_radial_endo_to_epi_dg0,
@@ -390,6 +394,30 @@ def export_case_beat(
 
     logger.info(f"  DG0 forms compiled ({n_cells} cells)")
 
+    # ── Region tags in serial cell order (for region-appropriate proxy pressure) ──
+    # The pressure-strain proxy uses the clinically adjacent cavity pressure per wall:
+    #   RV free wall (tag 2)        -> P_RV
+    #   LV free wall + septum (1,3) -> P_LV   (septum imaged from the LV side)
+    # per_cell_data.npz cells are in MPI-concat order; map to serial cell order via a
+    # KDTree on centroids (same approach as export_production_sweep_for_animation.py).
+    region_tags = np.ones(n_cells, dtype=np.int32)
+    pcd_path = results_dir / "per_cell_data.npz"
+    if pcd_path.exists():
+        pcd = np.load(pcd_path)
+        mesh.topology.create_connectivity(3, 0)
+        c2v = mesh.topology.connectivity(3, 0)
+        verts = mesh.geometry.x
+        serial_centroids = np.array(
+            [verts[c2v.links(c)].mean(axis=0) for c in range(n_cells)]
+        )
+        dist, m2p = cKDTree(pcd["centroids"]).query(serial_centroids, k=1)
+        if dist.max() > 1e-6:
+            logger.warning(f"  region KDTree max dist {dist.max():.2e} m — tags may be off")
+        region_tags = pcd["region_tags"][m2p].astype(np.int32)
+    else:
+        logger.warning("  per_cell_data.npz missing — proxy falls back to P_LV everywhere")
+    use_prv = region_tags == 2   # RV free wall uses P_RV; everything else uses P_LV
+
     # ── Determine last beat timestep slice ───────────────────────────────────
     timestamps = adios4dolfinx.read_timestamps(checkpoint_path, comm, "displacement")
     n_steps = len(timestamps)
@@ -433,9 +461,10 @@ def export_case_beat(
 
     # ── Replay loop ──────────────────────────────────────────────────────────
     cum_w = np.zeros(n_cells)   # J per cell (true internal work), serial order
-    cum_ps = np.zeros(n_cells)  # J per cell (P_LV * d_eps_ll proxy), serial order
+    cum_ps = np.zeros(n_cells)  # J per cell (region-appropriate P * d_eps_ll proxy)
     has_previous = False
     p_LV_prev = 0.0
+    p_RV_prev = 0.0
 
     pvd_entries: list[tuple[float, Path]] = []
 
@@ -456,19 +485,23 @@ def export_case_beat(
             w_vec = dolfinx.fem.assemble_vector(form_w_total)
             cum_w += w_vec.array[:n_cells]
 
-            # Accumulate proxy increment: P_LV_avg * deps_ll per cell
+            # Accumulate proxy increment: region-appropriate P_avg * deps_ll per cell
             p_LV = float(solver_cavity_pressure_mmHg[global_step, 0]) * MMHG_TO_PA
+            p_RV = float(solver_cavity_pressure_mmHg[global_step, 1]) * MMHG_TO_PA
             p_LV_avg = 0.5 * (p_LV + p_LV_prev)
+            p_RV_avg = 0.5 * (p_RV + p_RV_prev)
+            # per-cell pressure: RV free wall -> P_RV, LV + septum -> P_LV
+            p_cell = np.where(use_prv, p_RV_avg, p_LV_avg)
 
             if form_deps_ll is not None:
                 deps_ll_vec = dolfinx.fem.assemble_vector(form_deps_ll)
-                cum_ps += p_LV_avg * deps_ll_vec.array[:n_cells]
+                cum_ps += p_cell * deps_ll_vec.array[:n_cells]
 
             p_LV_prev = p_LV
+            p_RV_prev = p_RV
         else:
-            p_LV_prev = (
-                float(solver_cavity_pressure_mmHg[global_step, 0]) * MMHG_TO_PA
-            )
+            p_LV_prev = float(solver_cavity_pressure_mmHg[global_step, 0]) * MMHG_TO_PA
+            p_RV_prev = float(solver_cavity_pressure_mmHg[global_step, 1]) * MMHG_TO_PA
 
         # Shift state: current → previous for next step's trapezoidal average
         E_prev.x.array[:] = E_cur.x.array[:]
@@ -492,6 +525,7 @@ def export_case_beat(
         # Serial cell order matches DG0 assembly order — direct assignment.
         grid.cell_data["cum_work_density_Pa"] = cum_work_density_Pa.astype(np.float32)
         grid.cell_data["cum_ps_density_Pa"] = cum_ps_density_Pa.astype(np.float32)
+        grid.cell_data["region_tag"] = region_tags   # 1=LV, 2=RV, 3=Septum
         grid.field_data["beat_step"] = np.array([beat_idx], dtype=np.int32)
         grid.field_data["beat_time_s"] = np.array([t], dtype=np.float64)
 
