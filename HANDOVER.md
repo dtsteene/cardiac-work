@@ -74,10 +74,25 @@ FEniCSx builds are fragile — prefer (A) unless you're moving off this cluster.
   (`/home/dtsteene/D1/...`, `/global/D1/homes/...`) that don't exist, and an old
   `fenicsx-pulse 0.5.1` (the real source is 0.6.1). The **`.pth` files** in
   `site-packages` are authoritative and point at `/global/D1/cardiac_rv_shared/src/*`.
-- **ldrb conda/pip clobber.** `fenicsx-ldrb` was first conda-installed, then
-  re-installed editable over the top, so conda thinks some files were deleted.
-  Harmless for running; it only means `conda-pack` needs
-  `--ignore-missing-files` (already used to build the shared env).
+- **`import pulse`, not `import fenicsx_pulse`.** 0.6.1 deprecated the old name
+  (still works, just warns). Existing code uses `fenicsx_pulse` — fine.
+- **ldrb was silently shadowed (FIXED in the shared env — verify before you trust
+  a fresh rebuild).** `fenicsx-ldrb` had been conda/pip-installed non-editable
+  *and* editable. A leftover physical `ldrb/` in `site-packages` (old
+  **scalar-heuristic** septum tagging, 749 lines) sat earlier on `sys.path` than
+  the editable path, so `import ldrb` silently loaded the OLD version — **not**
+  the committed **`_compute_septum_tags_geometric` distance-based tagging** in
+  shared `src/` (814 lines). Fixed in the shared env by moving the stale copy to
+  `env/.../site-packages/_stale_conda_ldrb/`; `import ldrb` now resolves to
+  shared `src/` (check with `python -c "import ldrb.ldrb as m; print(m.__file__)"`).
+  If you rebuild from `environment.yml`, redo this: after the editable installs,
+  confirm `ldrb.__file__` points at `src/`, not `site-packages/ldrb`.
+  - **Provenance caveat (needs Daniel):** because the env had this shadowing bug,
+    it's unconfirmed whether the frozen 2026-06-09 production tags were generated
+    with the old scalar-heuristic or the new geometric tagging. Existing results
+    are frozen (fibers/tags saved per-sim under `geometry/`), so nothing changes
+    retroactively — but the septum-tagging provenance of the thesis figures
+    should be confirmed before claiming the geometric method produced them.
 
 ---
 
