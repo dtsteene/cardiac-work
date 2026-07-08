@@ -80,6 +80,67 @@ def test_ratio_preservation_hand():
     assert math.isclose(out["max_abs_raw_error"], 1.0)
 
 
+# ── agreement metrics (single-global-k calibration) ──────────────────────────
+
+def test_concordance_ccc_identity():
+    x = [1.0, 2.0, 3.0, 4.0]
+    assert math.isclose(ac.concordance_ccc(x, x), 1.0, abs_tol=1e-12)
+
+
+def test_concordance_ccc_scale_shift():
+    # Pearson r = 1 but a 2x scale shift → CCC penalizes it.
+    # x=[1,2,3], y=[2,4,6]: cov=4/3, var_x=2/3, var_y=8/3, (mx-my)^2=4
+    # CCC = 2*(4/3)/(2/3 + 8/3 + 4) = (8/3)/(22/3) = 4/11
+    assert math.isclose(ac.pearson_r([1.0, 2.0, 3.0], [2.0, 4.0, 6.0]), 1.0)
+    assert math.isclose(ac.concordance_ccc([1.0, 2.0, 3.0], [2.0, 4.0, 6.0]),
+                        4.0 / 11.0, rel_tol=1e-12)
+
+
+def test_concordance_ccc_guards():
+    assert math.isnan(ac.concordance_ccc([1.0], [1.0]))              # n < 2
+    assert math.isnan(ac.concordance_ccc([1.0, 1.0], [1.0, 2.0]))    # constant x
+
+
+def test_proportional_fit_exact():
+    # truth = 2 * proxy exactly → k=2, zero residual
+    out = ac.proportional_fit([1.0, 2.0, 3.0], [2.0, 4.0, 6.0])
+    assert math.isclose(out["k"], 2.0, rel_tol=1e-12)
+    assert math.isclose(out["resid_rmse"], 0.0, abs_tol=1e-12)
+    assert math.isclose(out["rel_rmse"], 0.0, abs_tol=1e-12)
+
+
+def test_proportional_fit_with_residual():
+    # proxy=[1,1], truth=[1,3]: k=(1+3)/(1+1)=2; resid=[-1,1]; rmse=1;
+    # rel_rmse = 1 / mean(|truth|)=1/2
+    out = ac.proportional_fit([1.0, 1.0], [1.0, 3.0])
+    assert math.isclose(out["k"], 2.0, rel_tol=1e-12)
+    assert math.isclose(out["resid_rmse"], 1.0, rel_tol=1e-12)
+    assert math.isclose(out["rel_rmse"], 0.5, rel_tol=1e-12)
+
+
+def test_agreement_stats_affine():
+    proxy = [1.0, 2.0, 3.0, 4.0]
+    truth = [3.0, 5.0, 7.0, 9.0]                                     # truth = 2*proxy + 1
+    s = ac.agreement_stats(proxy, truth)
+    assert math.isclose(s["slope"], 2.0, abs_tol=1e-9)
+    assert math.isclose(s["intercept"], 1.0, abs_tol=1e-9)
+    assert math.isclose(s["rel_rmse_affine"], 0.0, abs_tol=1e-9)     # perfect affine fit
+    assert s["n"] == 4
+
+
+def test_pooled_proportional_hand():
+    # region A: k_A=2 exactly; region B: k_B=1 exactly.
+    proxy = {"A": np.array([1.0, 2.0]), "B": np.array([1.0, 2.0])}
+    truth = {"A": np.array([2.0, 4.0]), "B": np.array([1.0, 2.0])}
+    out = ac.pooled_proportional(proxy, truth)
+    assert math.isclose(out["k_global"], 1.5, rel_tol=1e-12)         # 15/10
+    assert math.isclose(out["k_by_region"]["A"], 2.0, rel_tol=1e-12)
+    assert math.isclose(out["k_by_region"]["B"], 1.0, rel_tol=1e-12)
+    assert math.isclose(out["k_spread"], 2.0, rel_tol=1e-12)         # 2/1
+    assert math.isclose(out["rel_rmse"], math.sqrt(0.625) / 2.25, rel_tol=1e-12)
+    assert math.isclose(out["ccc_pooled"], 0.6428571428571429, rel_tol=1e-9)
+
+
 # ── equivalence vs canonical sweep_analysis ──────────────────────────────────
 
 def test_equiv_pearson_vs_canonical():

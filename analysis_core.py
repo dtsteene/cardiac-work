@@ -132,6 +132,107 @@ def correlation_stats(x, y) -> dict[str, float]:
     return {"n": len(x_arr), "r": r, "r2": r2, "slope": slope, "intercept": intercept}
 
 
+def concordance_ccc(x, y) -> float:
+    """Lin's concordance correlation coefficient between ``x`` and ``y``.
+
+    ``CCC = 2·cov / (var_x + var_y + (mean_x − mean_y)²)`` using *population*
+    (biased, ÷n) moments. Unlike Pearson r it is NOT invariant to scale/offset:
+    a proxy that tracks truth perfectly but on the wrong scale scores < 1. This
+    is exactly the discrimination Pearson throws away on a monotonic sweep.
+
+    NaN-guarded like :func:`pearson_r` (n < 2, or either series constant).
+    """
+    x_arr = np.asarray(x, dtype=float)
+    y_arr = np.asarray(y, dtype=float)
+    if len(x_arr) < 2 or np.std(x_arr) == 0 or np.std(y_arr) == 0:
+        return float("nan")
+    vx = float(np.var(x_arr))          # population variance (÷n)
+    vy = float(np.var(y_arr))
+    cov = float(np.mean((x_arr - x_arr.mean()) * (y_arr - y_arr.mean())))
+    denom = vx + vy + (x_arr.mean() - y_arr.mean()) ** 2
+    if denom == 0:
+        return float("nan")
+    return 2.0 * cov / denom
+
+
+def proportional_fit(proxy, truth) -> dict[str, float]:
+    """Least-squares through-origin fit ``truth ≈ k·proxy``.
+
+    ``k = Σ(proxy·truth) / Σ(proxy²)``. Reports the calibration slope ``k`` plus
+    the absolute (``resid_rmse``) and relative (``rel_rmse`` = RMSE / mean|truth|)
+    root-mean-square residual of ``truth − k·proxy``. This is the single-constant
+    calibration used everywhere in the agreement analysis.
+    """
+    p = np.asarray(proxy, dtype=float)
+    t = np.asarray(truth, dtype=float)
+    denom = float(np.sum(p * p))
+    k = float(np.sum(p * t) / denom) if denom != 0 else float("nan")
+    resid = t - k * p
+    rmse = float(np.sqrt(np.mean(resid * resid)))
+    scale = float(np.mean(np.abs(t)))
+    rel = rmse / scale if scale != 0 else float("nan")
+    return {"k": k, "resid_rmse": rmse, "rel_rmse": rel}
+
+
+def agreement_stats(proxy, truth) -> dict[str, float]:
+    """Per-region agreement summary between a proxy series and truth.
+
+    ``slope``/``intercept`` are the per-region affine calibration (reused from
+    :func:`correlation_stats`); ``ccc_raw`` is Lin's CCC on the *uncalibrated*
+    proxy vs truth (scale-sensitive — low for all choices because P ≠ σ, a
+    pre-calibration diagnostic, not the discriminator); ``rel_rmse_affine`` is
+    the %RMSE around the affine fit. The discriminator is the *cross-region*
+    stability of ``slope`` (see :func:`pooled_proportional`), not any per-region
+    CCC.
+    """
+    cs = correlation_stats(proxy, truth)
+    p = np.asarray(proxy, dtype=float)
+    t = np.asarray(truth, dtype=float)
+    if math.isnan(cs["slope"]):
+        rel = float("nan")
+    else:
+        resid = t - (cs["slope"] * p + cs["intercept"])
+        scale = float(np.mean(np.abs(t)))
+        rel = float(np.sqrt(np.mean(resid * resid))) / scale if scale != 0 else float("nan")
+    return {
+        "n": cs["n"],
+        "slope": cs["slope"],
+        "intercept": cs["intercept"],
+        "ccc_raw": concordance_ccc(proxy, truth),
+        "rel_rmse_affine": rel,
+    }
+
+
+def pooled_proportional(proxy_by_region, truth_by_region) -> dict:
+    """Cross-region single-global-k proportionality test — the headline metric.
+
+    ``proxy_by_region`` / ``truth_by_region`` map region name → 1-D array (one
+    value per case). One global ``k`` is fitted through the origin over the
+    *pooled* points; the winning pressure choice is the one whose single ``k``
+    fits every region (lowest ``rel_rmse``, ``k_spread`` closest to 1).
+
+    Returns ``k_global``, pooled ``rel_rmse`` and ``ccc_pooled`` (on ``k·proxy``
+    vs truth), the per-region through-origin ``k_by_region``, and ``k_spread``
+    (max/min of the per-region k — 1.0 means one constant works everywhere).
+    """
+    regions = list(proxy_by_region)
+    p_all = np.concatenate([np.asarray(proxy_by_region[r], float) for r in regions])
+    t_all = np.concatenate([np.asarray(truth_by_region[r], float) for r in regions])
+    glob = proportional_fit(p_all, t_all)
+    k_by_region = {r: proportional_fit(proxy_by_region[r], truth_by_region[r])["k"]
+                   for r in regions}
+    ks = np.array([k_by_region[r] for r in regions], float)
+    ks = ks[np.isfinite(ks) & (ks != 0)]
+    k_spread = float(np.max(ks) / np.min(ks)) if len(ks) else float("nan")
+    return {
+        "k_global": glob["k"],
+        "rel_rmse": glob["rel_rmse"],
+        "ccc_pooled": concordance_ccc(glob["k"] * p_all, t_all),
+        "k_by_region": k_by_region,
+        "k_spread": k_spread,
+    }
+
+
 def ratio_preservation(values, reference) -> dict[str, float]:
     """How well a proxy ratio series tracks the truth ratio series.
 
@@ -169,6 +270,10 @@ __all__ = [
     "tau_from_per_cell",
     "pearson_r",
     "correlation_stats",
+    "concordance_ccc",
+    "proportional_fit",
+    "agreement_stats",
+    "pooled_proportional",
     "ratio_preservation",
     "log_mae",
 ]
