@@ -228,32 +228,62 @@ Output: `paraview_exports/pah_pulmonary_beat/<bundle>/<case>/beat.pvd`.
 
 ## Collaborator setup (henriknf)
 
+The shared directory **exists** at `/global/D1/cardiac_rv_shared` (group
+`cppm_via_users`, setgid).  Both `dtsteene` and `henriknf` are in that group.
+It holds everything that cannot travel through git:
+
+```
+/global/D1/cardiac_rv_shared/
+  src/        fenicsx-pulse, fenicsx-ldrb, fenicsx-warp, circulation
+              (the editable installs the conda env points at)
+  data/       input meshes + circulation JSONs   (gitignored in the repo)
+  results/    simulation outputs (2.5 TB)        (gitignored in the repo)
+```
+
 ```bash
 # 1. Clone the repo (needs collaborator access on github.com/dtsteene/cardiac-work)
 git clone git@github.com:dtsteene/cardiac-work.git
 cd cardiac-work
 
-# 2. Point the repo at the shared results dir.
-#    Option A — symlink (matches the production layout):
+# 2. Point the clone at the shared data + results (the cloned repo ships an empty
+#    results/docs and no data/, so replace them with symlinks to the shared dir):
+rm -rf results data
 ln -s /global/D1/cardiac_rv_shared/results results
+ln -s /global/D1/cardiac_rv_shared/data    data
 
-#    Option B — env var (no symlink needed):
-export CARDIAC_RESULTS_ROOT=/global/D1/cardiac_rv_shared/results
+# 3. Use the existing shared conda env (world-readable on /home, no rebuild):
+conda activate /home/dtsteene/.conda/envs/RV
+#   The sbatch scripts already default CARDIAC_CONDA_ENV to this full path,
+#   so batch jobs pick it up automatically.
 
-# 3. Sanity check
-python -c "import paths; print(paths.RESULTS_ROOT)"
+# 4. For sbatch jobs, point the path vars at your own clone (add to ~/.bashrc):
+export SIM_DIR="$PWD"      # used by sbatch/jobs/*.sbatch
+export WORK_DIR="$PWD"     # used by sbatch/sweeps/*
+
+# 5. Sanity check
+python -c "import paths, pulse, ldrb, circulation; print(paths.RESULTS_ROOT, pulse.__file__)"
 ```
 
-The shared results directory lives at `/global/D1/cardiac_rv_shared/results`
-(created by moving `results/` from the home directory — a pending step if it
-does not exist yet; the `mv` on beegfs is atomic and needs no extra space).
-`henriknf` is in the `cppm_via_users` group (gid 5009), which has `rwx` on the
-shared directory via setgid bit — no additional ACL setup is needed.
+**Why each piece is needed.** `henriknf` is *not* in group `uio`, and
+`/global/D1/homes/dtsteene` is `drwxr-x---` (uio only, not world-traversable),
+so neither the repo nor the env's editable source packages can be reached
+through the home directory.  That is why `src/`, `data/`, and `results/` live
+directly under `/global/D1/` with group `cppm_via_users` + setgid, and why the
+conda env's `.pth` files were repointed at `cardiac_rv_shared/src`.  The conda
+env itself sits on the node-shared `/home` filesystem and is world-readable, so
+it needs no copy — only the source trees it references had to move.
+
+> **One manual step, by dtsteene:** add `henriknf` as a collaborator on
+> `github.com/dtsteene/cardiac-work` (the `gh` CLI is not installed on the
+> cluster — do it from the GitHub web UI).
 
 > **Note on POSIX ACLs:** beegfs on ex3 does not support `setfacl`.  Sharing is
 > via group ownership (`cppm_via_users`) + setgid on all directories.
-> `/global/D1/homes/dtsteene` is not world-traversable, so the shared dir must
-> remain directly under `/global/D1/` (not under the home directory).
+> `/global/D1/homes/dtsteene` is not world-traversable, so the shared tree must
+> remain directly under `/global/D1/` (not under the home directory).  Existing
+> result subdirectories stay owned by `dtsteene` but are world-readable;
+> `results/{sims,analysis,log,handover}` are group-writable + setgid so new runs
+> from either user inherit the shared group.
 
 ---
 

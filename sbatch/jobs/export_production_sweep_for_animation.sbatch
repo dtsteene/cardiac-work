@@ -15,7 +15,7 @@
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 
-SIM_DIR="/home/dtsteene/D1/cardiac-work"
+SIM_DIR="${SIM_DIR:-/home/dtsteene/D1/cardiac-work}"
 
 echo "--- Export Sweep Animation Job Started: $SLURM_JOB_ID ---"
 date
@@ -23,13 +23,13 @@ echo "  Bundle: ${BUNDLE:-no_frank_starling}"
 
 module load anaconda3
 eval "$(conda shell.bash hook)"
-conda activate RV
+conda activate "${CARDIAC_CONDA_ENV:-/home/dtsteene/.conda/envs/RV}"
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 export MPICH_HYDRA_LAUNCHER=fork
 
 # Per-job FFCx / PyVista cache directory to avoid races when jobs run in parallel.
-CACHE_BASE="/global/D1/homes/dtsteene/tmp/fenics-cache"
+CACHE_BASE="${CACHE_BASE:-$HOME/tmp/fenics-cache}"
 export XDG_CACHE_HOME="${CACHE_BASE}/exportED_${SLURM_JOB_ID}"
 export TMPDIR="${XDG_CACHE_HOME}/tmp"
 mkdir -p "${XDG_CACHE_HOME}" "${TMPDIR}"

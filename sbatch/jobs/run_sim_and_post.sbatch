@@ -49,7 +49,7 @@ RV_EDP_OVERRIDE_MMHG=${RV_EDP_OVERRIDE_MMHG:-""}
 GEOMETRY_FIELDS=${GEOMETRY_FIELDS:-""}
 
 # --- 2. Paths & Environment ---
-SIM_DIR="/home/dtsteene/D1/cardiac-work"
+SIM_DIR="${SIM_DIR:-/home/dtsteene/D1/cardiac-work}"
 DATA_DIR="${SIM_DIR}/data"
 
 # --- 3. Geometry Logic & Parameter Checks ---
@@ -197,7 +197,7 @@ export XDG_CACHE_HOME="${WORK_DIR}/.cache"
 # --- 6. Environment ---
 module load anaconda3
 eval "$(conda shell.bash hook)"
-conda activate RV
+conda activate "${CARDIAC_CONDA_ENV:-/home/dtsteene/.conda/envs/RV}"
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 export MPICH_HYDRA_LAUNCHER=fork
@@ -229,7 +229,7 @@ if [ $CIRC_STATUS -ne 0 ]; then
     echo "FATAL: Circulation library check failed"
     echo "  $CIRC_CHECK"
     echo "  The installed circulation library does NOT have kE nonlinear EDPVR support."
-    echo "  Run: pip install -e /home/dtsteene/D1/circulation"
+    echo "  Run: pip install -e /global/D1/cardiac_rv_shared/src/circulation"
     echo "  Refusing to run simulation — would produce wrong hemodynamics."
     exit 1
 fi
@@ -332,6 +332,16 @@ if [ $SIM_EXIT -eq 0 ] && [ "$RUN_POSTPROCESS" = "1" ]; then
         else
             echo "Per-cell work computed"
         fi
+
+        # --- A2. AHA mid-ring tags (aha_tags.npy sidecar) — BEFORE postprocess ---
+        # gernerate_aha_biv on the geometry mesh, mapped to the per_cell ordering
+        # via the canonical ckpt_to_cg_idx permutation (serial, geometry-only).
+        # Must run before postprocess_metrics.py, which now reads this sidecar to
+        # build correct AHA Basal/Mid sub-regions (the checkpoint-mesh AHA was wrong).
+        echo "Running compute_aha_band.py ..."
+        $CONDA_PREFIX/bin/python ${SIM_DIR}/compute_aha_band.py "${RESULTS_DIR}" \
+            > "${RESULTS_DIR}/compute_aha_band.log" 2> "${RESULTS_DIR}/compute_aha_band.err" \
+            && echo "AHA mid-ring tags written" || echo "WARNING: compute_aha_band.py failed"
 
         # --- B. Boundary + loops: slim postprocess_metrics.py ---
         # With the 2026-04-13 refactor, default flags skip the regional

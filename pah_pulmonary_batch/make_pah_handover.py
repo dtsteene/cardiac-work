@@ -29,8 +29,10 @@ from matplotlib.cm import ScalarMappable
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # repo root on path
 import paths
-SWEEP = paths.RESULTS_ROOT / "sims/2026-06-09/pah_pulmonary_20260609_prodsweep"
-OUT = paths.RESULTS_ROOT / "handover/pah_pulmonary_paper_20260611"
+SWEEP = paths.RESULTS_ROOT / os.environ.get(
+    "PAH_SWEEP", "sims/2026-06-09/pah_pulmonary_20260609_prodsweep")
+OUT = paths.RESULTS_ROOT / os.environ.get(
+    "PAH_OUT", "handover/pah_pulmonary_paper_20260611")
 CASES = ["case0_rv25","case1_rv35","case2_rv45","case3_rv55",
          "case4_rv65","case5_rv75","case6_rv85","case7_rv95"]
 BUNDLES = {
@@ -95,20 +97,42 @@ def rv_systolic(case_dir):
     n = len(p); lb = slice(n - n // NBEATS, n)
     return float(p[:, 1][lb].max())
 
-def aggregate(bundle):
+AHA_MID = (4, 5, 6)   # Mid_LV / Mid_RV / Mid_Septum — the canonical AHA mid ring
+
+def load_aha(cd, ncells):
+    """Per-cell AHA biventricular tag (0=Apical,1-3=Basal,4-6=Mid LV/RV/Sep).
+    Uses the `aha_tags.npy` sidecar from compute_aha_band.py (the proven path —
+    gernerate_aha_biv on the geometry mesh mapped via ckpt_to_cg_idx). Returns None
+    if absent, so callers skip the mid band cleanly."""
+    side = cd / "aha_tags.npy"
+    if side.exists():
+        a = np.load(side).astype(np.int32)
+        if len(a) == ncells:
+            return a
+    return None
+
+def aggregate(bundle, band="full"):
     """Per-case, per-region true work + the 6 ll pressure-strain proxies.
-    Work reported positive (negate the dW-convention sum)."""
+    Work reported positive (negate the dW-convention sum).
+    band="full" uses the whole LDRB region; band="mid" restricts to the AHA mid ring
+    (tags 4/5/6) intersected with the region — the mid-ventricular slab away from base
+    and apex."""
     rows = []
     for c in CASES:
         cd = SWEEP / bundle / c
         z = np.load(cd / "per_cell_data.npz", allow_pickle=True)
         tags = z["region_tags"]
+        aha = load_aha(cd, len(tags))
+        if band == "mid" and aha is None:
+            raise FileNotFoundError(
+                f"{cd}: no AHA tags (run compute_aha_band.py) — cannot aggregate band='mid'")
+        midmask = np.isin(aha, AHA_MID) if aha is not None else np.ones(len(tags), bool)
         dlv, drv = z["d_lv"], z["d_rv"]
         lam = dlv / (dlv + drv + 1e-30)                       # 0 at LV face -> 1 at RV face
         affine = (1 - lam) * z["proxy_PLV_ll"] + lam * z["proxy_PRV_ll"]
         row = {"case": c, "sev": rv_systolic(cd)}
         for r, tag in REG.items():
-            m = tags == tag
+            m = (tags == tag) & midmask if band == "mid" else (tags == tag)
             row[f"{r}_W"] = -float(z["w_total"][m].sum())      # true SS work (positive)
             row[f"{r}_Wff"] = -float(z["w_ff"][m].sum())
             row[f"{r}_PLV"]   = -float(z["proxy_PLV_ll"][m].sum())
@@ -262,6 +286,45 @@ def fig_work_dynamic_range(df, out):
     savefig(fig, out / "work_dynamic_range")
 
 # --------------------------------------------------------------------------- #
+# Full region vs AHA mid ring
+# --------------------------------------------------------------------------- #
+def fig_band_compare(df_full, df_mid, out):
+    """Full LDRB region vs AHA mid ring (tags 4/5/6), per region.
+    (top) proxy correlation r(true work, P x eps_ll) for each pressure choice;
+    (bottom) true-work dynamic range (% of sweep-mean). Restricting to the mid slab
+    removes the base/apex, where fibre orientation and tethering differ — this shows
+    whether the proxy conclusions and the RV-only dynamic range survive that cut."""
+    regs = list(REG)
+    fig, axes = plt.subplots(2, 3, figsize=(14.5, 8.0), constrained_layout=True)
+    xp = np.arange(len(PCHOICES)); w = 0.38
+    for j, reg in enumerate(regs):
+        ax = axes[0, j]
+        rf = [r_value(df_full[f"{reg}_{k}"], df_full[f"{reg}_W"]) for k, _ in PCHOICES]
+        rm = [r_value(df_mid[f"{reg}_{k}"], df_mid[f"{reg}_W"]) for k, _ in PCHOICES]
+        ax.bar(xp - w/2, rf, w, label="full region", color="#9ecae1", ec="k", lw=0.4)
+        ax.bar(xp + w/2, rm, w, label="AHA mid ring", color="#08519c", ec="k", lw=0.4)
+        ax.axhline(0, color="0.5", lw=0.8); ax.set_ylim(-1.05, 1.05)
+        ax.set_xticks(xp); ax.set_xticklabels([SHORT[k] for k, _ in PCHOICES], fontsize=8)
+        ax.set_title(reg, fontweight="bold")
+        if j == 0:
+            ax.set_ylabel("r(true work, proxy)"); ax.legend(frameon=False, fontsize=9)
+        style(ax)
+    for j, reg in enumerate(regs):
+        ax = axes[1, j]
+        for df_, lab, col in [(df_full, "full region", "#9ecae1"),
+                              (df_mid, "AHA mid ring", "#08519c")]:
+            o = np.argsort(df_["sev"]); x = df_["sev"][o]; W = df_[f"{reg}_W"][o]
+            rng = 100 * (W.max() - W.min()) / abs(W.mean())
+            ax.plot(x, 100 * (W - W.mean()) / abs(W.mean()), "-o", color=col, lw=2.0, ms=4,
+                    label=f"{lab} (range {rng:.0f}%)")
+        ax.axhline(0, color="0.6", lw=0.8); ax.set_xlabel(SEV)
+        if j == 0:
+            ax.set_ylabel("true work dev. from mean (%)")
+        ax.legend(frameon=False, fontsize=8.5); style(ax)
+    fig.suptitle("Full LDRB region vs AHA mid ring", fontsize=13, fontweight="bold")
+    savefig(fig, out / "band_compare")
+
+# --------------------------------------------------------------------------- #
 # Ratio
 # --------------------------------------------------------------------------- #
 def fig_ratio_spectrum(df, out):
@@ -318,6 +381,13 @@ def load_loop(cd):
     m = np.load(cd / "metrics/metrics_downsample_1.npy", allow_pickle=True).item()
     o = np.load(cd / "ode_state_history.npy", allow_pickle=True).item()
     sp = np.load(cd / "solver/solver_cavity_pressure_mmHg.npy").astype(float)
+    # Return the FEM cavity volumes the model actually sees (V_FEM = V_0D * ratio), NOT the
+    # raw coupled 0D volumes. Plotting the 0D volume against FEM pressure is misleading: the
+    # per-case coupling ratio can clamp the FEM preload (0D EDV varies far more than the FEM
+    # cavity does). Coupled plots must only show what the FEM sees.
+    _sp = json.load(open(cd / "simulation_params.json"))
+    o["V_LV"] = np.asarray(o["V_LV"]) * float(_sp.get("ratio_LV", 1.0))
+    o["V_RV"] = np.asarray(o["V_RV"]) * float(_sp.get("ratio_RV", 1.0))
     return m, o, sp
 
 def last_beat_slice(n):
@@ -334,7 +404,7 @@ def fig_pv_coupled(df, bundle, out):
         axes[0].plot(np.asarray(o["V_LV"])[:mn][lo], sp[:, 0][lb][:len(np.asarray(o["V_LV"])[:mn][lo])], color=col, lw=1.4, alpha=0.85)
         axes[1].plot(np.asarray(o["V_RV"])[:mn][lo], sp[:, 1][lb][:len(np.asarray(o["V_RV"])[:mn][lo])], color=col, lw=1.4, alpha=0.85)
     for ax, t in zip(axes, ["LV", "RV"]):
-        ax.set_title(t, fontweight="bold"); ax.set_xlabel("Volume (mL)"); ax.set_ylabel("cavity pressure (mmHg)"); style(ax)
+        ax.set_title(t, fontweight="bold"); ax.set_xlabel("FEM cavity volume (mL)"); ax.set_ylabel("cavity pressure (mmHg)"); style(ax)
     sm = ScalarMappable(cmap=CMAP, norm=norm); sm.set_array([])
     cb = fig.colorbar(sm, ax=axes, shrink=0.85, pad=0.02, aspect=30); cb.set_label(SEV, fontsize=9)
     fig.suptitle("Coupled FEM cavity pressure-volume loops", fontsize=12)
@@ -362,40 +432,50 @@ def fig_pv_0d(df, bundle, out):
     fig.suptitle("Standalone 0D circulation PV loops (pre-coupling)", fontsize=12)
     savefig(fig, out / "loops_pv_0d")
 
-def fig_stress_pressure_strain(df, bundle, out, frame):
-    """3 rows (LV/RV/Septum) x 2 cols: fibre stress-strain | pressure-strain."""
+def fig_stress_pressure_strain(df, bundle, out, frame, band="full"):
+    """3 rows (LV/RV/Septum) x 2 cols: fibre stress-strain | pressure-strain.
+    band='mid' uses the AHA mid-ring region keys (Mid_LV/Mid_RV/Mid_Septum)."""
     sev = df["sev"]; norm = Normalize(sev.min(), sev.max())
     regs = ["LV", "RV", "Septum"]
+    keyreg = {r: (f"Mid_{r}" if band == "mid" else r) for r in regs}
     pkey = {"LV": 0, "RV": 1, "Septum": 0}   # septum uses LV pressure axis for the PS panel
     fig, axes = plt.subplots(3, 2, figsize=(10.6, 12.5), constrained_layout=True)
+    miss = False
     for i, c in enumerate(CASES):
         m, o, sp = load_loop(SWEEP / bundle / c)
         col = CMAP(norm(df["sev"][i]))
         nm = len(np.asarray(m["mean_E_ff_LV"])); lbm = last_beat_slice(nm)   # last beat only
         nsp = sp.shape[0]; lbp = last_beat_slice(nsp)
         for ri, reg in enumerate(regs):
-            Eff = frame_strain(np.asarray(m[f"mean_E_ff_{reg}"])[lbm], frame)
-            Sff = np.asarray(m[f"mean_S_ff_{reg}"])[lbm] * PA_TO_KPA
-            Ell = frame_strain(np.asarray(m[f"mean_E_ll_{reg}"])[lbm], frame) * 100.0
+            kr = keyreg[reg]
+            if f"mean_E_ff_{kr}" not in m or np.allclose(np.asarray(m[f"mean_E_ff_{kr}"]), 0):
+                miss = True; continue
+            Eff = frame_strain(np.asarray(m[f"mean_E_ff_{kr}"])[lbm], frame)
+            Sff = np.asarray(m[f"mean_S_ff_{kr}"])[lbm] * PA_TO_KPA
+            Ell = frame_strain(np.asarray(m[f"mean_E_ll_{kr}"])[lbm], frame) * 100.0
             P = sp[:, pkey[reg]][lbp]
             L = min(len(Eff), len(P))
             axes[ri, 0].plot(Eff[:L], Sff[:L], color=col, lw=1.4, alpha=0.85)
             axes[ri, 1].plot(Ell[:L], P[:L], color=col, lw=1.4, alpha=0.85)
+    if miss:
+        print(f"   [fig_stress_pressure_strain band={band}] missing/zero Mid_* traces — "
+              f"re-run postprocess_metrics with the AHA sidecar present")
     plab = {0: "$P_{LV}$", 1: "$P_{RV}$"}   # which cavity pressure drives each PS panel
-    axes[0, 0].set_title("Fibre stress-strain (model)", fontweight="bold")
-    axes[0, 1].set_title("Pressure-longitudinal-strain (clinical proxy)", fontweight="bold")
+    bl = "  (AHA mid ring)" if band == "mid" else ""
+    axes[0, 0].set_title("Fibre stress-strain (model)" + bl, fontweight="bold")
+    axes[0, 1].set_title("Pressure-longitudinal-strain (clinical proxy)" + bl, fontweight="bold")
     for ri, reg in enumerate(regs):
         pl = plab[pkey[reg]]
         axes[ri, 0].set_ylabel("$S_{ff}$ (kPa)"); axes[ri, 0].set_xlabel("$E_{ff}$")
         # the cavity pressure for this region is communicated by the y-axis label alone
         axes[ri, 1].set_ylabel(f"{pl} (mmHg)", fontsize=14, fontweight="bold")
         axes[ri, 1].set_xlabel(r"$\varepsilon_{ll}$ (%)")
-        axes[ri, 0].annotate(reg, xy=(-0.25, 0.5), xycoords="axes fraction", fontsize=13,
+        axes[ri, 0].annotate(keyreg[reg], xy=(-0.25, 0.5), xycoords="axes fraction", fontsize=13,
                              fontweight="bold", rotation=90, ha="center", va="center")
         for col_i in range(2): style(axes[ri, col_i])
     sm = ScalarMappable(cmap=CMAP, norm=norm); sm.set_array([])
     cb = fig.colorbar(sm, ax=axes, shrink=0.5, pad=0.02, aspect=40); cb.set_label(SEV, fontsize=9)
-    savefig(fig, out / "loops_stress_pressure_strain")
+    savefig(fig, out / ("loops_stress_pressure_strain_mid" if band == "mid" else "loops_stress_pressure_strain"))
 
 def fig_septum_candidate_loops(df, bundle, out, frame):
     """Septum only: fibre stress-strain loop + every candidate cavity-pressure
@@ -459,9 +539,31 @@ def main():
     for bundle, desc in BUNDLES.items():
         base = OUT / bundle
         cdir = base / "correlation"; rdir = base / "ratio"; qdir = base / "loops"; ddir = base / "data"
-        for d in (cdir, rdir, qdir, ddir): d.mkdir(parents=True, exist_ok=True)
+        bdir = base / "band_compare"
+        for d in (cdir, rdir, qdir, ddir, bdir): d.mkdir(parents=True, exist_ok=True)
         df = aggregate(bundle)
         print(f"[{bundle}] n={len(df['case'])}  RV sys {df['sev'].min():.0f}-{df['sev'].max():.0f} mmHg")
+        # Full LDRB region vs AHA mid ring (tags 4/5/6). Skip gracefully if the AHA
+        # tags have not been backfilled yet (compute_aha_band.py / current per_cell run).
+        try:
+            df_mid = aggregate(bundle, band="mid")
+            fig_band_compare(df, df_mid, bdir)
+            # Mid-ring headline figures. Only the RV has real dynamic range here too
+            # (work range ~65-95% of mean); LV and septum stay flat (~5-14%), so their
+            # proxy r is the monotonic confound, not tracking — show RV correlation
+            # only, and let work_dynamic_range / true_vs_proxy_range make the
+            # "LV+septum are flat" point honestly.
+            fig_region_correlation(df_mid, "RV", bdir)
+            fig_true_vs_proxy_range(df_mid, bdir)
+            fig_work_dynamic_range(df_mid, bdir)
+            allr_mid = {region: {k: r_value(df_mid[f"{region}_{k}"], df_mid[f"{region}_W"])
+                                 for k, _ in PCHOICES} for region in REG}
+            write_tables(df_mid, allr_mid, bdir)
+            print("  mid-ring r:")
+            for r in REG:
+                print("    %-7s "%r + "  ".join(f"{k}={allr_mid[r][k]:+.2f}" for k,_ in PCHOICES))
+        except FileNotFoundError as e:
+            print(f"  (skipping mid-ring band: {e})")
         # Correlations are only meaningful where true work has dynamic range. In this
         # pulmonary sweep only the RV does (range ~70-95% of mean); LV and septum vary
         # ~5-13% (CV ~2-4%) so their proxy r is noise and flips sign across bundles.
@@ -477,6 +579,7 @@ def main():
         for frame in ("ED", "unloaded"):
             fdir2 = qdir / frame; fdir2.mkdir(parents=True, exist_ok=True)
             fig_stress_pressure_strain(df, bundle, fdir2, frame)
+            fig_stress_pressure_strain(df, bundle, fdir2, frame, band="mid")
             fig_septum_candidate_loops(df, bundle, fdir2, frame)
         write_tables(df, allr, ddir)
         summary[bundle] = allr

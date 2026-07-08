@@ -177,13 +177,26 @@ LV angles: alpha_endo=+60, alpha_epi=-60. RV angles: alpha_endo=+90, alpha_epi=-
 - Regions in key names: `_LV`, `_RV`, `_Septum`
 
 ## Dual-Frame Strain Convention
-Strain loops are available in two reference frames from `pah_pulmonary_batch/make_pah_handover.py`:
+Strain loops are emitted in two reference frames by `pah_pulmonary_batch/make_pah_handover.py`
+(figures land in `loops/ED/` and `loops/unloaded/`):
 - **Unloaded frame** — raw Green-Lagrange E (ED sits at ~+5-10% stretch)
-- **Clinical frame** — E − E[ED], re-zeroed at end-diastole (shortening reads negative;
-  matches speckle-tracking convention)
+- **ED frame** — E − E[ED], re-zeroed at end-diastole (shortening reads negative;
+  matches speckle-tracking; this is the clinically-measurable view)
 
 The proxy work ∮ P dε is offset-invariant, so frame choice does not change r-values
 or ratios. Correlation and ratio figures use a single figure set.
+
+## 0D PV Loops: standalone vs coupled
+- `loops/loops_pv_0d` — the **standalone** 0D circulation, pre-coupling warm-up,
+  read from `circulation/preload_history.npy` (the converged Regazzoni run on its own);
+  last beat (RR=0.8 s). This is the 0D model's intrinsic PV behaviour.
+- `loops/loops_pv_coupled` — FEM cavity pressure (`solver/`) vs coupled volume.
+  Do NOT read `ode_state_history.npy` for the "0D" loops — that is the *coupled* 0D state
+  and is near-identical to the coupled FEM loop.
+
+Pedagogical/presentation figures are in `pah_pulmonary_batch/make_presentation.py`
+(ED-vs-unloaded, proxy-vs-true, spectrum summary) and `make_dsign_animation.py`
+(septal D-sign short-axis work-density GIF); outputs under `<bundle>/presentation/`.
 
 ## Critical Bugs (Fixed, But Be Aware)
 

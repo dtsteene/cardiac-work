@@ -51,3 +51,14 @@ pah_pulmonary_batch/circ_params/pulcal_*.json
 pah_pulmonary_batch/circ_params/remap_*.json
 pah_pulmonary_batch/circ_params/ext_*.json
 pah_pulmonary_batch/circ_params/baseline_linear.json
+
+# data/results are symlinks to /global/D1/cardiac_rv_shared (collaborator-shared)
+/data
+/results
+
+# Slurm job logs (swept into logs/slurm/; reproducible scratch, not source)
+slurm-*.out
+slurm-*.err
+
+# Packed conda env / tarballs (env lives in /global/D1/cardiac_rv_shared/env)
+*.tar.gz

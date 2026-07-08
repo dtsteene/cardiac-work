@@ -28,7 +28,7 @@ SHARED_UNLOADED_NOTE="${SHARED_UNLOADED_NOTE:-char-5 inverse-unloaded reference,
 
 # 8 linear-EDPVR cases on baseline_linear_v2 (even in COUPLED RV systolic 25->95
 # mmHg; PUL R up / C down at conserved RC~0.33; shared 8/5 unloaded reference)
-CASES_GLOB="${PARAM_DIR}/case*_rv*.json"
+CASES_GLOB="${CASES_GLOB:-${PARAM_DIR}/case*_rv*.json}"
 STAMP="${STAMP:-$(date +%Y%m%d_%H%M%S)}"
 RESULTS_ROOT="${RESULTS_ROOT:-${WORK_DIR}/results/sims/$(date +%F)/pah_pulmonary_${STAMP}}"
 ANALYSIS_DIR="${ANALYSIS_DIR:-${WORK_DIR}/results/analysis/pah_pulmonary_sweep_${STAMP}}"
@@ -96,17 +96,24 @@ for bundle in "${BUNDLES[@]}"; do
             jid="DRYRUN"
             echo "      (dry) export: ALL,MESH=UKB,BPM=75,BEATS=6,POST_FULL=0,RUN_POSTPROCESS=1,CHAR_LENGTH=5.0,METRICS_SPACE=DG1,${extra_env},CIRCULATION_PARAMS=${json},GEOMETRY_DIR=...,LOAD_UNLOADED_FROM=...,RESULTS_DIR_OVERRIDE=${result_dir}"
         else
-            pin_node="${NODES_ARR[$(( node_i % ${#NODES_ARR[@]} ))]}"
-            node_i=$(( node_i + 1 ))
+            # Node pinning is optional: set NODES=none to let Slurm schedule freely
+            # (used when moving to mi50q/habanaq, which have few but large nodes).
+            if [ "${NODES:-}" = "none" ]; then
+                NODELIST_ARG=()
+            else
+                pin_node="${NODES_ARR[$(( node_i % ${#NODES_ARR[@]} ))]}"
+                node_i=$(( node_i + 1 ))
+                NODELIST_ARG=(--nodelist="${pin_node}")
+            fi
             jid=$(sbatch --parsable \
                 --partition="${PARTITION:-milanq}" \
-                --nodelist="${pin_node}" \
+                "${NODELIST_ARG[@]}" \
                 --signal=B:TERM@300 \
                 --job-name="pahpulm_${bundle:0:4}_${case_name}" \
                 --time="${WALLTIME}" \
-                --export=ALL,MESH=UKB,BPM=75,BEATS=6,POST_FULL=0,RUN_POSTPROCESS=1,CHAR_LENGTH=5.0,METRICS_SPACE=DG1,${extra_env},CIRCULATION_PARAMS="${json}",GEOMETRY_DIR="${GEOM_DIR}",GEOMETRY_FIELDS="${GEOM_FIELDS}",LOAD_UNLOADED_FROM="${SHARED_UNLOADED_FROM}",PRE_CIRC_BEATS=30,PRE_CIRC_MAX_BEATS=80,PRE_CIRC_CONVERGENCE_TOL=0.002,RESULTS_DIR_OVERRIDE="${result_dir}",COMMENT="${comment}" \
+                --export=ALL,MESH=UKB,BPM=75,BEATS=6,POST_FULL=0,RUN_POSTPROCESS=1,CHAR_LENGTH=5.0,METRICS_SPACE=DG1,${extra_env},FIXED_RATIO_LV="${FIXED_RATIO_LV:-}",FIXED_RATIO_RV="${FIXED_RATIO_RV:-}",CIRCULATION_PARAMS="${json}",GEOMETRY_DIR="${GEOM_DIR}",GEOMETRY_FIELDS="${GEOM_FIELDS}",LOAD_UNLOADED_FROM="${SHARED_UNLOADED_FROM}",PRE_CIRC_BEATS=30,PRE_CIRC_MAX_BEATS=80,PRE_CIRC_CONVERGENCE_TOL=0.002,RESULTS_DIR_OVERRIDE="${result_dir}",COMMENT="${comment}" \
                 "${WORK_DIR}/sbatch/jobs/run_sim_and_post.sbatch")
-            echo "      -> ${pin_node}, walltime ${WALLTIME}"
+            echo "      -> ${pin_node:-${PARTITION:-milanq}}, walltime ${WALLTIME}"
         fi
 
         if [ -n "${jid}" ]; then

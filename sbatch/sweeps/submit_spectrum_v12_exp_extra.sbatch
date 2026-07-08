@@ -18,7 +18,7 @@
 #SBATCH --output=fem_dispatch_exp_extra_%j.out
 #SBATCH --error=fem_dispatch_exp_extra_%j.err
 
-WORK_DIR="/global/D1/homes/dtsteene/cardiac-work"
+WORK_DIR="${WORK_DIR:-/global/D1/homes/dtsteene/cardiac-work}"
 DATA_DIR="${WORK_DIR}/data/ukb_circ_v12_exp"
 CASES="sPAP25 sPAP35 sPAP50 sPAP60 sPAP70 sPAP80 sPAP87 sPAP92"
 

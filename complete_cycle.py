@@ -610,6 +610,19 @@ if RESTART_MODE:
 else:
     ratio_LV = init_state_circ["V_LV"].magnitude / circ_state["V_LV"]
     ratio_RV = init_state_circ["V_RV"].magnitude / circ_state["V_RV"]
+    # Fixed-ratio coupling (2026-06-22): the per-case ratio above (Mesh_ED / this case's
+    # 0D warm-up ED) re-normalises every case back to the mesh ED, which clamps the FEM
+    # preload and discards the across-case dilation. Setting FIXED_RATIO_{LV,RV} pins a
+    # single reference ratio (case0 baseline) for ALL cases so the FEM feels the real
+    # preload spread (the imaged mesh = baseline; higher afterload dilates from there).
+    _fr_lv = os.environ.get("FIXED_RATIO_LV", "").strip()
+    _fr_rv = os.environ.get("FIXED_RATIO_RV", "").strip()
+    if _fr_lv and _fr_rv:
+        ratio_LV = float(_fr_lv)
+        ratio_RV = float(_fr_rv)
+        if comm.rank == 0:
+            logger.info(f"FIXED coupling ratios from env (overriding per-case): "
+                        f"LV={ratio_LV:.5f}, RV={ratio_RV:.5f}")
 
 if comm.rank == 0:
     logger.info(f"Coupling Ratios (Mesh/Circ): LV={ratio_LV:.4f}, RV={ratio_RV:.4f}")

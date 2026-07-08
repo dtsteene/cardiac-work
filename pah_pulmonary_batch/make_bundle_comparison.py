@@ -102,7 +102,7 @@ def fig_pv_loops_grid(out, drop_relax=False):
                 V, P = _rv_loop(o, sp, vk, pcol)
                 ax.plot(V, P, color=H.CMAP(norm(H.rv_systolic(H.SWEEP / b / c))),
                         lw=1.3, alpha=0.85)
-            ax.set_xlabel(f"{ch} volume (mL)"); H.style(ax)
+            ax.set_xlabel(f"{ch} FEM cavity volume (mL)"); H.style(ax)
             ax.set_ylabel((f"{lab}\n" if ci == 0 else "") + f"{ch} pressure (mmHg)",
                           fontsize=9 if ci == 0 else 10)
             if ri == 0:
@@ -182,11 +182,23 @@ def fig_rv_proxy_confound(out, bundle="no_frank_starling"):
     pattern. This is the figure that must NOT be glossed over: it shows the correlation
     argument for RV pressure is confounded by monotonicity, n=8."""
     df = H.aggregate(bundle)
-    names = ["true work", "$P_{LV}$", "$P_{RV}$", "mean", "sum", "trans"]
+    def beat(a):
+        a = np.asarray(a); return a[H.last_beat_slice(len(a))]
+    def loop(x, y):
+        return 0.5 * (np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+    eps_amp, normP = [], []   # bare strain amplitude; pressure-shape-only proxy
+    for c in H.CASES:
+        m, o, sp = H.load_loop(H.SWEEP / bundle / c)
+        e = beat(m["mean_E_ll_RV"]) * 100; pR = beat(sp[:, 1]); L = min(len(e), len(pR))
+        e, pR = e[:L], pR[:L]
+        eps_amp.append(e.max() - e.min())
+        normP.append(loop(e, pR / pR.max()))
+    names = ["true work", "$P_{LV}$", "$P_{RV}$", "mean", "sum", "trans",
+             r"$\varepsilon_{ll}$", "$P_{RV}$/pk"]
     keys = ["RV_W", "RV_PLV", "RV_PRV", "RV_Mean", "RV_Sum", "RV_Trans"]
-    cols = [np.asarray(df[k], float) for k in keys]
+    cols = [np.asarray(df[k], float) for k in keys] + [np.array(eps_amp), np.array(normP)]
     M = np.array([[np.corrcoef(a, b)[0, 1] for b in cols] for a in cols])
-    fig, ax = plt.subplots(figsize=(6.2, 5.6))
+    fig, ax = plt.subplots(figsize=(7.2, 6.4))
     im = ax.imshow(M, cmap="RdBu_r", vmin=-1, vmax=1)
     ax.set_xticks(range(len(names))); ax.set_xticklabels(names, rotation=30, fontsize=10)
     ax.set_yticks(range(len(names))); ax.set_yticklabels(names, fontsize=10)
@@ -195,8 +207,10 @@ def fig_rv_proxy_confound(out, bundle="no_frank_starling"):
             ax.text(j, i, f"{M[i,j]:+.2f}", ha="center", va="center", fontsize=10,
                     color="white" if abs(M[i, j]) > 0.55 else "black")
     cb = fig.colorbar(im, ax=ax, shrink=0.85, pad=0.03); cb.set_label("Pearson r")
-    ax.set_title("RV pressure proxies — pairwise correlation across the sweep", fontsize=11)
-    H.savefig(fig, out / "rv_proxy_confound")
+    blab = {"no_frank_starling": "no FS", "frank_starling_preload": "FS preload (ED)",
+            "frank_starling_relax": "FS relax"}.get(bundle, bundle)
+    ax.set_title(f"RV pressure proxies — pairwise correlation across the sweep ({blab})", fontsize=11)
+    H.savefig(fig, out / f"rv_proxy_confound_{bundle}")
 
 
 def fig_transmural_diagnostic(out, case="case7_rv95", bundle="no_frank_starling"):
@@ -247,7 +261,8 @@ def main():
     fig_hemodynamics_delta(out)
     fig_activation_stress_curves(out)
     fig_energetics_delta(out)
-    fig_rv_proxy_confound(out)
+    fig_rv_proxy_confound(out, "no_frank_starling")
+    fig_rv_proxy_confound(out, "frank_starling_preload")
     fig_transmural_diagnostic(out)
     print(f"wrote comparison figures -> {out}")
 

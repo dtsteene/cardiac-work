@@ -37,7 +37,7 @@ case "$MESH_KEY" in
         ;;
 esac
 
-WORK_DIR="/global/D1/homes/dtsteene/cardiac-work"
+WORK_DIR="${WORK_DIR:-/global/D1/homes/dtsteene/cardiac-work}"
 DATA_DIR="${WORK_DIR}/data/patient_mesh_circ_v12_exp/${MESH_KEY}"
 MANIFEST_DIR="${WORK_DIR}/results/patient_mesh_sweep"
 MANIFEST="${MANIFEST_DIR}/${MESH_KEY}_jobs_${SLURM_JOB_ID}.tsv"

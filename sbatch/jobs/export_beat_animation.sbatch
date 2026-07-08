@@ -23,7 +23,7 @@
 #SBATCH --output=slurm-%j.out
 #SBATCH --error=slurm-%j.err
 
-SIM_DIR="/home/dtsteene/D1/cardiac-work"
+SIM_DIR="${SIM_DIR:-/home/dtsteene/D1/cardiac-work}"
 
 echo "--- Beat Animation Export Started: $SLURM_JOB_ID ---"
 date
@@ -32,13 +32,13 @@ echo "  Cases:  ${CASES:-case0_rv25 case7_rv95}"
 
 module load anaconda3
 eval "$(conda shell.bash hook)"
-conda activate RV
+conda activate "${CARDIAC_CONDA_ENV:-/home/dtsteene/.conda/envs/RV}"
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 export MPICH_HYDRA_LAUNCHER=fork
 
 # Per-job FFCx / PyVista cache directory to avoid JIT compilation races.
-CACHE_BASE="/global/D1/homes/dtsteene/tmp/fenics-cache"
+CACHE_BASE="${CACHE_BASE:-$HOME/tmp/fenics-cache}"
 export XDG_CACHE_HOME="${CACHE_BASE}/exportBeat_${SLURM_JOB_ID}"
 export TMPDIR="${XDG_CACHE_HOME}/tmp"
 mkdir -p "${XDG_CACHE_HOME}" "${TMPDIR}"

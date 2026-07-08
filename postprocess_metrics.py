@@ -330,28 +330,44 @@ if rank == 0:
 # Uses LDRB apex-to-base Laplace solution to split LV/RV/Septum into
 # Basal (1-3), Mid (4-6) sub-regions for reliable patch-level metrics.
 
-import ldrb.aha
-from cardiac_geometries.mesh import transform_markers
-
-ldrb_markers = transform_markers(geo.markers, clipped=True)
-aha_func = ldrb.aha.gernerate_aha_biv(
-    mesh=mesh, ffun=ffun, markers=ldrb_markers,
-    function_space="DG_0",
-)
-
-# Convert DG0 function to MeshTags
+# AHA tags come from the aha_tags.npy sidecar (compute_aha_band.py), which runs
+# gernerate_aha_biv on the GEOMETRY mesh and maps cells via the canonical
+# ckpt_to_cg_idx permutation. We must NOT call gernerate_aha_biv on the adios
+# checkpoint mesh+ffun here: it mis-segments (produces almost-all-apical garbage,
+# no RV/septum), which silently zeroed every Mid_RV/Mid_Septum metric.
+#
+# The sidecar is in the per_cell_data.npz gather ordering; we map it onto this
+# run's (possibly MPI-distributed) checkpoint cells by matching reference cell
+# centroids — both are the same checkpoint reference mesh, so the match is exact
+# and rank-independent.
 imap = mesh.topology.index_map(3)
 _total_cells = imap.size_local + imap.num_ghosts
-aha_values = aha_func.x.array[:_total_cells].astype(np.int32)
-aha_mt = dolfinx.mesh.meshtags(mesh, 3, np.arange(_total_cells, dtype=np.int32), aha_values)
-
-if rank == 0:
-    aha_labels = {0: "Apical", 1: "Basal_LV", 2: "Basal_RV", 3: "Basal_Septum",
-                  4: "Mid_LV", 5: "Mid_RV", 6: "Mid_Septum"}
-    logger.info("AHA region counts:")
-    local_counts = np.bincount(aha_values, minlength=7)
-    for v in range(7):
-        logger.info(f"  {aha_labels[v]:>14s} (tag {v}): {local_counts[v]} cells")
+_side = results_dir / "aha_tags.npy"
+_pc = results_dir / "per_cell_data.npz"
+aha_mt = None
+if _side.exists() and _pc.exists():
+    from scipy.spatial import cKDTree
+    _aha_side = np.load(_side).astype(np.int32)
+    _npz_c = np.asarray(np.load(_pc, allow_pickle=True)["centroids"], float)
+    _local_c = dolfinx.mesh.compute_midpoints(
+        mesh, 3, np.arange(_total_cells, dtype=np.int32))
+    _d, _idx = cKDTree(_npz_c).query(_local_c)
+    if float(_d.max()) > 1e-4:
+        logger.warning(f"AHA sidecar centroid match max dist {_d.max():.2e} m is large; "
+                       f"Mid regions may be unreliable.")
+    aha_values = _aha_side[_idx].astype(np.int32)
+    aha_mt = dolfinx.mesh.meshtags(mesh, 3, np.arange(_total_cells, dtype=np.int32), aha_values)
+    if rank == 0:
+        aha_labels = {0: "Apical", 1: "Basal_LV", 2: "Basal_RV", 3: "Basal_Septum",
+                      4: "Mid_LV", 5: "Mid_RV", 6: "Mid_Septum"}
+        logger.info("AHA region counts (from aha_tags.npy sidecar):")
+        local_counts = np.bincount(aha_values, minlength=7)
+        for v in range(7):
+            logger.info(f"  {aha_labels[v]:>14s} (tag {v}): {local_counts[v]} cells")
+else:
+    if rank == 0:
+        logger.warning("No aha_tags.npy sidecar (run compute_aha_band.py) — "
+                       "AHA Basal/Mid sub-region metrics disabled.")
 
 # ─── 5. Load Fiber Fields ────────────────────────────────────────────────────
 # Fibers were saved into checkpoint.bp by complete_cycle.py (same file = correct DOFs)

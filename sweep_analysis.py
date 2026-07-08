@@ -42,17 +42,19 @@ from analysis_core import (
 )
 
 
-ROOT = Path("/home/dtsteene/D1/cardiac-work")
-SIM_ROOT = ROOT / "results" / "sims"
-OUT = Path(os.environ.get("SWEEP_OUT", ROOT / "results" / "analysis" / "sweep"))
+from paths import REPO_ROOT, RESULTS_ROOT
+
+ROOT = REPO_ROOT
+SIM_ROOT = RESULTS_ROOT / "sims"
+OUT = Path(os.environ.get("SWEEP_OUT", RESULTS_ROOT / "analysis" / "sweep"))
 MANIFEST = Path(
     os.environ.get(
         "SWEEP_MANIFEST",
-        ROOT / "results" / "analysis" / "h5_sweep_submission" / "h5_corrected_sweep_cases.tsv",
+        RESULTS_ROOT / "analysis" / "h5_sweep_submission" / "h5_corrected_sweep_cases.tsv",
     )
 )
 # Coarser reference mesh (h=10 mm) used only for the mesh-convergence QoI diff.
-H10_MANIFEST = ROOT / "results" / "important_sims" / "manifests" / "new_sweep_v12_exp_n16.csv"
+H10_MANIFEST = RESULTS_ROOT / "important_sims" / "manifests" / "new_sweep_v12_exp_n16.csv"
 
 # KPA, PROXIES (=PRESSURE_CHOICES), STRAINS, COMPONENTS now come from analysis_core.
 RV_BRIDGE_CANDIDATES = [

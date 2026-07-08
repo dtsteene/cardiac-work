@@ -29,7 +29,7 @@ if [ -z "${OUT_BASE:-}" ]; then
     exit 2
 fi
 
-SIM_DIR="/home/dtsteene/D1/cardiac-work"
+SIM_DIR="${SIM_DIR:-/home/dtsteene/D1/cardiac-work}"
 
 echo "--- Mesh convergence geometry job started: ${SLURM_JOB_ID} ---"
 date
@@ -38,7 +38,7 @@ echo "  OUT_BASE:    ${OUT_BASE}"
 
 module load anaconda3
 eval "$(conda shell.bash hook)"
-conda activate RV
+conda activate "${CARDIAC_CONDA_ENV:-/home/dtsteene/.conda/envs/RV}"
 
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1

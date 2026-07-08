@@ -27,11 +27,11 @@ RETAG_SEPTUM=${RETAG_SEPTUM:-0}
 RETAG_SEPTUM_ED=${RETAG_SEPTUM_ED:-0}
 LAST_BEAT=${LAST_BEAT:-0}
 
-SIM_DIR="/home/dtsteene/D1/cardiac-work"
+SIM_DIR="${SIM_DIR:-/home/dtsteene/D1/cardiac-work}"
 
 module load anaconda3
 eval "$(conda shell.bash hook)"
-conda activate RV
+conda activate "${CARDIAC_CONDA_ENV:-/home/dtsteene/.conda/envs/RV}"
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 export MPICH_HYDRA_LAUNCHER=fork

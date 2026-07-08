@@ -1003,6 +1003,15 @@ def _main():  # noqa: C901 — long but linear script body
     # Region tags from marker (always needed, outside the _mode_canonical branch)
     region_tags = markers_mt.values[:n_local_cells]
 
+    # NOTE: the AHA mid-ring tags (Mid_LV/RV/Septum) are NOT computed here.
+    # gernerate_aha_biv mis-segments on the adios checkpoint mesh+ffun pair (it
+    # produces almost-all-apical garbage), and computing it on the geometry-dir
+    # mesh would land in a different cell ordering than these per-cell arrays.
+    # AHA tags are instead added as an aha_tags.npy sidecar by compute_aha_band.py,
+    # which runs gernerate_aha_biv on the geometry mesh and maps cells onto this
+    # npz ordering via the canonical ckpt_to_cg_idx permutation. The sbatch tail
+    # runs it automatically after this script.
+
     n_geo = comm.allreduce(int(is_geometric_septum.sum()))
     n_ldrb = comm.allreduce(int(is_ldrb_septum.sum()))
     n_study = comm.allreduce(int(study_region.sum()))

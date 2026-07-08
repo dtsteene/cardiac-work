@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-WORK_DIR="/global/D1/homes/dtsteene/cardiac-work"
+WORK_DIR="${WORK_DIR:-/global/D1/homes/dtsteene/cardiac-work}"
 DATA_DIR="${WORK_DIR}/data/ukb_circ_v12_exp"
 GEOMETRY_DIR="${WORK_DIR}/data/mesh_convergence/ukb_L5/ukb/geometry"
 

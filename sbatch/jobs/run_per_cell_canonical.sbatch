@@ -30,7 +30,7 @@ if [ -z "$RESULTS_DIR" ]; then
     exit 1
 fi
 
-SIM_DIR="/home/dtsteene/D1/cardiac-work"
+SIM_DIR="${SIM_DIR:-/home/dtsteene/D1/cardiac-work}"
 GEOM_DIR="${RESULTS_DIR}/geometry"
 GEOM_FIELDS="${GEOM_DIR}/geometry_fields.npz"
 
@@ -43,7 +43,7 @@ echo "  Output file:       ${RESULTS_DIR}/per_cell_data_canonical.npz"
 
 module load anaconda3
 eval "$(conda shell.bash hook)"
-conda activate RV
+conda activate "${CARDIAC_CONDA_ENV:-/home/dtsteene/.conda/envs/RV}"
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 export MPICH_HYDRA_LAUNCHER=fork
@@ -51,7 +51,7 @@ export MPICH_HYDRA_LAUNCHER=fork
 # Per-job FFCx cache. NOTE: /tmp on milanq nodes is frequently out of space,
 # so put the cache on D1 (which has plenty of space) instead. Per-job unique
 # directory still isolates concurrent sbatch jobs from each other.
-CACHE_BASE="/global/D1/homes/dtsteene/tmp/fenics-cache"
+CACHE_BASE="${CACHE_BASE:-$HOME/tmp/fenics-cache}"
 export XDG_CACHE_HOME="${CACHE_BASE}/${SLURM_JOB_ID}"
 mkdir -p "${XDG_CACHE_HOME}"
 # Also point TMPDIR at the same area so FFCx's linker scratch writes go there

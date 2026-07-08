@@ -25,7 +25,7 @@ if [ -z "$RESULTS_DIR" ]; then
     exit 1
 fi
 
-SIM_DIR="/home/dtsteene/D1/cardiac-work"
+SIM_DIR="${SIM_DIR:-/home/dtsteene/D1/cardiac-work}"
 
 echo "--- Per-Cell Job Started: $SLURM_JOB_ID ---"
 date
@@ -36,7 +36,7 @@ echo "  Tag at unloaded: ${TAG_AT_UNLOADED:-0}"
 
 module load anaconda3
 eval "$(conda shell.bash hook)"
-conda activate RV
+conda activate "${CARDIAC_CONDA_ENV:-/home/dtsteene/.conda/envs/RV}"
 export OPENBLAS_NUM_THREADS=1
 export OMP_NUM_THREADS=1
 export MPICH_HYDRA_LAUNCHER=fork
@@ -44,7 +44,7 @@ export MPICH_HYDRA_LAUNCHER=fork
 # Per-job FFCx cache directory to avoid JIT compilation races when many
 # per_cell jobs start simultaneously. Keep it on D1 rather than node-local
 # /tmp, which can be tight on some nodes during FFCx/CFFI compilation.
-CACHE_BASE="/global/D1/homes/dtsteene/tmp/fenics-cache"
+CACHE_BASE="${CACHE_BASE:-$HOME/tmp/fenics-cache}"
 export XDG_CACHE_HOME="${CACHE_BASE}/${SLURM_JOB_ID}"
 export TMPDIR="${XDG_CACHE_HOME}/tmp"
 mkdir -p "${XDG_CACHE_HOME}" "${TMPDIR}"
