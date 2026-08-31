@@ -12,6 +12,30 @@ any deleted compatibility path:
 git checkout pre-cleanup-2026-08-31
 ```
 
+## Verification
+
+The cleanup was proven behaviour-preserving by re-running the pipeline on a
+canonical case (`2026-06-22/pah_pulmonary_fixedratio/no_frank_starling/case5_rv75`)
+with the cleaned code and diffing every output against the production results.
+All three runs came back **bitwise identical — largest relative difference
+0.000e+00**, not merely within tolerance:
+
+| Job | Covered | Result |
+|---|---|---|
+| 1377179 | `postprocess_metrics.py` after the legacy demolition | 132/132 metric keys identical |
+| 1377183 | `postprocess_metrics.py` at the final state (sim_params, flag removal, `__init__` split) | 132/132 metric keys identical |
+| 1377184 | `compute_per_cell.py` in canonical tagging mode | 46/46 numeric arrays identical |
+
+Exact equality is the expected outcome if the deleted branches really were dead
+and the extractions really were pure, so it is the result that carries the
+claim. The only structural difference found was an `aha_tag` array present in
+the production `per_cell_data.npz` and absent from a fresh run — traced to
+commit `7780397` (2026-07-08), unrelated to this cleanup, and documented in
+[provenance](provenance.md#per_cell_datanpz-and-the-aha-tags).
+
+Verification outputs were written to separate subdirectories
+(`--metrics-subdir`, `--output-tag`) so production results were never touched.
+
 ## Two latent bugs, both in regional wall volumes
 
 Neither fired in production — verified: every canonical run carries
