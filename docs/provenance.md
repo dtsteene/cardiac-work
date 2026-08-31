@@ -56,6 +56,27 @@ Verified reference values for that sweep, for cross-checking any re-run:
 sPAP70 RV_ESP = 85.83 mmHg; free-wall LV r = 0.994, RV r = 0.967; septum ratio
 preservation 0.805 / 1.171 / 2.075 / 0.969 for PLV / PRV / Trans / Mean.
 
+## The May 2026 deletion (2026-08-31)
+
+1.41 TB of superseded May simulation directories were deleted to reclaim space
+on a filesystem sitting at capacity: `sims/2026-05-03`, `05-06`, `05-08`,
+`05-11`, `05-13`, `05-25`, `05-27`, `05-29`. These were the Frank-Starling L5
+sweeps, the capped-RVEDP replacement sweep, the insurance endpoint cases, the
+cap-sensitivity study, and the A/B compressibility check — all superseded by
+the 2026-06-22 fixed-ratio sweep and its FS bundles.
+
+Before deleting, it was verified that nothing in the repo referenced these
+paths and that no surviving run used any of them as a shared unloaded
+reference. Their derived analysis in `results/analysis/` is untouched, so the
+numbers and figures survive; what is lost is the ability to compute a *new*
+metric from those runs without re-simulating.
+
+A per-case manifest — job IDs, run descriptions, sizes — is preserved at
+`results/DELETED_may_manifest_2026-08-31.txt`.
+
+Every surviving `sims/<date>/` directory now carries a `README.md` stating what
+the experiment was and whether it is canonical, superseded, or historical.
+
 ## Reading older runs
 
 The cleanup of 2026-08-31 removed the compatibility code that read pre-June

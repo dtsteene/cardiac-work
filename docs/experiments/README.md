@@ -22,8 +22,9 @@ Status means:
 | Base-Dirichlet / metric-space sensitivity | `analysis/base_dirichlet_sensitivity/`, `analysis/metric_space_sensitivity/` | — | Canonical (appendix) | [supporting-studies](supporting-studies.md) |
 | Pre-cap thesis sweep | `sims/_CURRENT_H5_PRODUCTION/` | 16 | Superseded (and links are dead) | [thesis-capped-sweep](thesis-capped-sweep.md) |
 | Pulmonary sweep, generations 1–4 | `sims/2026-06-07`, `2026-06-09` | 8 each | Superseded | [pulmonary-afterload-sweep](pulmonary-afterload-sweep.md) |
-| Frank-Starling L5 sweeps | `sims/2026-05-25`, `05-27`, `05-29` | varied | Superseded | [pulmonary-afterload-sweep](pulmonary-afterload-sweep.md) |
-| Cap-sensitivity (3 mmHg) | `analysis/cap_sensitivity_*_20260511_*` | 6 | Superseded | — |
+| PAH severity spectrum, shared unloaded ref | `sims/2026-08-31/` | 7 severities | **Canonical (newest)** | see the directory README |
+| Frank-Starling L5 sweeps | *deleted 2026-08-31* | varied | Superseded, raw data removed | [pulmonary-afterload-sweep](pulmonary-afterload-sweep.md) |
+| Cap-sensitivity (3 mmHg) | `analysis/cap_sensitivity_*_20260511_*` (raw deleted) | 6 | Superseded | — |
 | `case_NONEXISTENT` | in the fixed-ratio sweep | — | Dead (canary artifact) | — |
 
 ## The through-line
