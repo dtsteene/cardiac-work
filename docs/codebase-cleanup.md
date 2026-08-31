@@ -87,10 +87,24 @@ the frankstarling sweeps), but now warns rather than assuming silently.
 
 ## Removed
 
-The metric-key normaliser (`work_fiber_*` → `work_ff_*`), the four-layout
-metrics search, and the results-directory auto-migration in
-`run_postprocessing` — canonical runs use only current key names and the
-`metrics/` layout, verified against the data.
+The metric-key normaliser (`work_fiber_*` → `work_ff_*`) and the
+results-directory auto-migration in `run_postprocessing` — canonical runs use
+only current key names, verified against the data.
+
+The four-layout metrics search was narrowed to `<folder>/metrics/`, and **that
+went too far**. It was verified against the run *root*, but `run_postprocessing`
+passes `plot_loops` and `eval_proxies` the per-beat directories
+(`analysis/last_beat`, `analysis/all_beats`) where the metrics file sits flat.
+Both raised `FileNotFoundError` on every run, and because the subprocess calls
+used `check=False` the jobs still reported COMPLETED while producing no figures
+and no proxy stats — the 2026-08-31 spectrum pilot lost all eight per-beat
+outputs. Fixed in `9718cc0`: `load_metrics` now tries `<folder>/metrics/` then
+`<folder>` itself, `run_postprocessing` propagates subprocess exit codes so a
+broken plot step fails the Slurm job, and `tests/test_plot_utils.py` covers both
+layouts. The lesson worth keeping: the verification runs exercised
+`postprocess_metrics.py` directly and never `run_postprocessing.py`, so a whole
+branch of the pipeline was unverified while the metric comparison looked
+perfect.
 
 `--tag-at-unloaded`, which tagged the septum on the unloaded reference mesh.
 Its own help text called this "anatomically meaningless"; it existed only to
