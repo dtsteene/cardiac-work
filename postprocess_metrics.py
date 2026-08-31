@@ -32,6 +32,7 @@ import basix.ufl
 import pulse
 import cardiac_geometries
 import cardiac_geometries.geometry
+from sim_params import material_params_from_sim_params
 from clinical_frame import build_radial_endo_to_epi_dg0, tangent_project_longitudinal
 
 # ─── Parse Arguments ──────────────────────────────────────────────────────────
@@ -387,25 +388,7 @@ if rank == 0:
 # ─── 6. Reconstruct Problem (Material + BCs + Cavities) ─────────────────────
 
 # Material parameters — reconstruct pulse.Variable objects with saved units
-mat_params_raw = sim_params["material_params"]
-material_params = {}
-for k, entry in mat_params_raw.items():
-    if "value" in entry:
-        val = entry["value"]
-    elif entry.get("kind") == "Function":
-        # Regional material scaling (LV/RV/SEPTUM_MATERIAL_SCALE != 1) serializes
-        # a, a_f, ... as spatially-varying fields with no scalar 'value'. For
-        # whole-heart uniform scaling the field is constant, so local_mean is the
-        # exact scalar. Non-uniform regional scaling would need the field rebuilt
-        # from the mesh markers; warn (strain metrics are kinematic and unaffected).
-        lo, hi = entry.get("local_min"), entry.get("local_max")
-        if lo is not None and hi is not None and abs(hi - lo) > 1e-9 * (abs(hi) + 1e-12):
-            logger.warning(f"material_params['{k}'] is a non-uniform field; "
-                           f"replay uses local_mean={entry.get('local_mean')} (approx).")
-        val = entry.get("local_mean", entry.get("local_min"))
-    else:
-        raise KeyError(f"material_params['{k}'] has neither 'value' nor field stats: {entry}")
-    material_params[k] = pulse.Variable(val, entry["unit"])
+material_params = material_params_from_sim_params(sim_params)
 
 material = pulse.HolzapfelOgden(f0=f0_quad, s0=s0_quad, **material_params)
 
