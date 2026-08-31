@@ -63,7 +63,18 @@ class MetricsCalculator:
         self.one_sided_robin = one_sided_robin
         self.mesh = geometry.mesh
         
-        # --- 1. Define Function Spaces ---
+        self._setup_function_spaces(metrics_space_type)
+        self._setup_state_functions()
+        self._setup_region_tags(geo, aha_tags)
+        self._compute_region_volumes()
+
+        # --- 5. Pre-compile all integration forms (one-time JIT cost) ---
+        self._precompile_forms()
+        if self.rank == 0:
+            print("MetricsCalculator: All forms pre-compiled.")
+
+    def _setup_function_spaces(self, metrics_space_type):
+        """Define the function spaces the metrics are stored and integrated in."""
         element_type = metrics_space_type[0]
         degree = metrics_space_type[1]
         self._state_space_is_quadrature = element_type == "Quadrature"
@@ -93,7 +104,8 @@ class MetricsCalculator:
             # Tensor Space (for Stress S and Strain E)
             self.W_tensor = dolfinx.fem.functionspace(self.mesh, (element_type, degree, (3, 3)))
 
-        # --- 2. Define Functions for State Tracking ---
+    def _setup_state_functions(self):
+        """Allocate the stress/strain state functions and their history."""
         self.S_total = dolfinx.fem.Function(self.W_tensor, name="S_total")
         self.S_active = dolfinx.fem.Function(self.W_tensor, name="S_active")
         self.S_passive = dolfinx.fem.Function(self.W_tensor, name="S_passive")
@@ -122,7 +134,8 @@ class MetricsCalculator:
         self.sigma_comp = dolfinx.fem.Function(self.W_tensor, name="sigma_comp")
         self._state_projection_problems = {}
 
-        # --- 3. Setup UFL Expressions ---
+    def _setup_region_tags(self, geo, aha_tags):
+        """Attach region, AHA and tau-based LV/RV meshtags."""
         self._setup_expressions()
 
         # Will be populated after region_tags is set (in __init__ after marker diagnostic)
@@ -172,7 +185,8 @@ class MetricsCalculator:
         self.tau_tags_eu = self._build_tau_tags_euclid(geo)
         self.tau_tags_lap = self._build_tau_tags_laplace(geo)
 
-        # --- 4. Calculate Regional Wall Volumes for Unit Scaling ---
+    def _compute_region_volumes(self):
+        """Integrate the per-region wall volumes used to scale the PS indices."""
         # These scale the PS indices, so a wrong volume is a wrong work density
         # (~4 orders of magnitude if it defaults to 1.0 m³ instead of ~1e-4).
         # Failures here must propagate rather than fall back to a placeholder.
@@ -259,10 +273,6 @@ class MetricsCalculator:
                     print(f"  Volume {rname:>14s}: {rvol:.4e} m^3")
                 print(f"{'='*60}\n")
 
-        # --- 5. Pre-compile all integration forms (one-time JIT cost) ---
-        self._precompile_forms()
-        if self.rank == 0:
-            print("MetricsCalculator: All forms pre-compiled.")
 
     def _precompile_forms(self):
         """Pre-compile all dolfinx.fem.form objects used in the hot loop.
