@@ -15,18 +15,11 @@ Only the first is computed by default.
        ff/ss/nn/cross directional decomposition. compute_per_cell.py is now
        the canonical source for these quantities.
 
-    C. RESEARCH METRICS  (gated by enable_research, default OFF — reserved)
-       Fiber efficiency, dyssynchrony, work redistribution, and other
-       non-canonical research diagnostics. These currently live downstream
-       in compare_cases.py / eval_proxies.py. The flag is a stable entry
-       point for future migrations: new research metrics added to this
-       file should be gated by self.enable_research.
-
 In addition, enable_decomp gates the directional decomposition of mean
 state variables (mean_S/E_ss/nn and the full Cauchy-stress decomposition)
 which is distinct from regional internal work but equally expensive.
 
-The three flags are independent; enable_decomp can be on while
+The two flags are independent; enable_decomp can be on while
 enable_regional_internal is off (or vice-versa), though the production
 path is all three off.
 """
@@ -43,17 +36,17 @@ import basix.ufl
 import pulse
 
 class MetricsCalculator:
-    def __init__(self, geometry, geo, fiber_field_map, problem, comm, cardiac_model, metrics_space_type=("DG", 1), alpha_epi=1e5, alpha_base=1e6, hydro_pressure=None, one_sided_robin=False, aha_tags=None, enable_decomp=False, enable_research=False, enable_regional_internal=False):
+    def __init__(self, geometry, geo, fiber_field_map, problem, comm, cardiac_model, metrics_space_type=("DG", 1), alpha_epi=1e5, alpha_base=1e6, hydro_pressure=None, one_sided_robin=False, aha_tags=None, enable_decomp=False, enable_regional_internal=False):
         self.geometry = geometry
         self.geo = geo
         self.fiber_fields = fiber_field_map
         self.cardiac_model = cardiac_model
 
-        # Refactor 2026-04-13: canonical regional work lives in compute_per_cell.py.
-        # These flags gate the legacy regional + decomposition paths. Defaults are
-        # OFF; the caller (postprocess_metrics.py) re-enables them via --no-skip-*.
+        # Canonical regional work lives in compute_per_cell.py, so these two
+        # expensive paths default OFF. They are not deprecated — they are what
+        # energy-balance cross-checks and one-off investigations turn back on,
+        # via postprocess_metrics.py's --no-skip-* flags.
         self.enable_decomp = enable_decomp
-        self.enable_research = enable_research
         self.enable_regional_internal = enable_regional_internal
         
         # Register pressure for stress calculations if incompressible

@@ -64,20 +64,15 @@ _parser.add_argument(
          "the run directory does not contain a geometry subfolder (e.g. shared-mesh runs "
          "that loaded geometry from an external path).",
 )
-# Refactor 2026-04-13: regional internal work is now compute_per_cell.py's
-# responsibility. These --skip-* flags default TRUE to match the new canonical
-# pipeline. Pass --no-skip-* to restore the legacy path for one-off
-# investigations or energy-balance cross-checks.
+# Regional internal work is compute_per_cell.py's responsibility, so these
+# expensive paths default to skipped. Pass --no-skip-* to recompute them here
+# for energy-balance cross-checks or one-off investigations. They are optional,
+# not deprecated.
 _parser.add_argument(
     "--skip-decomp", action=argparse.BooleanOptionalAction, default=True,
     help="Skip directional stress/strain decomposition (mean_S/E_ss/nn, Cauchy "
          "sigma_* decompositions). PS-loop essentials (mean_E_ff, mean_S_ff, "
          "mean_E_ll, mean_S_ll) are always computed.",
-)
-_parser.add_argument(
-    "--skip-research", action=argparse.BooleanOptionalAction, default=True,
-    help="Skip research metrics (reserved flag for fiber efficiency, "
-         "dyssynchrony, work redistribution; currently a no-op placeholder).",
 )
 _parser.add_argument(
     "--skip-regional-internal", action=argparse.BooleanOptionalAction, default=True,
@@ -732,7 +727,6 @@ metrics_calc = MetricsCalculator(
     one_sided_robin=sim_params.get("one_sided_robin", False),
     aha_tags=aha_mt,
     enable_decomp=not _args.skip_decomp,
-    enable_research=not _args.skip_research,
     enable_regional_internal=not _args.skip_regional_internal,
 )
 
@@ -741,10 +735,9 @@ if rank == 0:
     logger.info(f"  Metrics space: {metrics_space_type[0]} degree {metrics_space_type[1]}")
     _mode = []
     if not _args.skip_decomp: _mode.append("decomp")
-    if not _args.skip_research: _mode.append("research")
     if not _args.skip_regional_internal: _mode.append("regional_internal")
     if _mode:
-        logger.info(f"  Legacy metrics enabled: {', '.join(_mode)}")
+        logger.info(f"  Optional metrics enabled: {', '.join(_mode)}")
     else:
         logger.info("  Slim mode: boundary + loops only (compute_per_cell.py is canonical for regional work).")
 
