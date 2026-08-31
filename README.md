@@ -53,13 +53,15 @@ complete_cycle.py ─▶ compute_per_cell.py ─▶ postprocess_metrics.py ─�
 | Sanity-check one sim's proxy loop areas | `eval_proxies.py` |
 | Toggle Frank-Starling activation | `USE_FRANK_STARLING` env var (`1`=on default, `0`=constant Ta) |
 | Tune the 0D circulation parameters | `pah_pulmonary_batch/` |
-| Run the fast unit tests (no FEniCSx, login-node safe) | `python3 tests/test_analysis_core.py && python3 tests/test_geometry_utils.py` |
+| Run the fast unit tests (no FEniCSx, login-node safe) | `for t in tests/test_{analysis_core,geometry_utils,syntax,paths}.py; do python3 $t; done` |
+| Understand what was run and what it showed | [`docs/`](docs/README.md) — the knowledge base |
 
 ## Layout
 
 ```
 cardiac-work/
 ├── README.md
+├── docs/                               KNOWLEDGE BASE — experiments, findings, open questions
 ├── tests/                              unit / smoke tests
 ├── data/                               pre-tuned 0D circulation JSONs + reference meshes (gitignored)
 ├── sbatch/
@@ -74,6 +76,7 @@ cardiac-work/
 ├── geometry_generator.py               UKB mesh + LDRB fibers + region tags + per-cell geometric fields
 ├── clinical_frame.py                   clinical-frame direction helpers (longitudinal projection)
 ├── geometry_utils.py                   pure point-to-surface geometry primitives (shared, no FEniCSx)
+├── sim_params.py                       simulation_params.json → pulse objects (shared by both replay paths)
 │
 │   ── analysis (read precomputed metrics; pure NumPy, no FEniCSx) ──
 ├── analysis_core.py                    THE stats core: per-region work, swappable-pressure proxy,
