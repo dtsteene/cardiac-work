@@ -20,6 +20,9 @@ If you read three pages, read these:
 3. **[Findings](findings/README.md)** — the scientific conclusions, region by
    region.
 
+If you are reading code that looks different from an older note, see
+[codebase cleanup](codebase-cleanup.md).
+
 ## Layout
 
 ```
@@ -27,6 +30,7 @@ docs/
 ├── README.md              this page
 ├── open-questions.md      unresolved issues and known gaps
 ├── provenance.md          where data lives; what was deleted; reproducibility
+├── codebase-cleanup.md    what the 2026-08-31 cleanup changed, and why
 ├── experiments/           what was run
 │   ├── README.md          registry: canonical vs superseded vs dead
 │   ├── thesis-capped-sweep.md
