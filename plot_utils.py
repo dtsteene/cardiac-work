@@ -76,20 +76,27 @@ def setup_style():
 def load_metrics(folder):
     """Load the metrics dict written by postprocess_metrics.py.
 
-    Reads `<folder>/metrics/`, preferring the finest downsampling available
-    (metrics_downsample_1.npy over _10.npy).
+    Reads `<folder>/metrics/` (the run-root layout), falling back to `<folder>`
+    itself (the per-beat layout: run_postprocessing.py passes analysis/last_beat
+    and analysis/all_beats, where the file sits flat). Prefers the finest
+    downsampling available (metrics_downsample_1.npy over _10.npy).
 
     Raises FileNotFoundError if the run has no metrics — an unpostprocessed or
     mistyped run should stop the caller, not yield an empty figure.
     """
-    metrics_dir = Path(folder) / "metrics"
-    files = sorted(
-        metrics_dir.glob("metrics_downsample_*.npy"),
-        key=lambda p: int(p.stem.rsplit("_", 1)[1]),
-    )
+    root = Path(folder)
+    candidates = [root / "metrics", root]
+    files = []
+    for d in candidates:
+        files = sorted(
+            d.glob("metrics_downsample_*.npy"),
+            key=lambda p: int(p.stem.rsplit("_", 1)[1]),
+        )
+        if files:
+            break
     if not files:
         raise FileNotFoundError(
-            f"No metrics_downsample_*.npy in {metrics_dir}. "
+            f"No metrics_downsample_*.npy in {candidates[0]} or {candidates[1]}. "
             f"Run postprocess_metrics.py on this results folder first."
         )
     print(f"  Loading: {files[0]}")

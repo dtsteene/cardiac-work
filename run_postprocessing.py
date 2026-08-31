@@ -171,6 +171,7 @@ def main():
         sys.exit(1)
 
     env = os.environ.copy()
+    report_failures = []
 
     for label, work_dir in [("ALL BEATS", all_beats_dir), ("LAST BEAT", last_beat_dir)]:
         print(f"\n--- 📊 Generating Reports for {label} ---")
@@ -179,17 +180,27 @@ def main():
             print(f"⚠️  Missing metrics file in {work_dir}, skipping...")
             continue
 
-        # Run eval proxies (total S:dE ground truth)
-        cmd_eval = [sys.executable, str(eval_proxies_script), str(work_dir)]
-        subprocess.run(cmd_eval, env=env, check=False)
-
-        # Run plot loops (clinical dashboard + engineering debug)
-        cmd_plot = [sys.executable, str(plot_loops_script), str(work_dir)]
-        subprocess.run(cmd_plot, env=env, check=False)
+        # Run eval proxies (total S:dE ground truth), then plot loops
+        # (clinical dashboard + engineering debug). Neither aborts the other,
+        # but a non-zero exit is recorded: these used to fail silently, so a
+        # run could report success having produced no figures at all.
+        for name, script in [("eval_proxies", eval_proxies_script),
+                             ("plot_loops", plot_loops_script)]:
+            rc = subprocess.run([sys.executable, str(script), str(work_dir)],
+                                env=env, check=False).returncode
+            if rc != 0:
+                print(f"❌ {name}.py failed on {label} (exit {rc})")
+                report_failures.append(f"{name} [{label}] exit {rc}")
 
     # --- 7. Organize Results into Subdirectories ---
     print("\n--- 📁 Organizing results ---")
     organize_results(results_dir)
+
+    if report_failures:
+        print(f"\n❌ Analysis pipeline finished WITH FAILURES for: {results_dir.name}")
+        for f in report_failures:
+            print(f"   - {f}")
+        sys.exit(1)
 
     print(f"\n✅ Analysis pipeline finished for: {results_dir.name}")
 
