@@ -16,7 +16,6 @@
 #   RETAG_SEPTUM=0 or 1 (default 0)
 #   GEOMETRY_FIELDS=/path/to/canonical/geometry_fields.npz (optional)
 #     If set, uses canonical atlas tagging via u_pre permutation.
-#   TAG_AT_UNLOADED=0 or 1 (default 0)
 #     If set to 1, uses legacy per-case unloaded-reference tagging.
 #     Otherwise (default), uses per-case tag-at-ED (clinically meaningful).
 
@@ -32,7 +31,6 @@ date
 echo "  Results dir: $RESULTS_DIR"
 echo "  Retag septum: ${RETAG_SEPTUM:-0}"
 echo "  Geometry fields: ${GEOMETRY_FIELDS:-<none>}"
-echo "  Tag at unloaded: ${TAG_AT_UNLOADED:-0}"
 
 module load anaconda3
 eval "$(conda shell.bash hook)"
@@ -59,9 +57,6 @@ if [ "${RETAG_SEPTUM:-0}" = "1" ]; then
 fi
 if [ -n "${GEOMETRY_FIELDS}" ]; then
     EXTRA_ARGS="$EXTRA_ARGS --geometry-fields ${GEOMETRY_FIELDS}"
-fi
-if [ "${TAG_AT_UNLOADED:-0}" = "1" ]; then
-    EXTRA_ARGS="$EXTRA_ARGS --tag-at-unloaded"
 fi
 if [ -n "${BEAT}" ]; then
     EXTRA_ARGS="$EXTRA_ARGS --beat ${BEAT}"

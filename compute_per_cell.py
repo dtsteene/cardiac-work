@@ -61,14 +61,7 @@ def _main():  # noqa: C901 — long but linear script body
                               "by geometry_generator.py alongside geometry.bp). Tags are "
                               "propagated to this case via the u_pre permutation, giving "
                               "identical cell labels across all cases in a spectrum. "
-                              "RECOMMENDED for sweep analyses. Mutually exclusive with "
-                              "--tag-at-unloaded.")
-    _parser.add_argument("--tag-at-unloaded", action="store_true",
-                         help="LEGACY mode: compute septum tags on this case's unloaded "
-                              "stress-free reference mesh (checkpoint mesh at u=0). This "
-                              "is anatomically meaningless — the unloaded state never "
-                              "occurs in vivo. Kept only for reproducibility of old runs. "
-                              "See session update 2026-04-13 in transmural_work_profiles.md.")
+                              "RECOMMENDED for sweep analyses.")
     _parser.add_argument("--d-sum-max-mm", type=float, default=22.0,
                          help="Envelope upper bound on d_sum (mm).")
     _parser.add_argument("--beat", type=int, default=None,
@@ -93,15 +86,11 @@ def _main():  # noqa: C901 — long but linear script body
     # deformed mesh at the start of the last beat (≈ end-diastole, the clinically
     # relevant reference frame). This is case-specific but anatomically meaningful.
     #
-    # Three modes total:
+    # Two modes:
     #   --geometry-fields PATH  → canonical atlas (same cells for every case)
-    #   (default, no flags)     → per-case at end-diastole (deformed mesh at t_start_last_beat)
-    #   --tag-at-unloaded       → per-case at unloaded (legacy, not clinically meaningful)
-    if _args.geometry_fields is not None and _args.tag_at_unloaded:
-        _parser.error("--geometry-fields and --tag-at-unloaded are mutually exclusive")
+    #   (default, no flag)      → per-case at end-diastole (deformed mesh at t_start_last_beat)
     _mode_canonical = _args.geometry_fields is not None
-    _mode_unloaded = _args.tag_at_unloaded
-    _mode_ed = not _mode_canonical and not _mode_unloaded
+    _mode_ed = not _mode_canonical
 
     results_dir = _args.results_dir.resolve()
     comm = MPI.COMM_WORLD
@@ -660,17 +649,8 @@ def _main():  # noqa: C901 — long but linear script body
             logger.info("  Centroids and surfaces deformed to ED for distance computation")
             logger.info("  (mesh.geometry.x restored to unloaded state; FEM forms unaffected)")
 
-    elif _mode_unloaded:
-        if rank == 0:
-            logger.warning("=" * 70)
-            logger.warning("LEGACY mode: tagging at unloaded reference (u=0).")
-            logger.warning("This is anatomically meaningless — the unloaded state never occurs")
-            logger.warning("in vivo. Kept only for reproducibility of old runs. Consider")
-            logger.warning("omitting the flag to use the default tag-at-ED mode instead.")
-            logger.warning("=" * 70)
-    # If _mode_canonical, centroids and surfaces will be superseded by canonical
-    # fields below. We keep centroids as computed so that if canonical loading
-    # fails, we fall through to the per-case path.
+    # If _mode_canonical, the centroids and surfaces computed above are
+    # superseded by the canonical fields loaded below.
 
     # ── Canonical anatomical tagging via u_pre permutation ──────────────────────
     # If --geometry-fields is provided, load canonical distances and tags from a
@@ -1155,8 +1135,9 @@ def _main():  # noqa: C901 — long but linear script body
             # Load displacement
             adios4dolfinx.read_function(checkpoint_path, problem.u, time=t, name="displacement")
 
-            # Set active tension (scalar; legacy [N,3] histories collapse to mean).
-            Ta.assign(float(np.mean(np.atleast_1d(Ta_history[i]))))
+            # Set active tension (uniform scalar; per-cell variation comes from
+            # stretch via FrankStarlingActiveStress, not from Ta).
+            Ta.assign(float(Ta_history[i]))
 
             # Interpolate state variables
             E_cur.interpolate(expr_E)
@@ -1478,7 +1459,7 @@ def _main():  # noqa: C901 — long but linear script body
                      w_ff_scalar_integral=w_ff_scalar_global,
                      # Tagging mode used (for provenance)
                      tagging_mode=np.array(
-                         "canonical" if _mode_canonical else ("tag_at_ed" if _mode_ed else "tag_at_unloaded")
+                         "canonical" if _mode_canonical else "tag_at_ed"
                      ),
                      # Canonical mode permutation: global_ckpt_idx → cg_idx.
                      # Only populated in --geometry-fields mode; empty otherwise.

@@ -1383,9 +1383,7 @@ else:
     # Now ramp from ED to the restart state (volumes + activation)
     restart_lv_target = (last_V_LV_0D * ratio_LV) / volume2ml
     restart_rv_target = (last_V_RV_0D * ratio_RV) / volume2ml
-    # Old solver Ta history may be either [N,3] (legacy region-aware) or [N]
-    # (uniform); collapse to a scalar either way.
-    restart_Ta_target = float(np.mean(np.atleast_1d(old_Ta_solver_history[-1])))
+    restart_Ta_target = float(old_Ta_solver_history[-1])
     ed_lv = lv_volume.value.copy()
     ed_rv = rv_volume.value.copy()
     ed_Ta = float(Ta.value.value)

@@ -172,7 +172,7 @@ if not ta_path.exists():
 
 Ta_history = np.load(ta_path)
 if rank == 0:
-    logger.info(f"Loaded Ta history: {Ta_history.shape} (timesteps x regions)")
+    logger.info(f"Loaded Ta history: {Ta_history.shape} (uniform scalar per timestep)")
 
 # ─── 3. Load Circulation History (Pressures/Volumes) ─────────────────────────
 
@@ -416,8 +416,17 @@ material = pulse.HolzapfelOgden(f0=f0_quad, s0=s0_quad, **material_params)
 # defaults to instantaneous.
 _fs_meta = sim_params.get("frank_starling", {}) if isinstance(sim_params, dict) else {}
 _fs_meta_mode = str(_fs_meta.get("mode", "")).lower()
-# Whether the forward sim used Frank-Starling at all. Default True for back-
-# compatibility with older runs that lack the key (they were all FS).
+# Whether the forward sim used Frank-Starling at all. Runs from before the
+# USE_FRANK_STARLING toggle (2026-06-07) omit the key; the surviving ones are
+# all from the frankstarling sweeps, so True is the right assumption — but say
+# so out loud, because guessing this wrong changes the replayed physics.
+if "enabled" not in _fs_meta:
+    if rank == 0:
+        logger.warning(
+            "simulation_params.json has no frank_starling.enabled — assuming "
+            "Frank-Starling was ON (pre-2026-06-07 run). If this run used "
+            "constant Ta, the replay will not match the forward simulation."
+        )
 USE_FRANK_STARLING = bool(_fs_meta.get("enabled", True))
 # Relaxation (activation-lag) tau from metadata; >0 selects relaxation mode.
 FS_RELAX_TAU_S = float(_fs_meta.get("relaxation_tau_s", 0.0) or 0.0)
@@ -909,10 +918,9 @@ for i in range(start_step, n_steps):
         logger.debug(f"  [{i}] Displacement loaded. Setting Ta...")
         sys.stderr.flush()
 
-    # 2. Set active tension from saved history (scalar).
-    # Legacy [N,3] region-aware histories collapse to their mean — the new
+    # 2. Set active tension from saved history (uniform scalar).
     # FrankStarlingActiveStress derives per-cell variation from stretch, not Ta.
-    Ta.assign(float(np.mean(np.atleast_1d(Ta_history[i]))))
+    Ta.assign(float(Ta_history[i]))
     # metrics_model.active shares the same Ta Variable, so no sync needed.
 
     # 3. Get circulation state at this time
