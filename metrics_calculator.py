@@ -143,13 +143,6 @@ class MetricsCalculator:
         
         # Strain History for PS Loops — dict-based for extensibility to AHA regions
         self._eps_prev = {}  # keyed by "{strain_component}_{region}", e.g. "E_ff_LV"
-        # Legacy attributes (kept for backward compat if anything reads them directly)
-        self.eps_LV_prev = 0.0
-        self.eps_RV_prev = 0.0
-        self.eps_Septum_prev = 0.0
-        self.eps_ll_LV_prev = 0.0
-        self.eps_ll_RV_prev = 0.0
-        self.eps_ll_Septum_prev = 0.0
 
         # Pressure History for Trapezoidal Boundary Work
         self.p_LV_prev = 0.0
@@ -187,73 +180,59 @@ class MetricsCalculator:
         self.tau_tags_lap = self._build_tau_tags_laplace(geo)
 
         # --- 4. Calculate Regional Wall Volumes for Unit Scaling ---
-        # We need specific volumes for LV, RV, and Septum to scale the PS Indices correctly.
+        # These scale the PS indices, so a wrong volume is a wrong work density
+        # (~4 orders of magnitude if it defaults to 1.0 m³ instead of ~1e-4).
+        # Failures here must propagate rather than fall back to a placeholder.
         self.region_volumes = {}
-        try:
-            # Helper to integrate volume for a specific tag
-            def get_vol(tags):
-                dx_sub = ufl.Measure("dx", domain=self.mesh, subdomain_data=self.region_tags, metadata={"quadrature_degree": self.quadrature_degree})
+        # Helper to integrate volume for a specific tag
+        def get_vol(tags):
+            dx_sub = ufl.Measure("dx", domain=self.mesh, subdomain_data=self.region_tags, metadata={"quadrature_degree": self.quadrature_degree})
+            val = 0.0
+            for t in tags:
+                 val += dolfinx.fem.assemble_scalar(dolfinx.fem.form(dolfinx.fem.Constant(self.mesh, 1.0) * dx_sub(int(t))))
+            return self.comm.allreduce(val, op=MPI.SUM)
+
+        if self.region_tags:
+            self.region_volumes["LV"] = get_vol([1])      # LV Free Wall
+            self.region_volumes["RV"] = get_vol([2])      # RV Free Wall
+            self.region_volumes["Septum"] = get_vol([3])  # Septum
+            self.region_volumes["Whole"] = get_vol([1, 2, 3, 4]) # Whole Mesh
+
+        def get_tau_vol(tau_mt, tag_val):
+            if tau_mt is None:
+                return 0.0
+            dx_tau = ufl.Measure("dx", domain=self.mesh,
+                                  subdomain_data=tau_mt,
+                                  metadata={"quadrature_degree": self.quadrature_degree})
+            val = dolfinx.fem.assemble_scalar(
+                dolfinx.fem.form(dolfinx.fem.Constant(self.mesh, 1.0)
+                                  * dx_tau(int(tag_val))))
+            return self.comm.allreduce(val, op=MPI.SUM)
+
+        if self.tau_tags_eu is not None:
+            self.region_volumes["LV_tau_eu"] = get_tau_vol(self.tau_tags_eu, 11)
+            self.region_volumes["RV_tau_eu"] = get_tau_vol(self.tau_tags_eu, 12)
+        if self.tau_tags_lap is not None:
+            self.region_volumes["LV_tau_lap"] = get_tau_vol(self.tau_tags_lap, 11)
+            self.region_volumes["RV_tau_lap"] = get_tau_vol(self.tau_tags_lap, 12)
+
+        # AHA sub-region volumes
+        if self.aha_tags is not None:
+            def get_aha_vol(tags):
+                dx_aha = ufl.Measure("dx", domain=self.mesh, subdomain_data=self.aha_tags, metadata={"quadrature_degree": self.quadrature_degree})
                 val = 0.0
                 for t in tags:
-                     val += dolfinx.fem.assemble_scalar(dolfinx.fem.form(dolfinx.fem.Constant(self.mesh, 1.0) * dx_sub(int(t))))
+                    val += dolfinx.fem.assemble_scalar(dolfinx.fem.form(dolfinx.fem.Constant(self.mesh, 1.0) * dx_aha(int(t))))
                 return self.comm.allreduce(val, op=MPI.SUM)
 
-            if self.region_tags:
-                self.region_volumes["LV"] = get_vol([1])      # LV Free Wall
-                self.region_volumes["RV"] = get_vol([2])      # RV Free Wall
-                self.region_volumes["Septum"] = get_vol([3])  # Septum
-                self.region_volumes["Whole"] = get_vol([1, 2, 3, 4]) # Whole Mesh
+            aha_region_map = {
+                "Basal_LV": [1], "Basal_RV": [2], "Basal_Septum": [3],
+                "Mid_LV": [4], "Mid_RV": [5], "Mid_Septum": [6],
+                "Apical": [0],
+            }
+            for name, tags in aha_region_map.items():
+                self.region_volumes[name] = get_aha_vol(tags)
 
-            def get_tau_vol(tau_mt, tag_val):
-                if tau_mt is None:
-                    return 0.0
-                dx_tau = ufl.Measure("dx", domain=self.mesh,
-                                      subdomain_data=tau_mt,
-                                      metadata={"quadrature_degree": self.quadrature_degree})
-                val = dolfinx.fem.assemble_scalar(
-                    dolfinx.fem.form(dolfinx.fem.Constant(self.mesh, 1.0)
-                                      * dx_tau(int(tag_val))))
-                return self.comm.allreduce(val, op=MPI.SUM)
-
-            if self.tau_tags_eu is not None:
-                self.region_volumes["LV_tau_eu"] = get_tau_vol(self.tau_tags_eu, 11)
-                self.region_volumes["RV_tau_eu"] = get_tau_vol(self.tau_tags_eu, 12)
-            if self.tau_tags_lap is not None:
-                self.region_volumes["LV_tau_lap"] = get_tau_vol(self.tau_tags_lap, 11)
-                self.region_volumes["RV_tau_lap"] = get_tau_vol(self.tau_tags_lap, 12)
-            else:
-                 # Fallback if no tags
-                 self.region_volumes["LV"] = 1.0
-                 self.region_volumes["RV"] = 1.0
-                 self.region_volumes["Septum"] = 1.0
-                 self.region_volumes["Whole"] = 1.0
-
-            # if self.rank == 0:
-            #      print(f"MetricsCalculator: Volumes calculated.")
-            #      print(f"  LV Free: {self.region_volumes['LV']:.2e} m3")
-            #      print(f"  RV Free: {self.region_volumes['RV']:.2e} m3")
-            #      print(f"  Septum:  {self.region_volumes['Septum']:.2e} m3")
-
-            # AHA sub-region volumes
-            if self.aha_tags is not None:
-                def get_aha_vol(tags):
-                    dx_aha = ufl.Measure("dx", domain=self.mesh, subdomain_data=self.aha_tags, metadata={"quadrature_degree": self.quadrature_degree})
-                    val = 0.0
-                    for t in tags:
-                        val += dolfinx.fem.assemble_scalar(dolfinx.fem.form(dolfinx.fem.Constant(self.mesh, 1.0) * dx_aha(int(t))))
-                    return self.comm.allreduce(val, op=MPI.SUM)
-
-                aha_region_map = {
-                    "Basal_LV": [1], "Basal_RV": [2], "Basal_Septum": [3],
-                    "Mid_LV": [4], "Mid_RV": [5], "Mid_Septum": [6],
-                    "Apical": [0],
-                }
-                for name, tags in aha_region_map.items():
-                    self.region_volumes[name] = get_aha_vol(tags)
-
-        except Exception as e:
-            if self.rank == 0: print(f"MetricsCalculator Warning: Could not calc regional volumes ({e}). Using defaults.")
-            self.region_volumes = defaultdict(lambda: 1.0)
 
         # --- Marker Diagnostic (MPI-global counts) ---
         if self.region_tags is not None:
@@ -650,11 +629,14 @@ class MetricsCalculator:
         # --- B. Integration using pre-compiled forms ---
         data = {}
 
-        try:
-            # Ta is a uniform scalar Constant under the FrankStarlingActiveStress model.
-            data["debug_Ta_internal_max"] = float(self.cardiac_model.active.activation.value.value)
-        except Exception:
-            data["debug_Ta_internal_max"] = 0.0
+        # Ta is a uniform scalar Constant under the FrankStarlingActiveStress
+        # model, so Variable.value.value is the scalar. A regional (Function)
+        # activation has no .value; suppress the key in that case rather than
+        # reporting 0.0, which would read as a real "no activation" measurement.
+        activation = getattr(self.cardiac_model.active, "activation", None)
+        Ta_constant = getattr(getattr(activation, "value", None), "value", None)
+        if Ta_constant is not None:
+            data["debug_Ta_internal_max"] = float(Ta_constant)
         # debug_S_active_max reads the S_active tensor function, which is only
         # interpolated when enable_regional_internal is on. In slim mode the
         # array keeps its initial (zero) value, so suppress the key entirely
@@ -881,14 +863,6 @@ class MetricsCalculator:
                 data[f"work_ps_{suffix}_{region}_Sum"] = ((p_LV_avg + p_RV_avg) * dE) * vol
                 self._eps_prev[f"{strain_key}_{region}"] = eps
 
-        # Keep legacy attributes in sync
-        self.eps_LV_prev = self._eps_prev.get("E_ff_LV", 0.0)
-        self.eps_RV_prev = self._eps_prev.get("E_ff_RV", 0.0)
-        self.eps_Septum_prev = self._eps_prev.get("E_ff_Septum", 0.0)
-        self.eps_ll_LV_prev = self._eps_prev.get("E_ll_LV", 0.0)
-        self.eps_ll_RV_prev = self._eps_prev.get("E_ll_RV", 0.0)
-        self.eps_ll_Septum_prev = self._eps_prev.get("E_ll_Septum", 0.0)
-
         return data
     
     def _calculate_robin_work(self):
@@ -1071,12 +1045,7 @@ class MetricsCalculator:
     def setup_csv_logging(self, file_path):
         if self.rank != 0: return
         self.trace_path = Path(file_path)
-        # Reset file
-        if self.trace_path.exists():
-            try:
-                self.trace_path.unlink()
-            except Exception:
-                pass
+        self.trace_path.unlink(missing_ok=True)   # reset any previous trace
         self.trace_headers_written = False
 
     def store_metrics(self, region_metrics, timestep_idx, t, downsample_factor=1):
