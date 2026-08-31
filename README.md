@@ -224,11 +224,18 @@ original thesis numbers):
 ```bash
 python3 tests/test_analysis_core.py     # per-region stats: correlation, ratio, proxy, density
 python3 tests/test_geometry_utils.py    # point-to-surface geometry primitives
+python3 tests/test_syntax.py            # every module in the repo parses
+```
+
+`test_sim_params.py` needs `pulse` and skips cleanly without it, so it is safe
+to include in the same run:
+
+```bash
+python3 tests/test_sim_params.py        # material-param deserialisation + unit round-trip
 ```
 
 FEM-dependent checks (run inside the FEniCSx env / a SLURM allocation):
 
 ```bash
-python3 tests/test_syntax.py                          # file-level syntax sanity
 python3 tests/test_canonical_tagging.py <sim_dirs>    # invariants across a spectrum
 ```

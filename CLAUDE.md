@@ -194,9 +194,10 @@ or ratios. Correlation and ratio figures use a single figure set.
   Do NOT read `ode_state_history.npy` for the "0D" loops — that is the *coupled* 0D state
   and is near-identical to the coupled FEM loop.
 
-Pedagogical/presentation figures are in `pah_pulmonary_batch/make_presentation.py`
-(ED-vs-unloaded, proxy-vs-true, spectrum summary) and `make_dsign_animation.py`
-(septal D-sign short-axis work-density GIF); outputs under `<bundle>/presentation/`.
+Pedagogical/presentation figures come from `pah_pulmonary_batch/make_dsign_animation.py`
+(septal D-sign short-axis work-density GIF), with outputs under `<bundle>/presentation/`.
+(`make_presentation.py` is referenced in older notes but was never committed and is not
+in the repo.)
 
 ## Critical Bugs (Fixed, But Be Aware)
 
