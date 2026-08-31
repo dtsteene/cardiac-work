@@ -28,9 +28,10 @@ import numpy as np
 import pyvista as pv
 from mpi4py import MPI
 
+import paths
 
 REPO = Path(__file__).resolve().parent
-DEFAULT_OUT = REPO / "paraview_exports" / "unloading_cap_comparison_20260511"
+DEFAULT_OUT = paths.RESULTS_ROOT / "paraview_exports" / "unloading_cap_comparison_20260511"
 
 
 @dataclass(frozen=True)

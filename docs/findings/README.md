@@ -8,6 +8,8 @@ its limits; where a claim is contested, it says so rather than picking a side.
 | [Septal proxy](septal-proxy.md) | No pressure choice tracks septal work well; the early "transmural is best" result was an unloading artifact |
 | [RV proxy](rv-proxy.md) | `P_RV` is the only proxy that recovers RV work magnitude, not just direction |
 | [ED overlap](ed-overlap.md) | The flat LV end-diastolic point is diastolic physics, not a modelling error |
+| [Proxy identifiability](proxy-identifiability.md) | Correlation cannot crown `P_RV` on the RV free wall in *any* 2-D loading design; the magnitude lens is the correct tool, not a fallback |
+| [Frank-Starling](frank-starling.md) | FS widens the RV dynamic range by half again and is the only bundle where `P_RV` wins the RV on both lenses |
 
 ## The one thing to carry away
 

@@ -44,8 +44,8 @@ CASES = ["case0_rv25", "case1_rv35", "case2_rv45", "case3_rv55",
          "case4_rv65", "case5_rv75", "case6_rv85", "case7_rv95"]
 SS = "w_total_density_Pa"               # stress-strain work density
 PS = "proxy_combined_ll_density_Pa"     # region-appropriate pressure-strain density
-ED_ROOT = paths.REPO_ROOT / "paraview_exports/pah_pulmonary_ed"
-OUT_ROOT = paths.REPO_ROOT / "paraview_exports/pah_pulmonary_sweep_interp"
+ED_ROOT = paths.RESULTS_ROOT / "paraview_exports/pah_pulmonary_ed"
+OUT_ROOT = paths.RESULTS_ROOT / "paraview_exports/pah_pulmonary_sweep_interp"
 
 
 def write_pvd(pvd_path: Path, entries: list[tuple[float, Path]]) -> None:

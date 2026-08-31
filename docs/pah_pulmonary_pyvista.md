@@ -30,7 +30,7 @@ shifting toward the RV. `clim.json` gives **separate** global ranges for ss and 
 ```python
 import json, pyvista as pv
 bundle = "no_frank_starling"
-root = f"paraview_exports/pah_pulmonary_sweep_interp/{bundle}"
+root = f"results/paraview_exports/pah_pulmonary_sweep_interp/{bundle}"
 reader = pv.get_reader(f"{root}/sweep_interp.pvd")
 clim = json.load(open(f"{root}/clim.json"))
 

@@ -53,6 +53,10 @@ ureg = circulation.units.ureg
 HERE = Path(__file__).resolve().parent
 WORK = HERE.parent
 
+# Generated figures and diagnostics belong with the other analysis products,
+# not next to the source. WORK/"results" is the symlink into the shared root.
+OUT = WORK / "results" / "analysis" / "pah_pulmonary_0d"
+
 # ---- BPM=75 activation timing, copied verbatim from complete_cycle.py -------
 BPM = 75
 HR_HZ = BPM / 60.0          # 1.25 Hz
@@ -182,7 +186,8 @@ def main():
     axes[1].set(title="RV PV loop (last beat)", xlabel="V_RV [mL]", ylabel="p_RV [mmHg]")
     for ax in axes:
         ax.legend(); ax.grid(alpha=0.3)
-    figpath = HERE / "baseline_compare_0d.png"
+    OUT.mkdir(parents=True, exist_ok=True)
+    figpath = OUT / "baseline_compare_0d.png"
     fig.tight_layout(); fig.savefig(figpath, dpi=140)
 
     # ---- report ----------------------------------------------------------
@@ -202,7 +207,7 @@ def main():
     print("  LV: EDV 120-150, EF 55-70%, EDP 6-12, ESP ~120")
     print("  RV: EDV 120-160, EF 45-65%, EDP 2-6,  ESP/peak ~20-30")
     print(f"\nfigure: {figpath}")
-    (HERE / "baseline_compare_0d.json").write_text(json.dumps(results, indent=2))
+    (OUT / "baseline_compare_0d.json").write_text(json.dumps(results, indent=2))
 
 
 if __name__ == "__main__":

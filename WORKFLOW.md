@@ -207,7 +207,7 @@ case, writes an ED-deformed `.vtu` with per-cell work density
 (`w_{total,ff,ss,nn,cross}` ÷ cell volume, J/m³) and pressure-strain proxy
 density, plus a `sweep.pvd` using severity as the PVD "time" axis.
 
-Output: `paraview_exports/pah_pulmonary_ed/<bundle>/`.
+Output: `results/paraview_exports/pah_pulmonary_ed/<bundle>/`.
 
 ### Through-beat PVD (baseline + severe, per bundle)
 
@@ -222,7 +222,7 @@ timestep-by-timestep from `solver/checkpoint.bp` and writes per-step VTU with
 building up over the beat.  Runs serially by design (single rank keeps DOLFINx
 cell ordering consistent with PyVista).
 
-Output: `paraview_exports/pah_pulmonary_beat/<bundle>/<case>/beat.pvd`.
+Output: `results/paraview_exports/pah_pulmonary_beat/<bundle>/<case>/beat.pvd`.
 
 ---
 

@@ -24,7 +24,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib import cm
 
-from compare_baselines_0d import build_params, run_0d, last_cycle_mask, ureg, HERE
+from compare_baselines_0d import build_params, run_0d, last_cycle_mask, ureg, HERE, OUT
 
 BASELINE = HERE / "circ_params" / "baseline_linear.json"
 OUTDIR = HERE / "circ_params"
@@ -103,7 +103,9 @@ def main():
     ax[1].plot([r["paT"] for r in rows], [r["paT"] for r in rows], "k--", alpha=0.4, label="target")
     ax[1].set(title="PA-systolic: target vs achieved", xlabel="target [mmHg]", ylabel="0D PA-sys [mmHg]")
     ax[1].legend(); ax[1].grid(alpha=0.3)
-    fig.tight_layout(); fig.savefig(HERE / "sweep_params_8cases.png", dpi=140)
+    fig.tight_layout()
+    OUT.mkdir(parents=True, exist_ok=True)
+    fig.savefig(OUT / "sweep_params_8cases.png", dpi=140)
 
     print("\n" + "=" * 92)
     print("8 pulmonary windkessel cases written to circ_params/  (even in 0D PA-systolic)")

@@ -47,7 +47,7 @@ from scipy.spatial import cKDTree
 
 import paths
 SWEEP_ROOT = paths.RESULTS_ROOT / "sims/2026-06-09/pah_pulmonary_20260609_prodsweep"
-DEFAULT_OUT = paths.REPO_ROOT / "paraview_exports/pah_pulmonary_ed"
+DEFAULT_OUT = paths.RESULTS_ROOT / "paraview_exports/pah_pulmonary_ed"
 
 CASES = [
     "case0_rv25",

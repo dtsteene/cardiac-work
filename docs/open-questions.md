@@ -52,9 +52,28 @@ cannot separate them; the code says so itself, in
 to break that collinearity, which is what would make the correlation test
 actually discriminating.
 
-This is the single highest-value unbuilt experiment.
+**Revised 2026-08-31.** Two of the design's premises did not survive contact
+with the completed [shared-unloaded spectrum](experiments/spectrum-shared-unloaded.md):
+the septal dynamic-range gate is already cleared (29.2%), and correlation will
+not crown `P_RV` on the RV free wall in *any* 2-D design — widening the LV axis
+makes it worse, because true RV work is nearly as sensitive to LV pressure as to
+its own. See [what correlation can and cannot decide](findings/proxy-identifiability.md).
+
+The grid is still the right destination, but it should be **staged**. Its
+lowest-RV row is a systemic-afterload-only arm mirroring the pulmonary sweep;
+those four cases measure the one coefficient the whole question turns on —
+∂W_RV/∂P_LV at fixed contractility — and decide whether the remaining twelve are
+worth running. Note that no single one-dimensional arm can separate the
+candidates at all, so the arm is a diagnostic, not a substitute for the grid.
 
 ## Adding measurement noise and a small cohort
+
+**Partly answered 2026-08-31:** noise does not rescue correlation — P_RV ranks
+first on the RV free wall in 0% of 4000 draws at every noise level from 2% to
+35%. Noise blurs a ranking rather than reversing one. Its real value is error
+bars, exposing spurious winners on a flat truth, and realism; put it on strain
+and pressure, not on the finished proxy work. See
+[proxy identifiability](findings/proxy-identifiability.md).
 
 Proposed in the August RV note. The clean monotone sweep can rank proxies by
 direction but not robustly by magnitude. Adding controlled measurement noise

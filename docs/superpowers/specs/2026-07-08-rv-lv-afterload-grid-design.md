@@ -238,3 +238,56 @@ above reusing the existing per-cell / correlation / ratio machinery.
   ~0.02 of the 1-D sweep — i.e. the proxies are now distinguishable.
 - A clear per-region verdict on H1/H2 emerges from the combined shape + magnitude
   analysis.
+
+---
+
+## Revision, 2026-08-31 — two premises did not survive
+
+Written after the [shared-unloaded spectrum](../../experiments/spectrum-shared-unloaded.md)
+completed and the design scan in [what correlation can and cannot
+decide](../../findings/proxy-identifiability.md) was run. The design is still
+worth building; two of its premises are not.
+
+**The septal gate is already cleared, and by the wrong sweep.** The pilot gate
+asked for septal true-work range ≳ 15% against the 1-D sweep's 2–4%. Sweep C
+delivers 29.2% simply by having an LV-pressure axis, without any grid. The gate
+has served its purpose and should not consume pilot compute.
+
+**Correlation will not crown P_RV, and widening the LV axis makes it worse.**
+H1 assumed the RV result would survive a richer design. Across eighteen scanned
+designs it does not: r(P_LV) stays at +0.998 while r(P_RV) falls from +1.000 to
++0.776 as the LV span widens, because true RV work is nearly as sensitive to LV
+pressure as to RV pressure. H3 is therefore *stronger* than drafted — correlation
+is degenerate under 1-D loading and actively misleading under 2-D — but H1 cannot
+be tested the way it was written.
+
+**The replacement gate.** The pivotal unknown is ∂W_RV/∂P_LV, currently
+estimable only from sweep C where contractility and cardiac output also move.
+Reduce it four-fold and every design crowns P_RV correctly. Measure it first.
+
+**Stage the grid; do not replace it.** A systemic-afterload-only arm at fixed
+pulmonary loading — the exact mirror of the existing pulmonary sweep, and
+identical to the grid's lowest-RV row — measures ∂W_RV/∂P_LV at fixed
+contractility and delivers LV and septal dynamic range. Run that row first, four
+cases, and let the coefficient decide whether to complete the remaining twelve.
+
+It is *not*, however, a substitute for the grid. On the metric that matters —
+how distinguishable the candidate pressure series are from each other — the
+condition number is misleading. Scoring designs by `1 − max|r|` between any two
+different candidates: any single one-dimensional arm scores **0.000**, whatever
+its direction (on a line in (P_LV, P_RV) every candidate is affine in one
+parameter, so all of them correlate perfectly with each other); the
+pulmonary + systemic cross scores 0.078; the full 4×4 grid scores 0.178. The
+cross recovers well under half of the grid's separating power, not most of it.
+The grid remains the right destination.
+
+**Watch cardiac output.** Sweep C's output falls 46% across its cases; work falls
+when flow falls whatever the pressures do. The pulmonary sweep drifts 11.9% in
+stroke volume and is clean. Any new arm should be checked against that bar before
+its proxy analysis is trusted.
+
+**Frank-Starling helps and should be kept.** Measured on the three activation
+bundles of the pulmonary sweep, FS raises RV true-work range from 80% to 115%
+and is the only bundle where P_RV wins the RV free wall on correlation as well as
+magnitude. It changes no LV verdict and rescues no septal one. See
+[the FS note](../../findings/frank-starling.md).

@@ -63,7 +63,7 @@ DEFAULT_SWEEP = (
     paths.RESULTS_ROOT
     / "sims/2026-06-09/pah_pulmonary_20260609_prodsweep"
 )
-DEFAULT_OUT = paths.REPO_ROOT / "paraview_exports/pah_pulmonary_beat"
+DEFAULT_OUT = paths.RESULTS_ROOT / "paraview_exports/pah_pulmonary_beat"
 
 DEFAULT_CASES = ["case0_rv25", "case7_rv95"]
 

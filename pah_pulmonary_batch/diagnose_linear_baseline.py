@@ -30,7 +30,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from compare_baselines_0d import build_params, run_0d, last_cycle_mask, ureg, WORK, HERE
+from compare_baselines_0d import build_params, run_0d, last_cycle_mask, ureg, WORK, HERE, OUT
 
 SPAP22 = WORK / "data/ukb_circ_v12_exp/optimized_regazzoni_ukb_sPAP22.json"
 
@@ -95,7 +95,9 @@ def main():
         a.axvline(MESH[ch]["EDV"], ls="--", color="k", alpha=0.5, label=f"mesh EDV={MESH[ch]['EDV']}")
         a.set(title=f"{ch} PV loop (sPAP22 warm-up)", xlabel=f"V_{ch} [mL]", ylabel=f"p_{ch} [mmHg]")
         a.legend(fontsize=8); a.grid(alpha=0.3)
-    fig.tight_layout(); fig.savefig(HERE / "linear_baseline_diag.png", dpi=140)
+    fig.tight_layout()
+    OUT.mkdir(parents=True, exist_ok=True)
+    fig.savefig(OUT / "linear_baseline_diag.png", dpi=140)
 
     # ---- report ----------------------------------------------------------
     print("\n" + "=" * 76)
@@ -115,7 +117,7 @@ def main():
     print(f"\nre-fit EB to hit target EDP at mesh EDV:  "
           f"LV {refit['LV']:.4f}  RV {refit['RV']:.4f}  mmHg/mL")
     print(f"figure: {HERE / 'linear_baseline_diag.png'}")
-    (HERE / "linear_baseline_diag.json").write_text(json.dumps(
+    (OUT / "linear_baseline_diag.json").write_text(json.dumps(
         {"results": results, "refit_EB": refit, "mesh": MESH}, indent=2))
 
 

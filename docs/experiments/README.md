@@ -16,6 +16,7 @@ Status means:
 |---|---|---|---|---|
 | Capped shared-unloaded L5 sweep | `analysis/capped_shared_l5_sweep_20260510_141015/` (raw data deleted) | 16 | **Canonical (thesis)** | [thesis-capped-sweep](thesis-capped-sweep.md) |
 | Pulmonary afterload, fixed-ratio coupling | `sims/2026-06-22/pah_pulmonary_fixedratio/` | 3 bundles × 8 | **Canonical (current)** | [pulmonary-afterload-sweep](pulmonary-afterload-sweep.md) |
+| Spectrum re-run, shared unloading + fixed ratio | `sims/2026-08-31/spectrum_shared_unloaded_production_20260831_184436/` | 7 | **Canonical (current)** | [spectrum-shared-unloaded](spectrum-shared-unloaded.md) |
 | Passive-softening pilot | `sims/2026-07-08/softmat_pilot_L10/` | 3 stiffnesses × 2 | **Canonical (current)** | [softening-pilot](softening-pilot.md) |
 | Mesh convergence h10/h7.5/h5/h3.75 | `analysis/mesh_convergence/` | 4 resolutions | Canonical (appendix) | [supporting-studies](supporting-studies.md) |
 | AHA mid-ventricular ring | tags 4/5/6 in `compute_per_cell` | — | Canonical (method) | [supporting-studies](supporting-studies.md) |

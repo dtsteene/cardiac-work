@@ -144,7 +144,7 @@ results/                             # Symlink → shared dir (see WORKFLOW.md)
   sims/                              # Simulation outputs (date-organised)
   handover/                          # Handover figure outputs
 
-paraview_exports/                    # PVD/VTU output for PyVista animation
+results/paraview_exports/            # PVD/VTU output for PyVista animation (moved out of the repo root 2026-08-31)
   pah_pulmonary_ed/<bundle>/         # ED-static sweep (one VTU per case + sweep.pvd)
   pah_pulmonary_beat/<bundle>/<case>/# Through-beat animation (step_NNN.vtu + beat.pvd)
 ```

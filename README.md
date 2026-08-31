@@ -91,6 +91,7 @@ cardiac-work/
 ├── export_static_geometry_tags.py      ch. 2 mesh / fiber / tag panels
 ├── export_unloading_cap_paraview.py    fig_unloaded_cap_grid, fig_ed_cap_grid
 └── export_production_sweep_for_animation.py   time-series field export for animations
+                                        (all exporters write to results/paraview_exports/)
 ```
 
 ## Analysis core

@@ -33,7 +33,7 @@ import matplotlib.pyplot as plt
 from matplotlib import cm
 
 from compare_baselines_0d import (
-    build_params, run_0d, last_cycle_mask, RR_INTERVAL, ureg, WORK, HERE,
+    build_params, run_0d, last_cycle_mask, RR_INTERVAL, ureg, WORK, HERE, OUT,
 )
 
 # Named baselines we might start tuning from. Each: (json, relinearize).
@@ -135,7 +135,8 @@ def main():
     summary = {}
     for baseline in args.baselines:
         rows, loops = run_spectrum(baseline, args.n, grad, args.beats)
-        outpath = HERE / f"sweep_{baseline}.png"
+        OUT.mkdir(parents=True, exist_ok=True)
+        outpath = OUT / f"sweep_{baseline}.png"
         plot_spectrum(baseline, rows, loops, outpath)
         summary[baseline] = rows
         print(f"\n{'='*86}\nBASELINE: {baseline}   ->  {outpath.name}\n{'='*86}")
@@ -147,7 +148,7 @@ def main():
                   f"{r['RV_peak']:>7.1f} {r['RV_EDV']:>7.1f} {r['RV_SV']:>6.1f} {r['RV_SW']:>8.0f} | "
                   f"{r['PA_sys']:>6.1f} {r['PA_dia']:>6.1f} {r['PA_mean']:>6.1f} | {r['LV_peak']:>7.1f}")
 
-    (HERE / "sweep_summary_0d.json").write_text(json.dumps(summary, indent=2))
+    (OUT / "sweep_summary_0d.json").write_text(json.dumps(summary, indent=2))
     print("\nReminder: 0D RV/LV systolic is inflated and elastance-based (FEM replaces "
           "it in coupling). PA pressures + windkessel values are the transferable picks.")
 
