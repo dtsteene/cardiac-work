@@ -81,3 +81,22 @@ Runs predating 2026-06-07 have no `frank_starling.enabled` key in
 **on** for those, which is correct: every surviving pre-toggle run belongs to
 the frankstarling sweeps. It now warns when it makes that assumption rather than
 making it silently, because guessing wrong changes the replayed physics.
+
+## per_cell_data.npz and the AHA tags
+
+Existing `per_cell_data.npz` files written before 2026-07-08 contain an
+`aha_tag` array. Re-running `compute_per_cell.py` today will **not** reproduce
+it, and that is deliberate rather than a regression.
+
+`gernerate_aha_biv` mis-segments on the adios checkpoint mesh + ffun pair — it
+returns almost-all-apical garbage — and running it on the geometry-dir mesh
+instead would land in a different cell ordering than the per-cell arrays. So
+commit `7780397` removed the in-line computation. AHA tags now come from
+`compute_aha_band.py`, which runs the segmentation on the geometry mesh and maps
+cells onto the npz ordering via the canonical `ckpt_to_cg_idx` permutation,
+writing an `aha_tags.npy` sidecar next to the npz. `sbatch/jobs/run_aha_band.sbatch`
+does the backfill.
+
+Practical consequence: if you regenerate a `per_cell_data.npz`, regenerate its
+`aha_tags.npy` too, or any band-restricted analysis (`make_pah_handover.py`
+`band="mid"`) will be reading a stale sidecar.
