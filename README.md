@@ -14,6 +14,11 @@ itself lives at [github.com/dtsteene/RV](https://github.com/dtsteene/RV).
 
 ## Start here
 
+**New to the project?** Read [`docs/`](docs/README.md) — the knowledge base
+covering what was run, what it showed, and what is still open. This README
+explains how to *run* things; `docs/` explains *why* the runs exist. Start with
+[open questions](docs/open-questions.md) and [data provenance](docs/provenance.md).
+
 The job: run biventricular heart simulations and ask whether clinical
 pressure-strain proxies actually track the true mechanical work of the
 myocardium. We compute ground-truth work `∫ S:dE` from the stress/strain
