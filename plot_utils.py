@@ -3,7 +3,7 @@ Shared utilities for visualization and analysis scripts.
 
 Provides:
 - Publication-quality matplotlib style
-- Metrics loading with multi-layout search and legacy key normalization
+- Metrics loading from a results folder
 - Common color palettes and helper functions
 """
 
@@ -74,62 +74,29 @@ def setup_style():
 # ─── Data Loading ────────────────────────────────────────────────────────────
 
 def load_metrics(folder):
-    """Load metrics dict, searching multiple directory layout conventions.
+    """Load the metrics dict written by postprocess_metrics.py.
 
-    Searches (in order): analysis/last_beat/, analysis_last_beat/, metrics/, root.
-    Applies legacy key normalization so all downstream code uses current names.
+    Reads `<folder>/metrics/`, preferring the finest downsampling available
+    (metrics_downsample_1.npy over _10.npy).
+
+    Raises FileNotFoundError if the run has no metrics — an unpostprocessed or
+    mistyped run should stop the caller, not yield an empty figure.
     """
-    path = Path(folder)
-    search_dirs = [
-        path / "analysis" / "last_beat",
-        path / "analysis_last_beat",
-        path / "metrics",
-        path,
-    ]
-    for d in search_dirs:
-        if not d.exists():
-            continue
-        files = sorted(d.glob("metrics_downsample_*.npy"), key=lambda p: len(str(p)))
-        if files:
-            print(f"  Loading: {files[0]}")
-            m = np.load(files[0], allow_pickle=True).item()
-            return _normalize_keys(m)
-    print(f"  No metrics found in {folder}")
-    return None
-
-
-def _normalize_keys(m):
-    """Map legacy metric key names to current convention."""
-    renames = {}
-    regions = ["LV", "RV", "Septum", "Whole"]
-    for reg in regions:
-        renames[f"work_fiber_{reg}"]  = f"work_ff_{reg}"
-        renames[f"work_sheet_{reg}"]  = f"work_ss_{reg}"
-        renames[f"work_normal_{reg}"] = f"work_nn_{reg}"
-        renames[f"work_shear_{reg}"]  = f"work_cross_{reg}"
-    for old_k in list(m.keys()):
-        if old_k.startswith("work_ps_index_"):
-            new_k = old_k.replace("work_ps_index_", "work_ps_ff_")
-            renames[old_k] = new_k
-    for old, new in renames.items():
-        if old in m and new not in m:
-            m[new] = m[old]
-    return m
+    metrics_dir = Path(folder) / "metrics"
+    files = sorted(
+        metrics_dir.glob("metrics_downsample_*.npy"),
+        key=lambda p: int(p.stem.rsplit("_", 1)[1]),
+    )
+    if not files:
+        raise FileNotFoundError(
+            f"No metrics_downsample_*.npy in {metrics_dir}. "
+            f"Run postprocess_metrics.py on this results folder first."
+        )
+    print(f"  Loading: {files[0]}")
+    return np.load(files[0], allow_pickle=True).item()
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
-
-def get_array(m, key):
-    """Safely extract a numpy array from metrics dict."""
-    return np.array(m[key]) if key in m else np.array([])
-
-
-def total_work(m, key):
-    """Sum a work timeseries to get total work (J)."""
-    if key not in m:
-        return 0.0
-    return float(np.sum(m[key]))
-
 
 def save_fig(fig, outdir, name):
     """Save figure and close."""

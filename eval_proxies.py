@@ -193,5 +193,4 @@ if __name__ == "__main__":
         sys.exit(1)
 
     metrics = load_metrics(res_dir)
-    if metrics:
-        analyze_proxies(metrics, res_dir)
+    analyze_proxies(metrics, res_dir)
