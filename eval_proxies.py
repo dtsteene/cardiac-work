@@ -50,7 +50,9 @@ def _stats(truth, proxy):
     n = min(len(truth), len(proxy))
     t, p = truth[:n], proxy[:n]
     W_true, W_proxy = float(np.sum(t)), float(np.sum(p))
-    ratio = W_proxy / W_true if abs(W_true) > 1e-12 else 0.0
+    # NaN, not 0.0: with no true work to compare against the ratio is undefined,
+    # and 0.0 would read as "the proxy captures none of the work".
+    ratio = W_proxy / W_true if abs(W_true) > 1e-12 else float("nan")
     return {"W_true": W_true, "W_proxy": W_proxy, "Ratio": ratio}
 
 

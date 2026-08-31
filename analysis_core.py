@@ -38,6 +38,12 @@ STRAINS = ("ll", "ff")
 # The septum is loaded from both sides, so its proxy pressure is ambiguous.
 # These are the candidate choices we evaluate; ``Trans`` (transmural) is the
 # thesis's preferred septal proxy in PAH.
+#
+# ``Sum`` (P_LV + P_RV) is deliberately absent: it equals exactly 2*``Mean``,
+# so it is affine in a candidate already listed and yields an identical
+# Pearson r. It can differ only in the ratio/magnitude view, which is why
+# metrics_calculator.py still emits a separate ``work_ps_*_Sum`` key — do not
+# "restore" it here expecting a new correlation result.
 PRESSURE_CHOICES = ("PLV", "PRV", "Trans", "Mean", "NearestSide", "TauWeighted")
 
 # Per-cell work densities are stored in Pa·(unit strain); ×1e-3 → kPa.

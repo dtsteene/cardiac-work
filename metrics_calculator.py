@@ -860,6 +860,9 @@ class MetricsCalculator:
                 data[f"work_ps_{suffix}_{region}_PLV"] = (p_LV_avg * dE) * vol
                 data[f"work_ps_{suffix}_{region}_PRV"] = (p_RV_avg * dE) * vol
                 data[f"work_ps_{suffix}_{region}_Mean"] = (0.5 * (p_LV_avg + p_RV_avg) * dE) * vol
+                # Sum is exactly 2*Mean, so it adds nothing to correlation. It is
+                # kept because the ratio/magnitude view is scale-sensitive, where
+                # the factor of 2 is the point. See analysis_core.PRESSURE_CHOICES.
                 data[f"work_ps_{suffix}_{region}_Sum"] = ((p_LV_avg + p_RV_avg) * dE) * vol
                 self._eps_prev[f"{strain_key}_{region}"] = eps
 
@@ -1142,12 +1145,6 @@ class MetricsCalculator:
                 for key, value in state_data.items():
                     if key.startswith(prefix):
                         self._eps_prev[f"{strain_key}_{key[len(prefix):]}"] = value
-            self.eps_LV_prev = self._eps_prev.get("E_ff_LV", 0.0)
-            self.eps_RV_prev = self._eps_prev.get("E_ff_RV", 0.0)
-            self.eps_Septum_prev = self._eps_prev.get("E_ff_Septum", 0.0)
-            self.eps_ll_LV_prev = self._eps_prev.get("E_ll_LV", 0.0)
-            self.eps_ll_RV_prev = self._eps_prev.get("E_ll_RV", 0.0)
-            self.eps_ll_Septum_prev = self._eps_prev.get("E_ll_Septum", 0.0)
 
             # Initialize all work keys to 0.0 at Step 0 to "reserve" the CSV columns.
             # We perform a dummy call to get the keys, but we don't use the values.
