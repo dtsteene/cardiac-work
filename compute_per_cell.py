@@ -239,7 +239,20 @@ def _main():  # noqa: C901 — long but linear script body
     mat_params_raw = sim_params["material_params"]
     material_params = {}
     for k, entry in mat_params_raw.items():
-        material_params[k] = pulse.Variable(entry["value"], entry["unit"])
+        if "value" in entry:
+            val = entry["value"]
+        elif entry.get("kind") == "Function":
+            # Regional material scaling (LV/RV/SEPTUM_MATERIAL_SCALE != 1) serializes
+            # a, a_f, ... as fields with no scalar 'value'. Whole-heart uniform scaling
+            # gives a constant field, so local_mean is exact; warn if non-uniform.
+            lo, hi = entry.get("local_min"), entry.get("local_max")
+            if lo is not None and hi is not None and abs(hi - lo) > 1e-9 * (abs(hi) + 1e-12):
+                logger.warning(f"material_params['{k}'] is a non-uniform field; "
+                               f"replay uses local_mean={entry.get('local_mean')} (approx).")
+            val = entry.get("local_mean", entry.get("local_min"))
+        else:
+            raise KeyError(f"material_params['{k}'] has neither 'value' nor field stats: {entry}")
+        material_params[k] = pulse.Variable(val, entry["unit"])
 
     material = pulse.HolzapfelOgden(f0=f0_quad, s0=s0_quad, **material_params)
     # Uniform scalar Ta + FrankStarlingActiveStress, matching the forward sim.
