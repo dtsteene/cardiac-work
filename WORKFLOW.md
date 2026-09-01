@@ -226,66 +226,39 @@ Output: `results/paraview_exports/pah_pulmonary_beat/<bundle>/<case>/beat.pvd`.
 
 ---
 
-## Collaborator setup (henriknf)
+## Collaborator setup
 
-The shared directory **exists** at `/global/D1/cardiac_rv_shared` (group
-`cppm_via_users`, setgid).  Both `dtsteene` and `henriknf` are in that group.
-It holds everything that cannot travel through git:
+Environment, cluster access and the shared directory layout are owned by
+**[HANDOVER.md](HANDOVER.md)** — it is the single source of truth for setup, and
+this file assumes you have already followed it.
 
-```
-/global/D1/cardiac_rv_shared/
-  src/        fenicsx-pulse, fenicsx-ldrb, fenicsx-warp, circulation
-              (the editable installs the conda env points at)
-  data/       input meshes + circulation JSONs   (gitignored in the repo)
-  results/    simulation outputs (2.5 TB)        (gitignored in the repo)
-```
+In short: everything that cannot travel through git lives under
+`/global/D1/cardiac_rv_shared/` (group `cppm_via_users`, setgid), the repo's
+`data` and `results` are symlinks into it, and there is a ready-to-activate
+conda env at `/global/D1/cardiac_rv_shared/env/` needing no FEniCSx build.
 
-```bash
-# 1. Clone the repo (needs collaborator access on github.com/dtsteene/cardiac-work)
-git clone git@github.com:dtsteene/cardiac-work.git
-cd cardiac-work
+## Sweep launchers
 
-# 2. Point the clone at the shared data + results (the cloned repo ships an empty
-#    results/docs and no data/, so replace them with symlinks to the shared dir):
-rm -rf results data
-ln -s /global/D1/cardiac_rv_shared/results results
-ln -s /global/D1/cardiac_rv_shared/data    data
+`sbatch/jobs/` holds single-job templates; `sbatch/sweeps/` holds the
+multi-job dispatchers below. Several drove campaigns whose raw data has since
+been deleted — they are kept because they record the exact case names and
+env-var settings, so a sweep can be reproduced even though its outputs are gone
+(see [docs/provenance.md](docs/provenance.md)).
 
-# 3. Use the existing shared conda env (world-readable on /home, no rebuild):
-conda activate /home/dtsteene/.conda/envs/RV
-#   The sbatch scripts already default CARDIAC_CONDA_ENV to this full path,
-#   so batch jobs pick it up automatically.
-
-# 4. For sbatch jobs, point the path vars at your own clone (add to ~/.bashrc):
-export SIM_DIR="$PWD"      # used by sbatch/jobs/*.sbatch
-export WORK_DIR="$PWD"     # used by sbatch/sweeps/*
-
-# 5. Sanity check
-python -c "import paths, pulse, ldrb, circulation; print(paths.RESULTS_ROOT, pulse.__file__)"
-```
-
-**Why each piece is needed.** `henriknf` is *not* in group `uio`, and
-`/global/D1/homes/dtsteene` is `drwxr-x---` (uio only, not world-traversable),
-so neither the repo nor the env's editable source packages can be reached
-through the home directory.  That is why `src/`, `data/`, and `results/` live
-directly under `/global/D1/` with group `cppm_via_users` + setgid, and why the
-conda env's `.pth` files were repointed at `cardiac_rv_shared/src`.  The conda
-env itself sits on the node-shared `/home` filesystem and is world-readable, so
-it needs no copy — only the source trees it references had to move.
-
-> **One manual step, by dtsteene:** add `henriknf` as a collaborator on
-> `github.com/dtsteene/cardiac-work` (the `gh` CLI is not installed on the
-> cluster — do it from the GitHub web UI).
-
-> **Note on POSIX ACLs:** beegfs on ex3 does not support `setfacl`.  Sharing is
-> via group ownership (`cppm_via_users`) + setgid on all directories.
-> `/global/D1/homes/dtsteene` is not world-traversable, so the shared tree must
-> remain directly under `/global/D1/` (not under the home directory).  Existing
-> result subdirectories stay owned by `dtsteene` but are world-readable;
-> `results/{sims,analysis,log,handover}` are group-writable + setgid so new runs
-> from either user inherit the shared group.
-
----
+| Launcher | What it submits | Status |
+|---|---|---|
+| `pah_pulmonary_batch/submit_pah_pulmonary_sweep.sh` | The canonical pulmonary afterload sweep, 8 cases × 3 activation bundles | **Current** |
+| `pah_pulmonary_batch/submit_spectrum_shared_unloaded.sh` | 7-severity spectrum on a shared unloaded reference | **Current** |
+| `pah_pulmonary_batch/submit_softmat_pilot.sh` | Passive-softening pilot (×1.0 / ×0.5 / ×0.33) | Current |
+| `sweeps/submit_capped_shared_l5_sweep.sh` | Capped RV-EDP production sweep, shared h=5 mesh — the thesis sweep | Historical (raw data deleted) |
+| `sweeps/submit_shared_unloaded_l5_sweep.sh` | Design B: shared L5 ED mesh + precomputed unloaded reference | Historical (raw data deleted) |
+| `sweeps/submit_frankstarling_l5_sweep.sh` | Frank-Starling, 16 cases, shared unloading | Historical (raw data deleted) |
+| `sweeps/submit_frankstarling_l5_preload_sweep.sh` | Frank-Starling with preload-only (ED-frozen) multiplier | Historical (raw data deleted) |
+| `sweeps/submit_frankstarling_l5_ta200_sweep.sh` | Frank-Starling with Ta_peak 100 → 200 kPa | Historical (raw data deleted) |
+| `sweeps/submit_spectrum_v12_exp_extra.sbatch` | v12 EXP extra 8 cases (sPAP25..sPAP92 interleaved) | Historical |
+| `sweeps/submit_patient_mesh_fem.sbatch` | Patient-mesh × pressure robustness check | Historical |
+| `sweeps/submit_unloading_ab.sh` | Unloading-only A/B diagnostic for the RV prestress issue | Historical |
+| `sweeps/submit_unloading_stiffness_sweep.sh` | Unloading-only regional passive-stiffness calibration | Historical |
 
 ## Path resolution
 

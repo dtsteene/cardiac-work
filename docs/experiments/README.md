@@ -17,13 +17,13 @@ Status means:
 | Capped shared-unloaded L5 sweep | `analysis/capped_shared_l5_sweep_20260510_141015/` (raw data deleted) | 16 | **Canonical (thesis)** | [thesis-capped-sweep](thesis-capped-sweep.md) |
 | Pulmonary afterload, fixed-ratio coupling | `sims/2026-06-22/pah_pulmonary_fixedratio/` | 3 bundles × 8 | **Canonical (current)** | [pulmonary-afterload-sweep](pulmonary-afterload-sweep.md) |
 | Spectrum re-run, shared unloading + fixed ratio | `sims/2026-08-31/spectrum_shared_unloaded_production_20260831_184436/` | 7 | **Canonical (current)** | [spectrum-shared-unloaded](spectrum-shared-unloaded.md) |
+| Systemic-afterload arm (specificity control) | `sims/2026-09-01/pah_pulmonary_20260901_systemic/` | 8 | **Running** | [systemic-afterload-arm](systemic-afterload-arm.md) |
 | Passive-softening pilot | `sims/2026-07-08/softmat_pilot_L10/` | 3 stiffnesses × 2 | **Canonical (current)** | [softening-pilot](softening-pilot.md) |
 | Mesh convergence h10/h7.5/h5/h3.75 | `analysis/mesh_convergence/` | 4 resolutions | Canonical (appendix) | [supporting-studies](supporting-studies.md) |
 | AHA mid-ventricular ring | tags 4/5/6 in `compute_per_cell` | — | Canonical (method) | [supporting-studies](supporting-studies.md) |
 | Base-Dirichlet / metric-space sensitivity | `analysis/base_dirichlet_sensitivity/`, `analysis/metric_space_sensitivity/` | — | Canonical (appendix) | [supporting-studies](supporting-studies.md) |
 | Pre-cap thesis sweep | `sims/_CURRENT_H5_PRODUCTION/` | 16 | Superseded (and links are dead) | [thesis-capped-sweep](thesis-capped-sweep.md) |
 | Pulmonary sweep, generations 1–4 | `sims/2026-06-07`, `2026-06-09` | 8 each | Superseded | [pulmonary-afterload-sweep](pulmonary-afterload-sweep.md) |
-| PAH severity spectrum, shared unloaded ref | `sims/2026-08-31/` | 7 severities | **Canonical (newest)** | see the directory README |
 | Frank-Starling L5 sweeps | *deleted 2026-08-31* | varied | Superseded, raw data removed | [pulmonary-afterload-sweep](pulmonary-afterload-sweep.md) |
 | Cap-sensitivity (3 mmHg) | `analysis/cap_sensitivity_*_20260511_*` (raw deleted) | 6 | Superseded | — |
 | `case_NONEXISTENT` | in the fixed-ratio sweep | — | Dead (canary artifact) | — |
